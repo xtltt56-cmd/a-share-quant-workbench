@@ -110,6 +110,24 @@ class AKShareDataProvider:
                 ) from fallback_error
         return normalize_daily_bars(raw, symbol=primary_symbol, source=self.name)
 
+    def get_index_daily_bars(
+        self,
+        symbol: str,
+        start_date: date | str,
+        end_date: date | str,
+    ) -> pd.DataFrame:
+        """Fetch an index benchmark through AKShare's index endpoint."""
+
+        primary_symbol = normalize_symbol(symbol)
+        raw = self._call(
+            "index_zh_a_hist",
+            symbol=primary_symbol,
+            period="daily",
+            start_date=_format_akshare_date(start_date),
+            end_date=_format_akshare_date(end_date),
+        )
+        return normalize_daily_bars(raw, symbol=primary_symbol, source=self.name)
+
 
 def _format_akshare_date(value: date | str) -> str:
     if isinstance(value, date):

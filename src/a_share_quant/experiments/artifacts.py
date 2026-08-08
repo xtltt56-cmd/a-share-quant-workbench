@@ -68,6 +68,11 @@ class ExperimentArtifactWriter:
         trades.to_parquet(path, index=False)
         return path
 
+    def write_signals(self, signals: pd.DataFrame) -> Path:
+        path = self.root / "signals.parquet"
+        signals.to_parquet(path, index=False)
+        return path
+
     def write_model(self, model: Any, *, filename: str = "model.pkl") -> Path:
         if Path(filename).name != filename:
             raise ValueError("model filename must be a single safe filename")

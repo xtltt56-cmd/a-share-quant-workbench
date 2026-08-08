@@ -6,3 +6,25 @@ qlib:
   model_versions:
     lightgbm: qlib_lgb_alpha158_v1
     double_ensemble: qlib_doubleensemble_alpha158_v1
+  models:
+    lightgbm:
+      loss: mse
+      num_boost_round: 50
+      early_stopping_rounds: 10
+      learning_rate: 0.05
+      max_depth: 6
+      num_leaves: 31
+      verbosity: -1
+      num_threads: 1
+    double_ensemble:
+      loss: mse
+      num_models: 2
+      epochs: 8
+      bins_sr: 2
+      bins_fs: 2
+      sample_ratios: [0.8, 0.6]
+      sub_weights: [1, 1]
+      decay: 0.9
+      early_stopping_rounds: 3
+      verbosity: -1
+      num_threads: 1

@@ -41,6 +41,7 @@ def test_experiment_runner_writes_reproducible_metadata_and_artifacts(tmp_path: 
         ),
         metrics={"cumulative_return": 0.01},
     )
+    signals = evaluation.predictions.assign(normalized_score=[100.0, 0.0], rank=[1, 2])
     spec = ExperimentSpec(
         experiment_id="stage2_rule_oos",
         strategy_id="rule_multifactor",
@@ -50,7 +51,7 @@ def test_experiment_runner_writes_reproducible_metadata_and_artifacts(tmp_path: 
         data_version="canonical-v1",
         dataset_hash="dataset-abc",
         seed=42,
-        config={"label": "forward_excess_return_5d"},
+        config={"label": "forward_excess_return_5d", "split": split.as_dict()},
         params={"top_k": 10},
         split=split,
         walk_forward=(split,),
@@ -60,11 +61,13 @@ def test_experiment_runner_writes_reproducible_metadata_and_artifacts(tmp_path: 
         spec,
         evaluation,
         model={"model": "fixture"},
+        signals=signals,
     )
 
     assert paths.root == tmp_path / "stage2_rule_oos"
     assert paths.model is not None and paths.model.exists()
     assert paths.trades.exists()
+    assert paths.signals is not None and paths.signals.exists()
     metadata = pd.read_json(paths.metadata, typ="series")
     assert metadata["dataset_hash"] == "dataset-abc"
     assert metadata["feature_version"] == "rule_features_v1"
@@ -72,6 +75,7 @@ def test_experiment_runner_writes_reproducible_metadata_and_artifacts(tmp_path: 
     assert metadata["git_commit"] == "unknown"
     assert metadata["split"]["test"] == ["2022-07-01", "2022-12-31"]
     assert metadata["artifacts"]["model"] == "model/model.pkl"
+    assert metadata["artifacts"]["signals"] == "signals.parquet"
 
 
 def test_experiment_spec_rejects_unsafe_or_invalid_identifiers() -> None:

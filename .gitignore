@@ -27,6 +27,7 @@ data/**/*.db
 data/**/*.json
 data/**/*.jsonl
 data/**/*.tmp
+data/qlib_provider/
 models/
 /experiments/
 logs/**/*.log

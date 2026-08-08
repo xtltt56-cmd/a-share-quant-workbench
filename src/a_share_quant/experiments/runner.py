@@ -10,6 +10,7 @@ import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,7 @@ class ExperimentRunPaths:
     predictions: Path
     equity: Path
     trades: Path
+    signals: Path | None
     model: Path | None
 
 
@@ -79,6 +81,7 @@ class ExperimentRunner:
         evaluation: FairEvaluationResult,
         *,
         model: Any | None = None,
+        signals: pd.DataFrame | None = None,
         model_filename: str = "model.pkl",
         extra_metadata: Mapping[str, Any] | None = None,
     ) -> ExperimentRunPaths:
@@ -87,6 +90,7 @@ class ExperimentRunner:
         predictions_path = writer.write_predictions(evaluation.predictions)
         equity_path = writer.write_equity(evaluation.equity)
         trades_path = writer.write_trades(evaluation.trades)
+        signals_path = writer.write_signals(signals) if signals is not None else None
         metrics_path = writer.write_metrics(evaluation.metrics)
         model_path = (
             writer.write_model(model, filename=model_filename)
@@ -104,6 +108,7 @@ class ExperimentRunner:
                 "predictions": _relative_name(predictions_path, writer.root),
                 "equity": _relative_name(equity_path, writer.root),
                 "trades": _relative_name(trades_path, writer.root),
+                "signals": _relative_name(signals_path, writer.root) if signals_path else None,
                 "model": _relative_name(model_path, writer.root) if model_path else None,
             },
         )
@@ -118,6 +123,7 @@ class ExperimentRunner:
             predictions=predictions_path,
             equity=equity_path,
             trades=trades_path,
+            signals=signals_path,
             model=model_path,
         )
 
@@ -199,7 +205,7 @@ def _json_safe(value: Any) -> Any:
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
-    if isinstance(value, (pd.Timestamp,)):
+    if isinstance(value, (date, datetime, pd.Timestamp)):
         return value.isoformat()
     if hasattr(value, "item"):
         return _json_safe(value.item())
