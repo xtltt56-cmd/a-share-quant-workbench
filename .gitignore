@@ -1,0 +1,54 @@
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+
+# Python tooling
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+# Local runtime state, data, experiments and generated artifacts
+data/**/*.parquet
+data/**/*.duckdb
+data/**/*.duckdb.*
+data/**/*.json
+data/**/*.jsonl
+data/**/*.tmp
+models/
+experiments/
+logs/**/*.log
+reports/**/*.html
+reports/**/*.json
+reports/**/*.png
+reports/**/*.csv
+
+# Keep intended local directories visible in a fresh checkout.
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/raw/daily/.gitkeep
+!data/raw/universe/.gitkeep
+!data/processed/.gitkeep
+!data/metadata/.gitkeep
+!reports/.gitkeep
+!reports/daily/.gitkeep
+!reports/backtests/.gitkeep
+!logs/.gitkeep
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini

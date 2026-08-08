@@ -1,0 +1,18 @@
+backtest:
+  quick_engine: vectorbt
+  final_engine: rqalpha
+  benchmark: "000300"
+  signal_to_execution_delay_days: 1
+  enforce_t_plus_one: true
+  enforce_limit_rules: true
+  enforce_suspension_rules: true
+  transaction_costs:
+    commission_rate: 0.0003
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.00001
+    slippage_bps: 5
+  walk_forward:
+    train_days: 756
+    validation_days: 252
+    test_days: 126
+    step_days: 126

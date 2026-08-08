@@ -1,0 +1,21 @@
+data:
+  provider: akshare
+  storage_root: data
+  database_path: quant.duckdb
+  lake_format: parquet
+  schema_version: "1"
+  adjusted_price: qfq
+  update_mode: incremental
+  request:
+    timeout_seconds: 30
+    retry_count: 3
+    delay_seconds: 0.25
+    max_symbols_per_run: null
+  quality:
+    require_unique_symbol_date: true
+    reject_negative_prices: true
+    reject_invalid_ohlc: true
+    max_missing_ratio: 0.05
+  pit:
+    require_announced_at_for_fundamentals: true
+    reject_unknown_publication_time: true

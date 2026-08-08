@@ -1,0 +1,45 @@
+strategy:
+  default_id: rule_multifactor
+  version: "1.0.0"
+  registry:
+    - rule_multifactor
+    - qlib_lightgbm_alpha158
+    - qlib_double_ensemble_alpha158
+    - ensemble
+  universe:
+    exclude_st: true
+    exclude_delisting_risk: true
+    exclude_new_days: 60
+    exclude_suspended: true
+    min_average_turnover_pct: 0.5
+    min_average_amount: 10000000
+  factors:
+    money_flow:
+      weight: 0.15
+      direction: positive
+    momentum:
+      weight: 0.15
+      direction: positive
+    trend:
+      weight: 0.10
+      direction: positive
+    relative_strength:
+      weight: 0.10
+      direction: positive
+    volume_turnover:
+      weight: 0.10
+      direction: positive
+    quality:
+      weight: 0.15
+      direction: positive
+    valuation:
+      weight: 0.10
+      direction: positive
+    volatility_risk:
+      weight: 0.15
+      direction: negative
+  score:
+    lower_bound: 0
+    upper_bound: 100
+    winsorize_quantiles: [0.01, 0.99]
+    minimum_cross_section: 30
