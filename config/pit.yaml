@@ -1,0 +1,5 @@
+pit:
+  announcement_day_policy: next_trading_day
+  allow_same_day_announcement: false
+  unknown_announcement_date: reject
+  effective_date_timezone: Asia/Shanghai

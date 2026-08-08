@@ -1,0 +1,15 @@
+comparison:
+  benchmark: "000300"
+  seed: 42
+  max_positions: 10
+  max_single_position: 0.15
+  rebalance_frequency: weekly
+  split:
+    train_ratio: 0.6
+    validation_ratio: 0.2
+    test_ratio: 0.2
+  walk_forward:
+    min_train_dates: 252
+    validation_dates: 63
+    test_dates: 63
+    step_dates: 63

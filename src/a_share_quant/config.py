@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import yaml
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -40,3 +43,99 @@ class Settings(BaseSettings):
     def load(cls, *, env_file: Path | None = None) -> Settings:
         kwargs = {"_env_file": str(env_file)} if env_file is not None else {}
         return cls(**kwargs)
+
+
+@dataclass(frozen=True)
+class PITConfig:
+    announcement_day_policy: str = "next_trading_day"
+    allow_same_day_announcement: bool = False
+    unknown_announcement_date: str = "reject"
+
+
+@dataclass(frozen=True)
+class SplitConfig:
+    train_ratio: float = 0.6
+    validation_ratio: float = 0.2
+    test_ratio: float = 0.2
+
+    def __post_init__(self) -> None:
+        total = self.train_ratio + self.validation_ratio + self.test_ratio
+        if any(value <= 0 for value in (self.train_ratio, self.validation_ratio, self.test_ratio)):
+            raise ValueError("time split ratios must be positive")
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError("time split ratios must sum to 1")
+
+
+@dataclass(frozen=True)
+class LabelConfig:
+    name: str = "forward_excess_return_5d"
+    horizon_days: int = 5
+
+    def __post_init__(self) -> None:
+        if self.name != "forward_excess_return_5d":
+            raise ValueError("stage 2 supports only forward_excess_return_5d")
+        if self.horizon_days != 5:
+            raise ValueError("stage 2 fixes the label horizon at 5 trading days")
+
+
+@dataclass(frozen=True)
+class ComparisonConfig:
+    benchmark: str = "000300"
+    seed: int = 42
+    max_positions: int = 10
+    max_single_position: float = 0.15
+    rebalance_frequency: str = "weekly"
+    split: SplitConfig = SplitConfig()
+
+
+@dataclass(frozen=True)
+class Stage2Config:
+    pit: PITConfig
+    label: LabelConfig
+    comparison: ComparisonConfig
+
+    @classmethod
+    def load(cls, *, config_dir: Path) -> Stage2Config:
+        pit_data = _read_yaml_section(config_dir / "pit.yaml", "pit")
+        qlib_data = _read_yaml_section(config_dir / "qlib.yaml", "qlib")
+        experiment_data = _read_yaml_section(config_dir / "experiments.yaml", "comparison")
+        split_data = experiment_data.pop("split", {})
+
+        return cls(
+            pit=PITConfig(
+                announcement_day_policy=pit_data.get(
+                    "announcement_day_policy", "next_trading_day"
+                ),
+                allow_same_day_announcement=bool(
+                    pit_data.get("allow_same_day_announcement", False)
+                ),
+                unknown_announcement_date=pit_data.get("unknown_announcement_date", "reject"),
+            ),
+            label=LabelConfig(
+                name=qlib_data.get("label", "forward_excess_return_5d"),
+                horizon_days=int(qlib_data.get("label_horizon_days", 5)),
+            ),
+            comparison=ComparisonConfig(
+                benchmark=str(experiment_data.get("benchmark", "000300")),
+                seed=int(experiment_data.get("seed", 42)),
+                max_positions=int(experiment_data.get("max_positions", 10)),
+                max_single_position=float(experiment_data.get("max_single_position", 0.15)),
+                rebalance_frequency=str(experiment_data.get("rebalance_frequency", "weekly")),
+                split=SplitConfig(
+                    train_ratio=float(split_data.get("train_ratio", 0.6)),
+                    validation_ratio=float(split_data.get("validation_ratio", 0.2)),
+                    test_ratio=float(split_data.get("test_ratio", 0.2)),
+                ),
+            ),
+        )
+
+
+def _read_yaml_section(path: Path, section: str) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    value = raw.get(section, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"configuration section must be a mapping: {section}")
+    return dict(value)

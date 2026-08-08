@@ -1,0 +1,8 @@
+qlib:
+  feature_version: alpha158_v1
+  label: forward_excess_return_5d
+  label_horizon_days: 5
+  seed: 42
+  model_versions:
+    lightgbm: qlib_lgb_alpha158_v1
+    double_ensemble: qlib_doubleensemble_alpha158_v1
