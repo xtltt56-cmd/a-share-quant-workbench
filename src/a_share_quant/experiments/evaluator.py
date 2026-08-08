@@ -30,17 +30,25 @@ class EvaluationConfig:
     slippage_bps: float = 5.0
 
     @classmethod
-    def from_yaml(cls, path: Path) -> EvaluationConfig:
+    def from_yaml(cls, path: Path, risk_path: Path | None = None) -> EvaluationConfig:
         with Path(path).open("r", encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
         config = raw.get("backtest", {})
         costs = config.get("transaction_costs", {})
+        resolved_risk_path = (
+            Path(risk_path) if risk_path is not None else Path(path).with_name("risk.yaml")
+        )
+        if resolved_risk_path.exists():
+            with resolved_risk_path.open("r", encoding="utf-8") as handle:
+                risk = (yaml.safe_load(handle) or {}).get("risk", {})
+        else:
+            risk = {}
         return cls(
             horizon_days=5,
             signal_delay_days=int(config.get("signal_to_execution_delay_days", 1)),
-            max_positions=10,
-            max_single_position=0.15,
-            max_gross_exposure=0.60,
+            max_positions=int(risk.get("max_positions", 10)),
+            max_single_position=float(risk.get("max_single_position", 0.15)),
+            max_gross_exposure=float(risk.get("max_gross_exposure", 0.60)),
             commission_rate=float(costs.get("commission_rate", 0.0003)),
             stamp_duty_rate=float(costs.get("stamp_duty_rate", 0.0005)),
             transfer_fee_rate=float(costs.get("transfer_fee_rate", 0.00001)),

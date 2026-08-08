@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -84,3 +85,11 @@ def test_position_limits_are_applied_before_order_generation() -> None:
     assert len(buys) <= 2
     assert buys["target_weight"].sum() <= 0.3 + 1e-12
     assert buys["target_weight"].max() <= 0.15 + 1e-12
+
+
+def test_evaluation_config_reads_risk_limits_from_yaml() -> None:
+    config = EvaluationConfig.from_yaml(Path("config/backtest.yaml"))
+
+    assert config.max_positions == 10
+    assert config.max_single_position == pytest.approx(0.15)
+    assert config.max_gross_exposure == pytest.approx(0.60)

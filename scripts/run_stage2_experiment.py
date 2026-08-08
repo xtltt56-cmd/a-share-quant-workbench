@@ -123,7 +123,12 @@ def _run(args: argparse.Namespace) -> None:
         split,
         windows,
     )
-    evaluator = FairPortfolioEvaluator(EvaluationConfig.from_yaml(config_dir / "backtest.yaml"))
+    evaluator = FairPortfolioEvaluator(
+        EvaluationConfig.from_yaml(
+            config_dir / "backtest.yaml",
+            risk_path=config_dir / "risk.yaml",
+        )
+    )
     artifact_root = repo_root / args.output_root
     experiment_runner = ExperimentRunner(root=artifact_root, repo_root=repo_root)
 
@@ -223,7 +228,17 @@ def _run(args: argparse.Namespace) -> None:
             "Walk-Forward execution skipped by operator; fixed OOS artifacts are not a full "
             "robustness result"
         )
-    _write_comparison_report(artifact_root, artifact_root, split, rule_result, model_specs)
+    _write_comparison_report(
+        artifact_root,
+        artifact_root,
+        split,
+        rule_result,
+        model_specs,
+        mode=args.mode,
+        benchmark=benchmark,
+        dataset_hash=dataset_hash,
+        walk_forward_count=len(windows),
+    )
     LOGGER.info("Stage 2 fixed OOS artifacts written under %s", artifact_root)
 
 
@@ -520,6 +535,11 @@ def _write_comparison_report(
     split: TimeSplit,
     rule_result: FairEvaluationResult,
     model_specs: tuple[tuple[str, str, dict[str, Any], str], ...],
+    *,
+    mode: str,
+    benchmark: str,
+    dataset_hash: str,
+    walk_forward_count: int,
 ) -> None:
     rows = [{"strategy_id": "rule_multifactor", **_summary_metrics(rule_result.metrics)}]
     for strategy_id, model_version, _, _ in model_specs:
@@ -541,6 +561,12 @@ def _write_comparison_report(
         "# Stage 2 baseline comparison",
         "",
         "This report is fixed OOS. It is not a live-trading recommendation.",
+        "",
+        f"- Data mode: `{mode}`",
+        f"- Benchmark: `{benchmark}`",
+        f"- Dataset hash: `{dataset_hash}`",
+        f"- Walk-Forward windows executed: `{walk_forward_count}`",
+        "- Source boundary: local canonical Parquet; fixture mode is synthetic smoke data only.",
         "",
         f"- Train: `{split.train[0]}` to `{split.train[1]}`",
         f"- Validation: `{split.validation[0]}` to `{split.validation[1]}`",

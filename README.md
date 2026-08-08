@@ -10,6 +10,7 @@
 - [x] Rule-based factor baseline and unified versioned signal adapter.
 - [x] Fixed OOS / Walk-Forward split utilities, A-share-aware fair evaluator, and reproducible experiment artifacts.
 - [x] Fixed OOS / Walk-Forward runner writes window-level and aggregate artifacts.
+- [x] report-renderer HTML smoke validated with an explicit synthetic-data warning.
 - [ ] Real AKShare/local-data Stage 2 run and rendered baseline comparison report.
 
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
@@ -29,6 +30,15 @@ Stage 2 operator commands:
 ```
 
 The current machine has only a four-row local stock sample and no local `000300` index snapshot. The live AKShare smoke request was attempted but the configured network proxy rejected both stock and index endpoints; therefore no synthetic fixture result is presented as a real-market run.
+
+After a real local run, render the report with the installed renderer (use UTF-8 mode on this Windows console):
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 `
+  'C:\Users\lenovo\.codex\skills\report-renderer\scripts\render_report.py' `
+  'experiments\stage2_baseline\report\baseline_comparison.md' `
+  'experiments\stage2_baseline\report\baseline_comparison.html'
+```
 
 研究优先、默认不下单的 A 股量化研究与纸面交易系统。项目的核心原则是复用成熟开源框架，只实现 A 股数据适配、PIT 数据边界、股票池、因子/模型注册、风险约束、统一信号和纸面交易记录。
 
