@@ -7,9 +7,11 @@
 - [x] Historical as-of universe filtering for listing age, delisting, ST, suspension, and historical liquidity.
 - [x] Qlib 0.9.7 provider adapter and official Alpha158 dataset builder with `forward_excess_return_5d` labels.
 - [x] Qlib LightGBM and Qlib DoubleEnsemble official model adapters with deterministic versioned predictions.
-- [ ] Rule-based factor baseline, fair OOS comparison, and paper signals.
+- [x] Rule-based factor baseline and unified versioned signal adapter.
+- [x] Fixed OOS / Walk-Forward split utilities, A-share-aware fair evaluator, and reproducible experiment artifacts.
+- [ ] Real AKShare/local-data Stage 2 run and rendered baseline comparison report.
 
-The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning.
+The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, optional Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 
 研究优先、默认不下单的 A 股量化研究与纸面交易系统。项目的核心原则是复用成熟开源框架，只实现 A 股数据适配、PIT 数据边界、股票池、因子/模型注册、风险约束、统一信号和纸面交易记录。
 

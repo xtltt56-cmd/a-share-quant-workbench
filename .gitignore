@@ -28,7 +28,7 @@ data/**/*.json
 data/**/*.jsonl
 data/**/*.tmp
 models/
-experiments/
+/experiments/
 logs/**/*.log
 reports/**/*.html
 reports/**/*.json
