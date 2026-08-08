@@ -33,6 +33,8 @@ class SignalRecord:
             raise ValueError("strategy_id and strategy_version are required")
         if not self.model_version or not self.feature_version or not self.data_version:
             raise ValueError("model, feature and data versions are required")
+        if not self.experiment_id:
+            raise ValueError("experiment_id is required")
         if not math.isfinite(float(self.raw_score)):
             raise ValueError("raw_score must be finite")
         if not 0 <= float(self.normalized_score) <= 100:
@@ -43,7 +45,15 @@ class SignalRecord:
             raise ValueError("confidence must be between 0 and 1")
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        result = asdict(self)
+        result["date"] = self.signal_date
+        return result
+
+    @property
+    def date(self) -> date:
+        """Alias used by downstream tabular signal consumers."""
+
+        return self.signal_date
 
 
 class SignalProvider(Protocol):

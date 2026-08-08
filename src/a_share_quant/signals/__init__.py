@@ -1,5 +1,12 @@
 """Project-owned signal contracts shared by rule and Qlib adapters."""
 
+from .adapter import prediction_frame_to_records
+from .rule import RuleBasedSignalProvider
 from .schema import SignalProvider, SignalRecord
 
-__all__ = ["SignalProvider", "SignalRecord"]
+__all__ = [
+    "RuleBasedSignalProvider",
+    "SignalProvider",
+    "SignalRecord",
+    "prediction_frame_to_records",
+]
