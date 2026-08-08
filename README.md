@@ -6,7 +6,8 @@
 - [x] Default financial-data visibility is the next trading day; missing announcement dates are rejected.
 - [x] Historical as-of universe filtering for listing age, delisting, ST, suspension, and historical liquidity.
 - [x] Qlib 0.9.7 provider adapter and official Alpha158 dataset builder with `forward_excess_return_5d` labels.
-- [ ] Rule-based factor baseline, Qlib LightGBM, Qlib DoubleEnsemble, fair OOS comparison, and paper signals.
+- [x] Qlib LightGBM and Qlib DoubleEnsemble official model adapters with deterministic versioned predictions.
+- [ ] Rule-based factor baseline, fair OOS comparison, and paper signals.
 
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning.
 

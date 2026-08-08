@@ -23,6 +23,7 @@ coverage.xml
 data/**/*.parquet
 data/**/*.duckdb
 data/**/*.duckdb.*
+data/**/*.db
 data/**/*.json
 data/**/*.jsonl
 data/**/*.tmp
@@ -33,6 +34,7 @@ reports/**/*.html
 reports/**/*.json
 reports/**/*.png
 reports/**/*.csv
+mlruns/
 
 # Keep intended local directories visible in a fresh checkout.
 !data/.gitkeep
