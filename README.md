@@ -1,5 +1,15 @@
 # A-Share Quant Framework-first
 
+## Stage 2 progress (2026-08-08)
+
+- [x] PIT feature store with separate trade date, report period, announcement date, effective date, and ingest time.
+- [x] Default financial-data visibility is the next trading day; missing announcement dates are rejected.
+- [x] Historical as-of universe filtering for listing age, delisting, ST, suspension, and historical liquidity.
+- [x] Qlib 0.9.7 provider adapter and official Alpha158 dataset builder with `forward_excess_return_5d` labels.
+- [ ] Rule-based factor baseline, Qlib LightGBM, Qlib DoubleEnsemble, fair OOS comparison, and paper signals.
+
+The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning.
+
 研究优先、默认不下单的 A 股量化研究与纸面交易系统。项目的核心原则是复用成熟开源框架，只实现 A 股数据适配、PIT 数据边界、股票池、因子/模型注册、风险约束、统一信号和纸面交易记录。
 
 ```text
