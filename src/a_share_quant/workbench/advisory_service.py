@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -10,11 +13,14 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
+from a_share_quant.account.contracts import money
 from a_share_quant.account.ledger import AccountLedger, LedgerReceipt
 from a_share_quant.account.store import JsonlLedgerStore
 from a_share_quant.advisory.engine import AdvisoryContext, AdvisoryEngine
 from a_share_quant.advisory.risk import RiskPolicy
 from a_share_quant.advisory.store import PredictionLedgerStore
+
+_INITIALIZATION_FORMAT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -42,12 +48,30 @@ class AdvisoryWorkbenchService:
         today: Callable[[], date] | None = None,
     ) -> None:
         self._ledger_store = JsonlLedgerStore(ledger_path)
+        self._initialization_path = _initialization_path(self._ledger_store.path)
         self._known_instruments = dict(known_instruments or {})
+        requested_initial_cash = money(initial_cash)
+        if requested_initial_cash < 0:
+            raise ValueError("initial_cash must be non-negative")
+        recorded_initial_cash = _load_initialization_metadata(self._initialization_path)
+        if recorded_initial_cash is not None:
+            if requested_initial_cash > 0 and requested_initial_cash != recorded_initial_cash:
+                raise ValueError("initial_cash conflicts with recorded account initialization")
+            effective_initial_cash = recorded_initial_cash
+        else:
+            if self._ledger_store.path.exists() and requested_initial_cash <= 0:
+                raise ValueError(
+                    "existing ledger requires initialization metadata "
+                    "or explicit positive initial cash"
+                )
+            effective_initial_cash = requested_initial_cash
         self._ledger = AccountLedger.from_records(
-            initial_cash=initial_cash,
+            initial_cash=effective_initial_cash,
             records=self._ledger_store.load_records(),
             known_instruments=self._known_instruments,
         )
+        if recorded_initial_cash is None and requested_initial_cash > 0:
+            _write_initialization_metadata(self._initialization_path, requested_initial_cash)
         self._advisory_engine = AdvisoryEngine(risk_policy or RiskPolicy.conservative())
         self._prediction_store = prediction_store or PredictionLedgerStore()
         self._today = today or date.today
@@ -200,9 +224,12 @@ class AdvisoryWorkbenchService:
         }
 
     def managed_local_files(self) -> dict[str, Path]:
-        """Return the explicitly managed, credential-free local ledger file only."""
+        """Return the explicitly managed, credential-free local account files."""
 
-        return {"account-ledger.jsonl": self._ledger_store.path}
+        return {
+            "account-ledger.jsonl": self._ledger_store.path,
+            "account-ledger.jsonl.initialization.json": self._initialization_path,
+        }
 
     def _copy_ledger(self) -> AccountLedger:
         return AccountLedger.from_records(
@@ -213,3 +240,73 @@ class AdvisoryWorkbenchService:
             next_trading_day=self._ledger.next_trading_day,
             lot_size=self._ledger.lot_size,
         )
+
+
+def _initialization_path(ledger_path: Path) -> Path:
+    return ledger_path.with_name(f"{ledger_path.name}.initialization.json")
+
+
+def _load_initialization_metadata(path: Path) -> Decimal | None:
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("account initialization metadata is invalid")
+    try:
+        raw_content = path.read_bytes()
+    except OSError as exc:
+        raise ValueError("account initialization metadata cannot be read") from exc
+    if not raw_content or len(raw_content) > 4096:
+        raise ValueError("account initialization metadata is invalid")
+    try:
+        payload = json.loads(raw_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("account initialization metadata is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {"format_version", "initial_cash"}:
+        raise ValueError("account initialization metadata is invalid")
+    if payload["format_version"] != _INITIALIZATION_FORMAT_VERSION:
+        raise ValueError("account initialization metadata is invalid")
+    encoded_initial_cash = payload["initial_cash"]
+    if not isinstance(encoded_initial_cash, str):
+        raise ValueError("account initialization metadata is invalid")
+    try:
+        parsed_initial_cash = money(encoded_initial_cash)
+    except ValueError as exc:
+        raise ValueError("account initialization metadata is invalid") from exc
+    if parsed_initial_cash <= 0 or encoded_initial_cash != f"{parsed_initial_cash:.2f}":
+        raise ValueError("account initialization metadata is invalid")
+    return parsed_initial_cash
+
+
+def _write_initialization_metadata(path: Path, initial_cash: Decimal) -> None:
+    payload = json.dumps(
+        {
+            "format_version": _INITIALIZATION_FORMAT_VERSION,
+            "initial_cash": f"{initial_cash:.2f}",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(payload)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        raise ValueError("account initialization metadata cannot be written") from exc
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()

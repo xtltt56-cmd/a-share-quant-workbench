@@ -157,6 +157,45 @@ def test_holdings_replays_local_jsonl_and_keeps_manual_execution_requirement(tmp
     assert holdings["positions"][0]["total_quantity"] == 100
 
 
+def test_initial_cash_metadata_replays_a_confirmed_fill_after_zero_value_restart(tmp_path) -> None:
+    first = _service(tmp_path)
+    preview = first.preview_manual_buy(name="平安银行", code="000001", quantity=100, price=10)
+    first.confirm_manual_buy(preview["confirmation_token"])
+
+    metadata_path = first.managed_local_files()["account-ledger.jsonl.initialization.json"]
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    restarted = AdvisoryWorkbenchService(
+        initial_cash=0,
+        ledger_path=tmp_path / "account-ledger.jsonl",
+        known_instruments={"000001": "平安银行"},
+        today=lambda: date(2026, 8, 10),
+    )
+
+    assert metadata == {"format_version": 1, "initial_cash": "100000.00"}
+    assert restarted.holdings()["cash"] == "98995.00"
+    assert restarted.holdings()["positions"][0]["total_quantity"] == 100
+
+
+def test_conflicting_nonzero_initial_cash_is_rejected_after_initialization(tmp_path) -> None:
+    _service(tmp_path)
+
+    with pytest.raises(ValueError, match="conflicts"):
+        AdvisoryWorkbenchService(
+            initial_cash=90000,
+            ledger_path=tmp_path / "account-ledger.jsonl",
+        )
+
+
+def test_existing_ledger_without_initialization_metadata_rejects_zero_initial_cash(
+    tmp_path,
+) -> None:
+    ledger_path = tmp_path / "account-ledger.jsonl"
+    ledger_path.write_text("", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="initialization metadata"):
+        AdvisoryWorkbenchService(initial_cash=0, ledger_path=ledger_path)
+
+
 def test_today_guidance_uses_only_caller_provided_context_and_is_manual_only(tmp_path) -> None:
     service = _service(tmp_path)
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import zipfile
+from datetime import date
+from decimal import Decimal
 
 import pytest
 
+from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.backup import LocalBackupManager
 
 
@@ -99,3 +102,25 @@ def test_restore_needs_preflight_confirmation_and_audits_before_replacement(tmp_
     ]
     assert audit_rows[-1]["action"] == "restore"
     assert audit_rows[-1]["phase"] == "before_replacement"
+
+
+def test_backup_includes_explicit_account_initialization_metadata(tmp_path) -> None:
+    ledger_path = tmp_path / "account-ledger.jsonl"
+    service = AdvisoryWorkbenchService(
+        initial_cash=Decimal("100000"),
+        ledger_path=ledger_path,
+        today=lambda: date(2026, 8, 10),
+    )
+    preview = service.preview_manual_buy(name="平安银行", code="000001", quantity=100, price=10)
+    service.confirm_manual_buy(preview["confirmation_token"])
+    manager = LocalBackupManager(
+        managed_files=service.managed_local_files(),
+        audit_path=tmp_path / "restore-audit.jsonl",
+    )
+
+    manifest = manager.create_backup(tmp_path / "local-backup.zip")
+
+    assert {item.path for item in manifest.files} == {
+        "account-ledger.jsonl",
+        "account-ledger.jsonl.initialization.json",
+    }
