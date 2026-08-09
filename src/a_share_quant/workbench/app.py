@@ -12,14 +12,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
 
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
-    def __init__(self, server_address: tuple[str, int], service: WorkbenchService) -> None:
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        service: WorkbenchService,
+        advisory_service: AdvisoryWorkbenchService | None = None,
+    ) -> None:
         self.service = service
+        self.advisory_service = advisory_service
         super().__init__(server_address, WorkbenchRequestHandler)
 
 
@@ -30,10 +37,18 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             self._write_html(_DASHBOARD_HTML)
+        elif path == "/advisory":
+            self._write_html(_ADVISORY_DASHBOARD_HTML)
         elif path == "/api/health":
             self._write_json(self.server.service.health())
         elif path == "/api/state":
             self._write_json(self.server.service.snapshot())
+        elif path == "/api/advisory/holdings":
+            self._write_advisory_response(lambda service: service.holdings())
+        elif path == "/api/advisory/guidance":
+            self._write_advisory_response(lambda service: service.today_guidance())
+        elif path == "/api/advisory/health":
+            self._write_advisory_response(lambda service: service.model_data_health())
         elif path == "/api/refresh":
             self._write_json(
                 {"error": "use POST with the local refresh request header"},
@@ -44,9 +59,18 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
-        if path != "/api/refresh":
-            self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+        if path == "/api/refresh":
+            self._refresh()
             return
+        if path == "/api/advisory/buy-preview":
+            self._manual_buy_preview()
+            return
+        if path == "/api/advisory/buy-confirm":
+            self._manual_buy_confirm()
+            return
+        self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _refresh(self) -> None:
         if self.headers.get("X-Quant-Workbench-Request") != "refresh":
             self._write_json(
                 {"error": "local refresh request header required"},
@@ -55,6 +79,74 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return
         self.server.service.refresh()
         self._write_json(self.server.service.snapshot())
+
+    def _manual_buy_preview(self) -> None:
+        payload = self._manual_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"name", "code", "quantity", "price"}:
+            self._write_advisory_error(HTTPStatus.BAD_REQUEST)
+            return
+        self._write_advisory_response(
+            lambda service: service.preview_manual_buy(
+                name=payload["name"],
+                code=payload["code"],
+                quantity=payload["quantity"],
+                price=payload["price"],
+            )
+        )
+
+    def _manual_buy_confirm(self) -> None:
+        payload = self._manual_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"confirmation_token"}:
+            self._write_advisory_error(HTTPStatus.BAD_REQUEST)
+            return
+        self._write_advisory_response(
+            lambda service: service.confirm_manual_buy(payload["confirmation_token"])
+        )
+
+    def _manual_request_payload(self) -> dict[str, Any] | None:
+        if self.headers.get("X-Quant-Workbench-Request") != "manual-advisory":
+            self._write_json(
+                {"error": "local manual advisory request header required"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return None
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length < 1 or content_length > 4096:
+                raise ValueError
+            parsed = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            self._write_advisory_error(HTTPStatus.BAD_REQUEST)
+            return None
+        return parsed
+
+    def _write_advisory_response(self, action: Any) -> None:
+        service = self.server.advisory_service
+        if service is None:
+            self._write_json(
+                {
+                    "error": "local advisory service is unavailable",
+                    "manual_execution_required": True,
+                },
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            self._write_json(action(service))
+        except Exception:  # A local HTTP boundary must not disclose internal details.
+            self._write_advisory_error(HTTPStatus.BAD_REQUEST)
+
+    def _write_advisory_error(self, status: HTTPStatus) -> None:
+        self._write_json(
+            {"error": "manual advisory request could not be processed", "manual_execution_required": True},
+            status=status,
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         # Keep the default access log local and payload-free.
@@ -82,12 +174,17 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 def create_server(
     *,
     service: WorkbenchService | None = None,
+    advisory_service: AdvisoryWorkbenchService | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
     if host != "127.0.0.1":
         raise ValueError("the workbench must bind to 127.0.0.1")
-    return WorkbenchHTTPServer((host, port), service or WorkbenchService(allow_network=False))
+    return WorkbenchHTTPServer(
+        (host, port),
+        service or WorkbenchService(allow_network=False),
+        advisory_service,
+    )
 
 
 def run_server(
@@ -95,11 +192,12 @@ def run_server(
     port: int = 8765,
     allow_network: bool = False,
     repo_root: Path | None = None,
+    advisory_service: AdvisoryWorkbenchService | None = None,
 ) -> None:
     del repo_root  # reserved for future config loading; no path is trusted from HTTP
     service = WorkbenchService(allow_network=allow_network)
     service.start_background()
-    server = create_server(service=service, port=port)
+    server = create_server(service=service, advisory_service=advisory_service, port=port)
     try:
         print(f"A-share Quant Workbench: http://127.0.0.1:{server.server_address[1]}/")
         server.serve_forever()
@@ -197,6 +295,25 @@ async function load(){
 }
 async function refresh(){await fetch('/api/refresh',{method:'POST',headers:{'X-Quant-Workbench-Request':'refresh'},cache:'no-store'});await load()}
 load(); setInterval(load,15000);
+</script></body></html>"""
+
+
+_ADVISORY_DASHBOARD_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地人工投顾</title><style>
+body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#172033;margin:0}header{background:#12233f;color:white;padding:20px 28px}main{max-width:960px;margin:22px auto;padding:0 18px}.card{background:white;border:1px solid #dfe5ef;border-radius:10px;padding:16px;margin-top:14px;box-shadow:0 2px 8px #12233f12}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}label{display:grid;gap:5px;font-size:13px}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}button{background:#1d5fd1;color:white;border:0;border-radius:6px;padding:9px 14px;cursor:pointer}.muted{color:#667085}.warn{color:#a15c00;white-space:pre-wrap}pre{overflow:auto;background:#f8fafc;padding:12px;border-radius:6px}</style></head>
+<body><header><h1>本地人工投顾</h1><div>仅供人工复核、人工下单与本机成交记录；本页面不提交委托。</div></header><main>
+<div class="card"><strong>重要提示：</strong>请先在券商端自行完成交易，再在此确认记录；数据与模型状态不构成实时市场验证。</div>
+<div class="card"><h2>持仓与状态</h2><div id="holdings" class="muted">加载中</div><div id="health" class="muted"></div></div>
+<div class="card"><h2>人工成交记录</h2><p class="muted">输入只包含名称、代码、数量和价格。先预览，再使用一次性确认令牌记录人工成交。</p><div class="grid"><label>证券名称<input id="name" value=""></label><label>证券代码<input id="code" value=""></label><label>数量<input id="quantity" inputmode="numeric" value=""></label><label>价格<input id="price" inputmode="decimal" value=""></label></div><p><button onclick="previewBuy()">预览人工成交</button> <button onclick="confirmBuy()">确认记录人工成交</button></p><label>确认令牌<input id="token" readonly></label><p id="message" class="warn"></p></div>
+<div class="card"><h2>今日指引</h2><p class="muted">未提供经核验的本地上下文时，系统将明确显示数据不足。</p><pre id="guidance">加载中</pre></div></main>
+<script>
+function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+async function getJson(path){const r=await fetch(path,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error('本地服务暂不可用');return d}
+async function load(){try{const h=await getJson('/api/advisory/holdings');document.getElementById('holdings').innerHTML='<pre>'+esc(JSON.stringify(h,null,2))+'</pre>';const health=await getJson('/api/advisory/health');document.getElementById('health').textContent='模型/数据状态：'+JSON.stringify(health);const guidance=await getJson('/api/advisory/guidance');document.getElementById('guidance').textContent=JSON.stringify(guidance,null,2)}catch(e){document.getElementById('message').textContent='本地人工投顾服务暂不可用'}}
+async function previewBuy(){const payload={name:document.getElementById('name').value,code:document.getElementById('code').value,quantity:Number(document.getElementById('quantity').value),price:document.getElementById('price').value};try{const r=await fetch('/api/advisory/buy-preview',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Quant-Workbench-Request':'manual-advisory'},body:JSON.stringify(payload)});const d=await r.json();if(!r.ok)throw new Error();document.getElementById('token').value=d.confirmation_token;document.getElementById('message').textContent=d.notice_zh+' 预估总成本：'+d.estimated_total_cost}catch(e){document.getElementById('message').textContent='预览失败，请检查四个输入字段'}}
+async function confirmBuy(){const token=document.getElementById('token').value;try{const r=await fetch('/api/advisory/buy-confirm',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Quant-Workbench-Request':'manual-advisory'},body:JSON.stringify({confirmation_token:token})});const d=await r.json();if(!r.ok)throw new Error();document.getElementById('message').textContent=d.notice_zh;await load()}catch(e){document.getElementById('message').textContent='确认失败，请重新预览并人工核对'}}
+load();
 </script></body></html>"""
 
 

@@ -10,6 +10,7 @@ from a_share_quant.data.realtime.diagnostics import (
     collect_network_diagnostics,
     write_network_diagnostics_report,
 )
+from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.app import run_server
 from a_share_quant.workbench.service import WorkbenchService
 
@@ -26,6 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subcommands.add_parser("status", help="show sanitized local capability status")
     status.add_argument("--json", action="store_true", dest="as_json")
+
+    advisory_status = subcommands.add_parser(
+        "advisory-status",
+        help="show local manual-advisory ledger and data status without network access",
+    )
+    advisory_status.add_argument("--ledger", type=Path, required=True)
+    advisory_status.add_argument("--initial-cash", required=True)
 
     refresh = subcommands.add_parser("refresh", help="perform one paper-monitor refresh")
     refresh.add_argument(
@@ -64,6 +72,22 @@ def main(argv: list[str] | None = None) -> int:
         payload["live_trading_enabled"] = False
         payload["paper_only"] = True
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "advisory-status":
+        service = AdvisoryWorkbenchService(
+            initial_cash=args.initial_cash,
+            ledger_path=args.ledger,
+        )
+        print(
+            json.dumps(
+                {
+                    "holdings": service.holdings(),
+                    "model_data_health": service.model_data_health(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "realtime":
         report = collect_network_diagnostics(allow_network=bool(args.network))
