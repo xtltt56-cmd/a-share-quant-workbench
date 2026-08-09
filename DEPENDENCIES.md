@@ -58,6 +58,11 @@ specific. Capability discovery skips missing or permission-denied providers;
 the current smoke run used the explicitly labelled AKShare public fallback and
 recorded a proxy failure without credentials or raw provider payloads.
 
+The Stage 3RT-D dashboard uses the Python standard library HTTP server and
+does not add Streamlit, FastAPI, or an inbound service dependency. It binds
+only to `127.0.0.1`; provider calls remain optional runtime behavior guarded by
+the explicit launcher/CLI network flag.
+
 ## 依赖管理规则
 
 1. 核心安装必须可在无 Token、无券商、无 RQData、无外网历史数据的环境中完成，并能运行离线测试。

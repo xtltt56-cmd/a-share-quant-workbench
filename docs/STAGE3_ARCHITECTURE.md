@@ -497,6 +497,14 @@ bounded retry policy fail closed on future/backwards/stale data. EOD callbacks
 are ordered so an official daily signal is observable only after final daily
 data, reconciliation, PIT update, and report generation succeed.
 
+Stage 3RT-D provides `workbench/app.py` and `workbench/service.py` using the
+Python standard library HTTP server, so the local dashboard does not require a
+new web framework. The service remains usable when no provider is available,
+returns only sanitized health/state payloads, and runs with network access
+disabled unless the operator explicitly starts the workbench with `--network`.
+The PowerShell launcher owns a repository-local PID/log boundary, opens only
+the loopback URL, and the Desktop `.lnk` points to that stable launcher.
+
 ## 20. Stage 3A acceptance criteria
 
 Stage 3A is accepted only when all of the following are true:

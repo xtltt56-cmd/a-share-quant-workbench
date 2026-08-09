@@ -92,9 +92,17 @@ provider is present.
       WAIT/WATCH/READY/OVERHEATED/RISK/STALE_DATA monitor states, model
       frequency guards, trading-session-aware polling, bounded retries, gap
       tracking, and an ordered EOD finalization/PIT boundary.
-- [ ] Stage 3RT-D dashboard, CLI, Windows launchers, and final acceptance
-      report remain in progress. No broker, account, or live order interface
-      exists.
+- [x] Stage 3RT-D adds the loopback-only Dashboard/API, paper-only service,
+      CLI, bounded Windows launcher/stop scripts, and Desktop shortcut creator.
+      The verified local shortcut is
+      `C:\Users\lenovo\Desktop\A股量化交易系统.lnk` and is not committed.
+- [x] Stage 3RT acceptance report is in
+      [`reports/stage3_realtime_workbench_report.md`](reports/stage3_realtime_workbench_report.md).
+      The current provider smoke remains proxy-blocked; this is explicitly
+      recorded as a data-source limitation, not investment evidence.
+- [x] Stage 3RT regression: 175 tests passed, coverage 88%, Ruff/pip
+      check/compileall/diff checks passed. No broker, account, or live order
+      interface exists.
 
 The Stage 3RT-A design is recorded in
 [`docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md`](docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md)
@@ -143,6 +151,23 @@ and the execution plan is in
 - [x] Stage 3RT-C regression: 167 tests passed, including the original suite
       and new intraday/runtime/frequency/EOD coverage. Full coverage and the
       final commit gate are recorded after the repository checks below.
+
+### Stage 3RT-D evidence
+
+- [x] Added `src/a_share_quant/workbench/app.py` and `service.py`. The HTTP
+      server rejects non-loopback hosts, returns sanitized health/state JSON,
+      and separates official daily candidates from descriptive intraday
+      monitor rows.
+- [x] Added `scripts/quant_cli.py` plus PowerShell start/stop/shortcut
+      scripts. The launcher owns only its PID file, writes local logs, opens
+      the browser at `127.0.0.1`, and has an offline mode for deterministic
+      UI smoke tests.
+- [x] Created and inspected the local Desktop `.lnk`; it targets the stable
+      PowerShell launcher and never a temporary Python path. The `.lnk` is
+      outside Git.
+- [x] Dashboard/launcher security tests cover loopback binding, paper-only
+      state, no raw provider error payload, no broker import, and no
+      `0.0.0.0` listener.
 
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 

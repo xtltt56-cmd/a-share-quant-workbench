@@ -1,4 +1,5 @@
 from datetime import datetime
+from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
 
 from a_share_quant.contracts.realtime import MarketSnapshot, RealTimeQuote
@@ -178,3 +179,42 @@ def test_scheduler_retries_provider_with_bounded_backoff() -> None:
     assert tick.updated is True
     assert attempts == 3
     assert sleeps == [0.1, 0.2]
+
+
+def test_market_hours_mapping_and_calendar_validation_are_explicit() -> None:
+    hours = MarketHours.from_mapping(
+        {
+            "timezone": "Asia/Shanghai",
+            "pre_market_start": "08:45",
+            "open_start": "09:30",
+            "morning_end": "11:30",
+            "afternoon_start": "13:00",
+            "close_end": "15:00",
+        }
+    )
+    resolver = SessionResolver(hours=hours, calendar=StaticTradingCalendar())
+
+    assert hours.pre_market_start == datetime_time(8, 45)
+    assert resolver.resolve(datetime(2026, 8, 10, 9, 0, tzinfo=TZ)) is MarketSession.PRE_MARKET
+    assert resolver.resolve(datetime(2026, 8, 10, 7, 30, tzinfo=TZ)) is MarketSession.CLOSED
+
+    try:
+        resolver.resolve(datetime(2026, 8, 10, 9, 30))
+    except ValueError as exc:
+        assert "timezone-aware" in str(exc)
+    else:
+        raise AssertionError("naive timestamps must be rejected")
+
+
+def test_gap_tracker_validates_bars_and_can_recover_from_provider() -> None:
+    tracker = GapRecoveryTracker(interval_seconds=60)
+    provider = FakeProvider(_snapshot(datetime(2026, 8, 10, 1, 30, tzinfo=TZ)))
+
+    try:
+        tracker.observe("000001", datetime(2026, 8, 10, 1, 30))
+    except ValueError as exc:
+        assert "timezone-aware" in str(exc)
+    else:
+        raise AssertionError("naive gap timestamps must be rejected")
+    assert tracker.observe_bars([]) == ()
+    assert tracker.recover(provider, symbols=("000001",)) == ()

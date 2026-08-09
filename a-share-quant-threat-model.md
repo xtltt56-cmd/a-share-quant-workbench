@@ -289,3 +289,31 @@ runtime rejects unsafe timestamps and unavailable sessions, and the EOD
 boundary prevents provisional data from being presented as an official daily
 signal. Local dashboard binding, launcher process ownership, and secret/log
 scans remain Stage 3RT-D acceptance items.
+
+## Stage 3RT-D security addendum (2026-08-09)
+
+Stage 3RT-D adds a standard-library local HTTP dashboard and Windows launcher
+surface. It does not add a broker client, account login, order endpoint, or
+remote listener.
+
+| Boundary | Evidence | Control |
+|---|---|---|
+| Browser -> dashboard | `src/a_share_quant/workbench/app.py`, `tests/test_workbench_app.py` | Server construction rejects every host other than `127.0.0.1`; API responses use no-store headers and expose paper-only status |
+| Provider/runtime -> dashboard | `src/a_share_quant/workbench/service.py` | Offline mode skips endpoint calls; provider errors are reduced to exception class/status; no credential field is serialized |
+| User shortcut -> process | `scripts/start_quant_workbench.ps1`, `stop_quant_workbench.ps1`, `create_desktop_shortcut.ps1` | Stable launcher path, owned PID file under `.runtime`, local logs, bounded readiness polling, explicit stop target, actual `.lnk` kept outside Git |
+| Source tree -> release | `tests/test_launcher_security.py`, repository scans | No `0.0.0.0`, broker import, order call, or live flag path; `.env` and runtime state remain ignored |
+
+### Stage 3RT-D abuse paths and residual risk
+
+| ID | Abuse path | Priority | Mitigation/status |
+|---|---|---|---|
+| TM-024 | Dashboard is accidentally exposed on a remote interface | critical if enabled | `create_server` rejects non-loopback hosts; regression test covers `0.0.0.0`; launcher URL is loopback-only |
+| TM-025 | Launcher reports ready while the process failed or a stale PID is reused | medium | bounded `/api/health` readiness loop, PID existence check, local stderr log, stop script removes only its own PID file |
+| TM-026 | Provider exception or secret appears in API/log/report | high | service and provider layers expose sanitized status/type only; secret scan and launcher tests are part of acceptance |
+| TM-027 | Operator interprets monitor `READY` as an order | high | dashboard labels paper/signal monitoring, official daily list is separate, no execution module or broker import exists |
+
+Stage 3RT-D conclusion: the local workbench is accepted for paper-only
+monitoring with an explicit real-data availability limitation. The boundary
+is fail-closed for remote binding, provider failure, and live execution. Any
+future broker or external deployment must trigger a new threat-model review,
+new human approval, and a separate execution package.
