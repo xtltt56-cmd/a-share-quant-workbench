@@ -245,7 +245,7 @@ class LocalBackupManager:
             return self._create_backup_locked(archive_path)
 
     def _create_backup_locked(self, archive_path: Path) -> BackupManifest:
-        archive = _resolve_local_path(archive_path)
+        archive = _resolve_backup_archive_path(archive_path)
         protected_paths = (
             *self._managed_files.values(),
             self._audit_path,
@@ -1439,6 +1439,22 @@ def _resolve_declared_backup_path(path: Path, *, description: str) -> Path:
             f"{description} cannot use a reserved backup coordination sidecar name"
         )
     return _resolve_non_linked_path(candidate, description=description)
+
+
+def _resolve_backup_archive_path(path: Path) -> Path:
+    candidate = _lexically_normalized_absolute_path(Path(path))
+    _validate_backup_archive_not_reserved_sidecar(candidate)
+    archive = _resolve_local_path(candidate)
+    _validate_backup_archive_not_reserved_sidecar(archive)
+    return archive
+
+
+def _validate_backup_archive_not_reserved_sidecar(path: Path) -> None:
+    if _is_reserved_coordination_sidecar_name(path.name):
+        raise ValueError(
+            "backup archive cannot replace a protected file: "
+            "reserved backup coordination sidecar"
+        )
 
 
 def _is_reserved_coordination_sidecar_name(name: str) -> bool:

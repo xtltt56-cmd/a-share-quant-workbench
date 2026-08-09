@@ -1284,6 +1284,50 @@ def test_backup_rejects_archive_alias_to_protected_restore_artifact(tmp_path, ar
         "journal rollback",
     ),
 )
+def test_backup_rejects_other_manager_coordination_sidecar_archive_target(
+    tmp_path, artifact
+) -> None:
+    owner_target = tmp_path / "owner" / "account-ledger.jsonl"
+    owner = LocalBackupManager(
+        managed_files={"account-ledger.jsonl": owner_target},
+        audit_path=tmp_path / "owner" / "restore-audit.jsonl",
+    )
+    owner_artifact = {
+        "pending marker": next(iter(owner._destination_marker_paths.values())),
+        "destination lock": owner._destination_lock_paths[0],
+        "journal": owner._journal_path,
+        "audit lock": owner._restore_lock_path,
+        "journal rollback": owner._journal_path.with_name(
+            f"{owner._journal_path.name}.restore-{'a' * 32}.0.rollback"
+        ),
+    }[artifact]
+    original_content = f"owner-{artifact}".encode()
+    owner_artifact.write_bytes(original_content)
+    independent_target = tmp_path / "independent" / "model-notes.json"
+    independent_target.parent.mkdir()
+    independent_target.write_text('{"model":"independent"}\n', encoding="utf-8")
+    independent = LocalBackupManager(
+        managed_files={"model-notes.json": independent_target},
+        audit_path=tmp_path / "independent" / "restore-audit.jsonl",
+    )
+    archive_alias = owner_artifact.parent / "alias" / ".." / owner_artifact.name
+
+    with pytest.raises(ValueError, match="reserved backup coordination sidecar"):
+        independent.create_backup(archive_alias)
+
+    assert owner_artifact.read_bytes() == original_content
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    (
+        "pending marker",
+        "destination lock",
+        "journal",
+        "audit lock",
+        "journal rollback",
+    ),
+)
 @pytest.mark.parametrize("declared_as", ("managed target", "audit path"))
 def test_manager_rejects_other_configuration_reserved_sidecar_path(
     tmp_path, artifact, declared_as
