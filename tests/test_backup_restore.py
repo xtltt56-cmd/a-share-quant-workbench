@@ -68,15 +68,87 @@ def _restore_journal_path(audit_path: Path) -> Path:
     return audit_path.with_name(f".{audit_path.name}.restore-journal.json")
 
 
-def _write_pending_account_journal(
+def _canonical_destination(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path.resolve())))
+
+
+def _managed_configuration_digest(managed_files: dict[str, Path]) -> str:
+    configuration = [
+        {"path": logical_path, "destination": _canonical_destination(destination)}
+        for logical_path, destination in sorted(managed_files.items())
+    ]
+    encoded = json.dumps(
+        configuration,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_bound_pending_journal(
+    *,
+    audit_path: Path,
+    managed_files: dict[str, Path],
+    original_contents: dict[str, bytes | None],
+    planned_contents: dict[str, bytes],
+    invalid_snapshot_hash: bool = False,
+) -> tuple[Path, tuple[Path, ...]]:
+    transaction_id = f"restore-{'a' * 32}"
+    journal_path = _restore_journal_path(audit_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, object]] = []
+    snapshots: list[Path] = []
+    for index, (logical_path, original_content) in enumerate(original_contents.items()):
+        planned_content = planned_contents[logical_path]
+        had_original = original_content is not None
+        snapshot: Path | None = None
+        if had_original:
+            snapshot = journal_path.with_name(
+                f"{journal_path.name}.{transaction_id}.{index}.rollback"
+            )
+            snapshot.write_bytes(original_content)
+            snapshots.append(snapshot)
+        expected_hash = (
+            hashlib.sha256(original_content).hexdigest() if original_content is not None else None
+        )
+        entries.append(
+            {
+                "path": logical_path,
+                "destination": _canonical_destination(managed_files[logical_path]),
+                "had_original": had_original,
+                "snapshot": snapshot.name if snapshot is not None else None,
+                "sha256": "0" * 64 if invalid_snapshot_hash and had_original else expected_hash,
+                "size": len(original_content) if original_content is not None else None,
+                "planned_sha256": hashlib.sha256(planned_content).hexdigest(),
+                "planned_size": len(planned_content),
+            }
+        )
+    journal_path.write_text(
+        json.dumps(
+            {
+                "format_version": 2,
+                "transaction_id": transaction_id,
+                "configuration_digest": _managed_configuration_digest(managed_files),
+                "entries": entries,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    return journal_path, tuple(snapshots)
+
+
+def _write_legacy_pending_account_journal(
     *,
     audit_path: Path,
     original_ledger: bytes,
     original_initialization: bytes,
-    invalid_snapshot_hash: bool = False,
 ) -> tuple[Path, tuple[Path, Path]]:
-    transaction_id = f"restore-{'a' * 32}"
+    transaction_id = f"restore-{'c' * 32}"
     journal_path = _restore_journal_path(audit_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, object]] = []
     snapshots: list[Path] = []
     for index, (logical_path, content) in enumerate(
@@ -90,23 +162,18 @@ def _write_pending_account_journal(
         )
         snapshot.write_bytes(content)
         snapshots.append(snapshot)
-        expected_hash = hashlib.sha256(content).hexdigest()
         entries.append(
             {
                 "path": logical_path,
                 "had_original": True,
                 "snapshot": snapshot.name,
-                "sha256": "0" * 64 if invalid_snapshot_hash else expected_hash,
+                "sha256": hashlib.sha256(content).hexdigest(),
                 "size": len(content),
             }
         )
     journal_path.write_text(
         json.dumps(
-            {
-                "format_version": 1,
-                "transaction_id": transaction_id,
-                "entries": entries,
-            },
+            {"format_version": 1, "transaction_id": transaction_id, "entries": entries},
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -476,19 +543,27 @@ def test_new_manager_recovers_durable_journal_after_partial_account_restore(tmp_
     _, ledger, initialization, audit_path = _account_pair_manager(tmp_path)
     original_ledger = b"original-ledger"
     original_initialization = b"original-initialization"
+    managed_files = {
+        "account-ledger.jsonl": ledger,
+        "account-ledger.jsonl.initialization.json": initialization,
+    }
     ledger.write_bytes(b"partially-restored-ledger")
     initialization.write_bytes(original_initialization)
-    journal_path, snapshots = _write_pending_account_journal(
+    journal_path, snapshots = _write_bound_pending_journal(
         audit_path=audit_path,
-        original_ledger=original_ledger,
-        original_initialization=original_initialization,
+        managed_files=managed_files,
+        original_contents={
+            "account-ledger.jsonl": original_ledger,
+            "account-ledger.jsonl.initialization.json": original_initialization,
+        },
+        planned_contents={
+            "account-ledger.jsonl": b"partially-restored-ledger",
+            "account-ledger.jsonl.initialization.json": b"planned-initialization",
+        },
     )
 
     LocalBackupManager(
-        managed_files={
-            "account-ledger.jsonl": ledger,
-            "account-ledger.jsonl.initialization.json": initialization,
-        },
+        managed_files=managed_files,
         consistency_groups={
             "account-state": (
                 "account-ledger.jsonl",
@@ -508,21 +583,29 @@ def test_manager_retains_journal_and_snapshots_when_recovery_cannot_validate(tmp
     _, ledger, initialization, audit_path = _account_pair_manager(tmp_path)
     original_ledger = b"original-ledger"
     original_initialization = b"original-initialization"
+    managed_files = {
+        "account-ledger.jsonl": ledger,
+        "account-ledger.jsonl.initialization.json": initialization,
+    }
     ledger.write_bytes(b"partially-restored-ledger")
     initialization.write_bytes(original_initialization)
-    journal_path, snapshots = _write_pending_account_journal(
+    journal_path, snapshots = _write_bound_pending_journal(
         audit_path=audit_path,
-        original_ledger=original_ledger,
-        original_initialization=original_initialization,
+        managed_files=managed_files,
+        original_contents={
+            "account-ledger.jsonl": original_ledger,
+            "account-ledger.jsonl.initialization.json": original_initialization,
+        },
+        planned_contents={
+            "account-ledger.jsonl": b"partially-restored-ledger",
+            "account-ledger.jsonl.initialization.json": b"planned-initialization",
+        },
         invalid_snapshot_hash=True,
     )
 
     with pytest.raises(ValueError, match="restore journal"):
         LocalBackupManager(
-            managed_files={
-                "account-ledger.jsonl": ledger,
-                "account-ledger.jsonl.initialization.json": initialization,
-            },
+            managed_files=managed_files,
             consistency_groups={
                 "account-state": (
                     "account-ledger.jsonl",
@@ -540,26 +623,21 @@ def test_manager_retains_journal_and_snapshots_when_recovery_cannot_validate(tmp
 
 def test_new_manager_finalizes_an_empty_pending_restore_journal(tmp_path) -> None:
     audit_path = tmp_path / "restore-audit.jsonl"
-    journal_path = _restore_journal_path(audit_path)
-    journal_path.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "transaction_id": f"restore-{'b' * 32}",
-                "entries": [],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
+    managed_files = {"model-notes.json": tmp_path / "model-notes.json"}
+    journal_path, snapshots = _write_bound_pending_journal(
+        audit_path=audit_path,
+        managed_files=managed_files,
+        original_contents={},
+        planned_contents={},
     )
 
     LocalBackupManager(
-        managed_files={"model-notes.json": tmp_path / "model-notes.json"},
+        managed_files=managed_files,
         audit_path=audit_path,
     )
 
     assert not journal_path.exists()
+    assert snapshots == ()
 
 
 def test_backup_waits_for_restore_and_archives_one_coherent_account_state(
@@ -629,3 +707,105 @@ def test_backup_waits_for_restore_and_archives_one_coherent_account_state(
             bundle.read("managed/account-ledger.jsonl.initialization.json"),
         )
     assert backup_state in {original_state, archived_state}
+
+
+def test_manager_rejects_pending_journal_bound_to_different_managed_destinations(tmp_path) -> None:
+    audit_path = tmp_path / "shared" / "restore-audit.jsonl"
+    source_ledger = tmp_path / "source" / "account-ledger.jsonl"
+    source_initialization = tmp_path / "source" / "account-ledger.jsonl.initialization.json"
+    target_ledger = tmp_path / "target" / "account-ledger.jsonl"
+    target_initialization = tmp_path / "target" / "account-ledger.jsonl.initialization.json"
+    source_ledger.parent.mkdir()
+    target_ledger.parent.mkdir()
+    source_ledger.write_bytes(b"partially-restored-source-ledger")
+    source_initialization.write_bytes(b"source-initialization")
+    target_ledger.write_bytes(b"target-ledger")
+    target_initialization.write_bytes(b"target-initialization")
+    # A v1 journal only identifies logical paths, so it can be replayed against B.
+    journal_path, snapshots = _write_legacy_pending_account_journal(
+        audit_path=audit_path,
+        original_ledger=b"original-source-ledger",
+        original_initialization=b"original-source-initialization",
+    )
+
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        LocalBackupManager(
+            managed_files={
+                "account-ledger.jsonl": target_ledger,
+                "account-ledger.jsonl.initialization.json": target_initialization,
+            },
+            consistency_groups={
+                "account-state": (
+                    "account-ledger.jsonl",
+                    "account-ledger.jsonl.initialization.json",
+                )
+            },
+            audit_path=audit_path,
+        )
+
+    assert target_ledger.read_bytes() == b"target-ledger"
+    assert target_initialization.read_bytes() == b"target-initialization"
+    assert journal_path.exists()
+    assert all(snapshot.exists() for snapshot in snapshots)
+
+
+def test_manager_retains_manual_writes_that_do_not_match_pending_restore_state(
+    tmp_path, monkeypatch
+) -> None:
+    manager, ledger, initialization, audit_path = _account_pair_manager(tmp_path)
+    managed_files = {
+        "account-ledger.jsonl": ledger,
+        "account-ledger.jsonl.initialization.json": initialization,
+    }
+    planned_ledger = b"planned-ledger"
+    planned_initialization = b"planned-initialization"
+    ledger.write_bytes(planned_ledger)
+    initialization.write_bytes(planned_initialization)
+    archive = tmp_path / "account-backup.zip"
+    manager.create_backup(archive)
+    ledger.unlink()
+    initialization.unlink()
+    preflight = manager.preflight_restore(archive)
+
+    real_replace = os.replace
+    interrupted = False
+
+    def interrupt_after_first_replacement(source, destination) -> None:
+        nonlocal interrupted
+        if not interrupted and destination == ledger and source.read_bytes() == planned_ledger:
+            interrupted = True
+            real_replace(source, destination)
+            raise KeyboardInterrupt("injected interruption")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "a_share_quant.workbench.backup.os.replace",
+        interrupt_after_first_replacement,
+    )
+    # Model a process ending before its in-process exception handler can recover.
+    monkeypatch.setattr(manager, "_recover_pending_restore", lambda: None)
+
+    with pytest.raises(KeyboardInterrupt, match="injected interruption"):
+        manager.restore(archive, confirmation_token=preflight.confirmation_token)
+
+    manual_ledger = b"manual-ledger-after-interruption"
+    manual_initialization = b"manual-initialization-after-interruption"
+    ledger.write_bytes(manual_ledger)
+    initialization.write_bytes(manual_initialization)
+    journal_path = _restore_journal_path(audit_path)
+
+    with pytest.raises(ValueError, match="unexpected post-interruption state"):
+        LocalBackupManager(
+            managed_files=managed_files,
+            consistency_groups={
+                "account-state": (
+                    "account-ledger.jsonl",
+                    "account-ledger.jsonl.initialization.json",
+                )
+            },
+            audit_path=audit_path,
+        )
+
+    assert ledger.read_bytes() == manual_ledger
+    assert initialization.read_bytes() == manual_initialization
+    assert journal_path.exists()

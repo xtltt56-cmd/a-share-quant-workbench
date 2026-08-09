@@ -17,7 +17,8 @@ from uuid import uuid4
 _FORMAT_VERSION = 1
 _MANIFEST_NAME = "backup-manifest.json"
 _MANAGED_PREFIX = "managed/"
-_RESTORE_JOURNAL_FORMAT_VERSION = 1
+_RESTORE_JOURNAL_FORMAT_VERSION = 2
+_LEGACY_RESTORE_JOURNAL_FORMAT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -68,30 +69,50 @@ class _PendingRestore:
 @dataclass(frozen=True)
 class _RestoreJournalEntry:
     path: str
+    destination: str | None
     had_original: bool
     snapshot: str | None
     sha256: str | None
     size: int | None
+    planned_sha256: str | None
+    planned_size: int | None
 
     def to_dict(self) -> dict[str, object]:
+        if (
+            self.destination is None
+            or self.planned_sha256 is None
+            or self.planned_size is None
+        ):
+            raise ValueError("restore journal is invalid")
         return {
             "path": self.path,
+            "destination": self.destination,
             "had_original": self.had_original,
             "snapshot": self.snapshot,
             "sha256": self.sha256,
             "size": self.size,
+            "planned_sha256": self.planned_sha256,
+            "planned_size": self.planned_size,
         }
 
 
 @dataclass(frozen=True)
 class _RestoreJournal:
+    format_version: int
     transaction_id: str
+    configuration_digest: str | None
     entries: tuple[_RestoreJournalEntry, ...]
 
     def to_dict(self) -> dict[str, object]:
+        if (
+            self.format_version != _RESTORE_JOURNAL_FORMAT_VERSION
+            or self.configuration_digest is None
+        ):
+            raise ValueError("restore journal is invalid")
         return {
             "format_version": _RESTORE_JOURNAL_FORMAT_VERSION,
             "transaction_id": self.transaction_id,
+            "configuration_digest": self.configuration_digest,
             "entries": [entry.to_dict() for entry in self.entries],
         }
 
@@ -129,6 +150,7 @@ class LocalBackupManager:
             raise ValueError("restore audit file cannot be a managed backup file")
         if _has_duplicate_destinations(self._managed_files.values()):
             raise ValueError("managed backup files cannot share a duplicate local destination")
+        self._managed_configuration_digest = _managed_configuration_digest(self._managed_files)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pending_restores: dict[str, _PendingRestore] = {}
         self._restore_lock = RLock()
@@ -243,7 +265,7 @@ class LocalBackupManager:
                     )
                 )
 
-            journal = self._create_restore_journal(staged)
+            journal = self._create_restore_journal(staged, contents)
             self._write_restore_journal(journal)
             audit_id = self._append_restore_audit(manifest)
             for _, destination, temporary in staged:
@@ -269,6 +291,7 @@ class LocalBackupManager:
     def _create_restore_journal(
         self,
         staged: list[tuple[str, Path, Path]],
+        contents: Mapping[str, bytes],
     ) -> _RestoreJournal:
         transaction_id = f"restore-{uuid4().hex}"
         entries: list[_RestoreJournalEntry] = []
@@ -285,13 +308,21 @@ class LocalBackupManager:
             entries.append(
                 _RestoreJournalEntry(
                     path=logical_path,
+                    destination=_canonical_path(destination),
                     had_original=had_original,
                     snapshot=snapshot_path.name if had_original else None,
                     sha256=sha256,
                     size=size,
+                    planned_sha256=_sha256(contents[logical_path]),
+                    planned_size=len(contents[logical_path]),
                 )
             )
-        return _RestoreJournal(transaction_id=transaction_id, entries=tuple(entries))
+        return _RestoreJournal(
+            format_version=_RESTORE_JOURNAL_FORMAT_VERSION,
+            transaction_id=transaction_id,
+            configuration_digest=self._managed_configuration_digest,
+            entries=tuple(entries),
+        )
 
     def _write_restore_journal(self, journal: _RestoreJournal) -> None:
         _write_durable_bytes(
@@ -307,12 +338,14 @@ class LocalBackupManager:
             recovery_targets = self._journal_recovery_targets(journal)
             self._recover_restore_journal(journal, recovery_targets)
         except ValueError as exc:
-            raise ValueError("restore journal cannot be recovered") from exc
+            raise ValueError(f"restore journal cannot be recovered: {exc}") from exc
 
     def _read_pending_restore_journal(self) -> _RestoreJournal | None:
+        if self._journal_path.is_symlink():
+            raise ValueError("restore journal is invalid")
         if not self._journal_path.exists():
             return None
-        if self._journal_path.is_symlink() or not self._journal_path.is_file():
+        if not self._journal_path.is_file():
             raise ValueError("restore journal is invalid")
         try:
             content = self._journal_path.read_bytes()
@@ -324,6 +357,14 @@ class LocalBackupManager:
         paths = {entry.path for entry in journal.entries}
         if not paths.issubset(self._managed_files):
             raise ValueError("restore journal is invalid")
+        if (
+            journal.format_version != _RESTORE_JOURNAL_FORMAT_VERSION
+            or journal.configuration_digest != self._managed_configuration_digest
+        ):
+            raise ValueError("restore journal configuration mismatch")
+        for entry in journal.entries:
+            if entry.destination != _canonical_path(self._managed_files[entry.path]):
+                raise ValueError("restore journal configuration mismatch")
         self._ensure_consistency_groups_complete(paths)
         return journal
 
@@ -336,6 +377,14 @@ class LocalBackupManager:
             destination = self._managed_files[entry.path]
             _validate_restore_destination(destination)
             if not entry.had_original:
+                _validate_recovery_target_state(
+                    destination,
+                    had_original=False,
+                    original_sha256=None,
+                    original_size=None,
+                    planned_sha256=entry.planned_sha256,
+                    planned_size=entry.planned_size,
+                )
                 targets.append(
                     _JournalRecoveryTarget(
                         destination=destination,
@@ -355,6 +404,14 @@ class LocalBackupManager:
                 snapshot_path,
                 expected_sha256=entry.sha256,
                 expected_size=entry.size,
+            )
+            _validate_recovery_target_state(
+                destination,
+                had_original=True,
+                original_sha256=entry.sha256,
+                original_size=entry.size,
+                planned_sha256=entry.planned_sha256,
+                planned_size=entry.planned_size,
             )
             targets.append(
                 _JournalRecoveryTarget(
@@ -579,10 +636,105 @@ def _restore_journal_from_bytes(content: bytes, journal_path: Path) -> _RestoreJ
         raw = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("restore journal is invalid") from exc
-    expected_keys = {"format_version", "transaction_id", "entries"}
-    if not isinstance(raw, dict) or set(raw) != expected_keys:
+    if not isinstance(raw, dict):
         raise ValueError("restore journal is invalid")
-    if raw["format_version"] != _RESTORE_JOURNAL_FORMAT_VERSION:
+    format_version = raw.get("format_version")
+    if format_version == _LEGACY_RESTORE_JOURNAL_FORMAT_VERSION:
+        return _legacy_restore_journal_from_dict(raw, journal_path)
+    if format_version != _RESTORE_JOURNAL_FORMAT_VERSION:
+        raise ValueError("restore journal is invalid")
+    expected_keys = {
+        "format_version",
+        "transaction_id",
+        "configuration_digest",
+        "entries",
+    }
+    if set(raw) != expected_keys or not _is_sha256(raw["configuration_digest"]):
+        raise ValueError("restore journal is invalid")
+    transaction_id = raw["transaction_id"]
+    if not _is_restore_transaction_id(transaction_id):
+        raise ValueError("restore journal is invalid")
+    if not isinstance(raw["entries"], list):
+        raise ValueError("restore journal is invalid")
+    entries: list[_RestoreJournalEntry] = []
+    seen_paths: set[str] = set()
+    for index, raw_entry in enumerate(raw["entries"]):
+        expected_entry_keys = {
+            "path",
+            "destination",
+            "had_original",
+            "snapshot",
+            "sha256",
+            "size",
+            "planned_sha256",
+            "planned_size",
+        }
+        if not isinstance(raw_entry, dict) or set(raw_entry) != expected_entry_keys:
+            raise ValueError("restore journal is invalid")
+        logical_path = _validate_logical_path(raw_entry["path"])
+        if logical_path in seen_paths or not isinstance(raw_entry["had_original"], bool):
+            raise ValueError("restore journal is invalid")
+        if (
+            not isinstance(raw_entry["destination"], str)
+            or not raw_entry["destination"]
+            or raw_entry["destination"].strip() != raw_entry["destination"]
+            or "\x00" in raw_entry["destination"]
+        ):
+            raise ValueError("restore journal is invalid")
+        if not _is_sha256(raw_entry["planned_sha256"]):
+            raise ValueError("restore journal is invalid")
+        if (
+            not isinstance(raw_entry["planned_size"], int)
+            or isinstance(raw_entry["planned_size"], bool)
+            or raw_entry["planned_size"] < 0
+        ):
+            raise ValueError("restore journal is invalid")
+        had_original = raw_entry["had_original"]
+        if had_original:
+            expected_snapshot = _journal_snapshot_path(
+                journal_path,
+                transaction_id,
+                index,
+            ).name
+            if raw_entry["snapshot"] != expected_snapshot:
+                raise ValueError("restore journal is invalid")
+            if not _is_sha256(raw_entry["sha256"]):
+                raise ValueError("restore journal is invalid")
+            if (
+                not isinstance(raw_entry["size"], int)
+                or isinstance(raw_entry["size"], bool)
+                or raw_entry["size"] < 0
+            ):
+                raise ValueError("restore journal is invalid")
+        elif any(raw_entry[key] is not None for key in ("snapshot", "sha256", "size")):
+            raise ValueError("restore journal is invalid")
+        seen_paths.add(logical_path)
+        entries.append(
+            _RestoreJournalEntry(
+                path=logical_path,
+                destination=raw_entry["destination"],
+                had_original=had_original,
+                snapshot=raw_entry["snapshot"],
+                sha256=raw_entry["sha256"],
+                size=raw_entry["size"],
+                planned_sha256=raw_entry["planned_sha256"],
+                planned_size=raw_entry["planned_size"],
+            )
+        )
+    return _RestoreJournal(
+        format_version=_RESTORE_JOURNAL_FORMAT_VERSION,
+        transaction_id=transaction_id,
+        configuration_digest=raw["configuration_digest"],
+        entries=tuple(entries),
+    )
+
+
+def _legacy_restore_journal_from_dict(
+    raw: dict[object, object],
+    journal_path: Path,
+) -> _RestoreJournal:
+    expected_keys = {"format_version", "transaction_id", "entries"}
+    if set(raw) != expected_keys:
         raise ValueError("restore journal is invalid")
     transaction_id = raw["transaction_id"]
     if not _is_restore_transaction_id(transaction_id):
@@ -621,13 +773,21 @@ def _restore_journal_from_bytes(content: bytes, journal_path: Path) -> _RestoreJ
         entries.append(
             _RestoreJournalEntry(
                 path=logical_path,
+                destination=None,
                 had_original=had_original,
                 snapshot=raw_entry["snapshot"],
                 sha256=raw_entry["sha256"],
                 size=raw_entry["size"],
+                planned_sha256=None,
+                planned_size=None,
             )
         )
-    return _RestoreJournal(transaction_id=transaction_id, entries=tuple(entries))
+    return _RestoreJournal(
+        format_version=_LEGACY_RESTORE_JOURNAL_FORMAT_VERSION,
+        transaction_id=transaction_id,
+        configuration_digest=None,
+        entries=tuple(entries),
+    )
 
 
 def _is_restore_transaction_id(value: object) -> bool:
@@ -684,6 +844,46 @@ def _read_valid_snapshot(
     if len(content) != expected_size or _sha256(content) != expected_sha256:
         raise ValueError("restore journal is invalid")
     return content
+
+
+def _validate_recovery_target_state(
+    destination: Path,
+    *,
+    had_original: bool,
+    original_sha256: str | None,
+    original_size: int | None,
+    planned_sha256: str | None,
+    planned_size: int | None,
+) -> None:
+    if not _is_sha256(planned_sha256) or not _is_nonnegative_size(planned_size):
+        raise ValueError("restore journal is invalid")
+    if had_original and (
+        not _is_sha256(original_sha256) or not _is_nonnegative_size(original_size)
+    ):
+        raise ValueError("restore journal is invalid")
+    _validate_restore_destination(destination)
+    if not destination.exists():
+        if not had_original:
+            return
+        raise ValueError("restore journal has unexpected post-interruption state")
+    try:
+        current_content = destination.read_bytes()
+    except OSError as exc:
+        raise ValueError("restore journal has unexpected post-interruption state") from exc
+    current_sha256 = _sha256(current_content)
+    current_size = len(current_content)
+    matches_original = (
+        had_original
+        and current_sha256 == original_sha256
+        and current_size == original_size
+    )
+    matches_planned = current_sha256 == planned_sha256 and current_size == planned_size
+    if not matches_original and not matches_planned:
+        raise ValueError("restore journal has unexpected post-interruption state")
+
+
+def _is_nonnegative_size(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _stage_restore_bytes(destination: Path, content: bytes, *, suffix: str) -> Path:
@@ -777,6 +977,17 @@ def _has_duplicate_destinations(paths: Iterable[Path]) -> bool:
             return True
         seen_paths.append(path)
     return False
+
+
+def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
+    configuration = [
+        {
+            "path": logical_path,
+            "destination": _canonical_path(destination),
+        }
+        for logical_path, destination in sorted(managed_files.items())
+    ]
+    return _sha256(_canonical_json(configuration).encode("utf-8"))
 
 
 def _canonical_path(path: Path) -> str:
