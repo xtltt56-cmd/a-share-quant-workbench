@@ -654,6 +654,43 @@ def test_backup_manager_rejects_duplicate_managed_destination_path_aliases(tmp_p
         )
 
 
+def test_backup_manager_rejects_managed_file_symlink_before_backup_or_restore(tmp_path) -> None:
+    external_file = tmp_path / "external-model-notes.json"
+    managed_symlink = tmp_path / "model-notes.json"
+    external_file.write_text('{"model":"external"}\n', encoding="utf-8")
+    try:
+        managed_symlink.symlink_to(external_file)
+    except OSError as exc:
+        pytest.skip(f"creating a file symlink is unavailable: {exc}")
+
+    assert managed_symlink.is_symlink()
+    with pytest.raises(ValueError, match="symbolic link"):
+        LocalBackupManager(
+            managed_files={"model-notes.json": managed_symlink},
+            audit_path=tmp_path / "restore-audit.jsonl",
+        )
+
+    assert external_file.read_text(encoding="utf-8") == '{"model":"external"}\n'
+
+
+def test_backup_manager_checks_declared_path_for_symlink_before_resolution(
+    tmp_path, monkeypatch
+) -> None:
+    declared_managed_path = tmp_path / "declared-model-notes.json"
+    real_is_symlink = Path.is_symlink
+
+    def report_declared_path_as_symlink(path: Path) -> bool:
+        return path == declared_managed_path or real_is_symlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", report_declared_path_as_symlink)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        LocalBackupManager(
+            managed_files={"model-notes.json": declared_managed_path},
+            audit_path=tmp_path / "restore-audit.jsonl",
+        )
+
+
 def test_restore_recovers_account_pair_after_keyboard_interrupt(tmp_path, monkeypatch) -> None:
     manager, ledger, initialization, audit_path = _account_pair_manager(tmp_path)
     original_ledger = b"original-ledger"

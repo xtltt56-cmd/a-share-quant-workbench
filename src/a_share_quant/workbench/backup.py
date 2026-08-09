@@ -143,14 +143,20 @@ class LocalBackupManager:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._managed_files = {
-            _validate_logical_path(logical_path): _resolve_local_path(local_path)
+            _validate_logical_path(logical_path): _resolve_non_symlink_path(
+                local_path,
+                description="managed backup file",
+            )
             for logical_path, local_path in managed_files.items()
         }
         self._consistency_groups = _validate_consistency_groups(
             consistency_groups,
             set(self._managed_files),
         )
-        self._audit_path = _resolve_local_path(audit_path)
+        self._audit_path = _resolve_non_symlink_path(
+            audit_path,
+            description="restore audit file",
+        )
         if any(_same_path(path, self._audit_path) for path in self._managed_files.values()):
             raise ValueError("restore audit file cannot be a managed backup file")
         if _has_duplicate_destinations(self._managed_files.values()):
@@ -160,6 +166,10 @@ class LocalBackupManager:
         self._pending_restores: dict[str, _PendingRestore] = {}
         self._journal_path = _restore_journal_path(self._audit_path)
         self._restore_lock_path = _restore_lock_path(self._journal_path)
+        if self._journal_path.is_symlink():
+            raise ValueError("restore journal file cannot be a symbolic link")
+        if self._restore_lock_path.is_symlink():
+            raise ValueError("restore lock file cannot be a symbolic link")
         if any(_same_path(path, self._journal_path) for path in self._managed_files.values()):
             raise ValueError("restore journal file cannot be a managed backup file")
         if _same_path(self._journal_path, self._audit_path):
@@ -1076,6 +1086,13 @@ def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
         for logical_path, destination in sorted(managed_files.items())
     ]
     return _sha256(_canonical_json(configuration).encode("utf-8"))
+
+
+def _resolve_non_symlink_path(path: Path, *, description: str) -> Path:
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise ValueError(f"{description} cannot be a symbolic link")
+    return _resolve_local_path(candidate)
 
 
 def _resolve_local_path(path: Path) -> Path:
