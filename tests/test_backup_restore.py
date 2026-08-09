@@ -1274,6 +1274,58 @@ def test_backup_rejects_archive_alias_to_protected_restore_artifact(tmp_path, ar
         assert protected_path.read_bytes() == original_content
 
 
+@pytest.mark.parametrize(
+    "artifact",
+    (
+        "pending marker",
+        "destination lock",
+        "journal",
+        "audit lock",
+        "journal rollback",
+    ),
+)
+@pytest.mark.parametrize("declared_as", ("managed target", "audit path"))
+def test_manager_rejects_other_configuration_reserved_sidecar_path(
+    tmp_path, artifact, declared_as
+) -> None:
+    owner_target = tmp_path / "owner" / "account-ledger.jsonl"
+    owner_audit = tmp_path / "owner" / "restore-audit.jsonl"
+    owner = LocalBackupManager(
+        managed_files={"account-ledger.jsonl": owner_target},
+        audit_path=owner_audit,
+    )
+    reserved_path = {
+        "pending marker": next(iter(owner._destination_marker_paths.values())),
+        "destination lock": owner._destination_lock_paths[0],
+        "journal": owner._journal_path,
+        "audit lock": owner._restore_lock_path,
+        "journal rollback": owner._journal_path.with_name(
+            f"{owner._journal_path.name}.restore-{'a' * 32}.0.rollback"
+        ),
+    }[artifact]
+
+    kwargs = {
+        "managed_files": {"model-notes.json": tmp_path / "other" / "model-notes.json"},
+        "audit_path": tmp_path / "other" / "restore-audit.jsonl",
+    }
+    if declared_as == "managed target":
+        kwargs["managed_files"] = {"model-notes.json": reserved_path}
+    else:
+        kwargs["audit_path"] = reserved_path
+
+    with pytest.raises(ValueError, match="reserved backup coordination sidecar"):
+        LocalBackupManager(**kwargs)
+
+
+def test_manager_allows_non_coordination_json_and_lock_names(tmp_path) -> None:
+    manager = LocalBackupManager(
+        managed_files={"model-notes.json": tmp_path / "model-notes.json"},
+        audit_path=tmp_path / "restore-audit.lock",
+    )
+
+    assert manager._audit_path.name == "restore-audit.lock"
+
+
 def test_backup_manager_checks_declared_path_for_symlink_before_resolution(
     tmp_path, monkeypatch
 ) -> None:

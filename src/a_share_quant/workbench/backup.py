@@ -152,7 +152,7 @@ class LocalBackupManager:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._managed_files = {
-            _validate_logical_path(logical_path): _resolve_non_linked_path(
+            _validate_logical_path(logical_path): _resolve_declared_backup_path(
                 local_path,
                 description="managed backup file",
             )
@@ -162,7 +162,7 @@ class LocalBackupManager:
             consistency_groups,
             set(self._managed_files),
         )
-        self._audit_path = _resolve_non_linked_path(
+        self._audit_path = _resolve_declared_backup_path(
             audit_path,
             description="restore audit file",
         )
@@ -1430,6 +1430,58 @@ def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
         for logical_path, destination in sorted(managed_files.items())
     ]
     return _sha256(_canonical_json(configuration).encode("utf-8"))
+
+
+def _resolve_declared_backup_path(path: Path, *, description: str) -> Path:
+    candidate = _lexically_normalized_absolute_path(Path(path))
+    if _is_reserved_coordination_sidecar_name(candidate.name):
+        raise ValueError(
+            f"{description} cannot use a reserved backup coordination sidecar name"
+        )
+    return _resolve_non_linked_path(candidate, description=description)
+
+
+def _is_reserved_coordination_sidecar_name(name: str) -> bool:
+    normalized_name = os.path.normcase(name)
+    for suffix in (
+        ".restore-pending.json",
+        ".restore-resource.lock",
+        ".restore-journal.json",
+        ".restore-journal.json.lock",
+    ):
+        if _has_generated_coordination_sidecar_name(normalized_name, suffix):
+            return True
+    return _is_restore_journal_rollback_sidecar_name(normalized_name)
+
+
+def _has_generated_coordination_sidecar_name(name: str, suffix: str) -> bool:
+    return (
+        name.startswith(".")
+        and len(name) > len(suffix) + 1
+        and name.endswith(suffix)
+    )
+
+
+def _is_restore_journal_rollback_sidecar_name(name: str) -> bool:
+    owner_name, separator, remainder = name.rpartition(
+        ".restore-journal.json.restore-"
+    )
+    if not separator or not _has_generated_coordination_sidecar_name(owner_name, ""):
+        return False
+    transaction_hex, separator, index_and_extension = remainder.partition(".")
+    if (
+        not separator
+        or len(transaction_hex) != 32
+        or any(character not in "0123456789abcdef" for character in transaction_hex)
+    ):
+        return False
+    index, separator, extension = index_and_extension.partition(".")
+    return (
+        bool(separator)
+        and bool(index)
+        and all(character in "0123456789" for character in index)
+        and extension == "rollback"
+    )
 
 
 def _resolve_non_linked_path(path: Path, *, description: str) -> Path:
