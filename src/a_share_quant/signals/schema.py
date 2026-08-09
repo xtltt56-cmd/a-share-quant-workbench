@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol
 
 import pandas as pd
@@ -26,6 +26,8 @@ class SignalRecord:
     feature_version: str
     data_version: str
     experiment_id: str
+    signal_available_at: datetime | pd.Timestamp | None = None
+    intended_execution_date: date | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -43,6 +45,16 @@ class SignalRecord:
             raise ValueError("rank must be positive")
         if self.confidence is not None and not 0 <= float(self.confidence) <= 1:
             raise ValueError("confidence must be between 0 and 1")
+        if (
+            self.signal_available_at is not None
+            and pd.Timestamp(self.signal_available_at).tzinfo is None
+        ):
+            raise ValueError("signal_available_at must be timezone-aware")
+        if (
+            self.intended_execution_date is not None
+            and self.intended_execution_date <= self.signal_date
+        ):
+            raise ValueError("intended execution date must be after signal date")
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)

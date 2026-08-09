@@ -13,6 +13,38 @@
 - [x] report-renderer HTML smoke validated with an explicit synthetic-data warning.
 - [ ] Real AKShare/local-data Stage 2 run and rendered baseline comparison report.
 
+## Stage 3A progress (2026-08-09)
+
+- [x] Approved adapter-first architecture and implementation plan.
+- [x] Frozen the accepted Stage 2 baseline in
+      `artifacts/baselines/STAGE2_BASELINE_MANIFEST.json` without modifying
+      Stage 2 experiment directories.
+- [x] Added shared `SignalFrame`, `PortfolioTarget`, and `ExecutionSpec`
+      contracts with explicit after-close signal and T+1 execution semantics.
+- [x] Added out-of-sample IC/Rank IC/ICIR, quantile, Top20, time-period,
+      causal regime, volatility, stability, and model-correlation analysis.
+- [x] Added structural promotion checks ending at `SIGNAL_VALIDATED`; `LIVE`
+      remains forbidden.
+- [x] Added TEST-isolation boundary for future ensemble/Optuna work.
+- [x] Generated `reports/stage3_signal_quality_report.md` and its ignored JSON
+      companion. The current report is explicitly labelled `fixture` data.
+- [x] Stage 3A verification: 73 tests passed, Ruff passed, `pip check` passed,
+      `compileall` passed, and coverage remained at 86%.
+
+Stage 3A commands:
+
+```powershell
+\.venv\Scripts\python.exe scripts\freeze_stage2_baseline.py
+\.venv\Scripts\python.exe scripts\run_stage3a_signal_quality.py
+\.venv\Scripts\python.exe -m pytest -q
+```
+
+The three frozen bundles are synthetic fixture artifacts from the accepted
+Stage 2 smoke run. Their metrics are useful for deterministic contract and
+pipeline validation only; they are not real-market investment evidence. VectorBT
+and RQAlpha remain optional Stage 3B/3D adapters and no broker or live execution
+provider is present.
+
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 
 Stage 2 operator commands:

@@ -1,0 +1,169 @@
+{
+  "baseline_commit": "a293a13",
+  "entries": [
+    {
+      "benchmark": "000300",
+      "config_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/config.yaml",
+      "config_hash": "137b8c10fdf3a68bb416f8151da480619268ebe91a6ac2e411f23944e4c7683f",
+      "data_mode": "fixture",
+      "dataset_hash": "c5e311ea34aec2121e34de0b3f7c5b4ca4fb9ad13efa3b5b36fe292c281fa949",
+      "equity_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/equity.parquet",
+      "experiment_id": "qlib_double_ensemble_alpha158_oos",
+      "experiment_root": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos",
+      "feature_version": "alpha158_v1",
+      "git_commit": "41eff1d4ec967bd2c6fbc2bf31730f0e53d1e719",
+      "library_versions": {
+        "a_share_quant": "0.1.0",
+        "akshare": "1.18.83",
+        "duckdb": "1.5.5",
+        "lightgbm": "4.7.0",
+        "numpy": "2.5.1",
+        "pandas": "2.3.3",
+        "pyarrow": "23.0.1",
+        "qlib": "0.9.7"
+      },
+      "metadata_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/metadata.json",
+      "metrics_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/metrics.json",
+      "model_version": "qlib_doubleensemble_alpha158_v1",
+      "prediction_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/predictions.parquet",
+      "predictions_hash": "4a5e2201004740a66dcfa29a112ae1ed18d86270b492498f2f84e76d09624ca5",
+      "random_seed": 42,
+      "signal_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/signals.parquet",
+      "signals_hash": "61792872b16452b58f0284ce67d6ab50a935ae8cb3810dee186e16edea7555a7",
+      "strategy_id": "qlib_double_ensemble_alpha158",
+      "strategy_version": "stage2-v1",
+      "test_period": [
+        "2021-09-02",
+        "2022-02-01"
+      ],
+      "trades_artifact_path": "experiments/stage2_wf_smoke2/qlib_double_ensemble_alpha158_oos/trades.parquet",
+      "train_period": [
+        "2020-01-01",
+        "2021-04-01"
+      ],
+      "transaction_cost_assumptions": {
+        "commission_rate": 0.0003,
+        "enforce_limit_rules": true,
+        "enforce_suspension_rules": true,
+        "enforce_t_plus_one": true,
+        "slippage_bps": 5,
+        "stamp_duty_rate": 0.0005,
+        "transfer_fee_rate": 0.00001
+      },
+      "validation_period": [
+        "2021-04-02",
+        "2021-09-01"
+      ]
+    },
+    {
+      "benchmark": "000300",
+      "config_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/config.yaml",
+      "config_hash": "137b8c10fdf3a68bb416f8151da480619268ebe91a6ac2e411f23944e4c7683f",
+      "data_mode": "fixture",
+      "dataset_hash": "c5e311ea34aec2121e34de0b3f7c5b4ca4fb9ad13efa3b5b36fe292c281fa949",
+      "equity_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/equity.parquet",
+      "experiment_id": "qlib_lightgbm_alpha158_oos",
+      "experiment_root": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos",
+      "feature_version": "alpha158_v1",
+      "git_commit": "41eff1d4ec967bd2c6fbc2bf31730f0e53d1e719",
+      "library_versions": {
+        "a_share_quant": "0.1.0",
+        "akshare": "1.18.83",
+        "duckdb": "1.5.5",
+        "lightgbm": "4.7.0",
+        "numpy": "2.5.1",
+        "pandas": "2.3.3",
+        "pyarrow": "23.0.1",
+        "qlib": "0.9.7"
+      },
+      "metadata_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/metadata.json",
+      "metrics_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/metrics.json",
+      "model_version": "qlib_lgb_alpha158_v1",
+      "prediction_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/predictions.parquet",
+      "predictions_hash": "761bf29f4885cf49a90f827d3e4fa4f478b625524f8eac733ff898d9e64d7a10",
+      "random_seed": 42,
+      "signal_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/signals.parquet",
+      "signals_hash": "2ef5bcab5d3e6a370eb40ae4fd3f48179bce5cbd2f0a162ff76cdcb474d64cd0",
+      "strategy_id": "qlib_lightgbm_alpha158",
+      "strategy_version": "stage2-v1",
+      "test_period": [
+        "2021-09-02",
+        "2022-02-01"
+      ],
+      "trades_artifact_path": "experiments/stage2_wf_smoke2/qlib_lightgbm_alpha158_oos/trades.parquet",
+      "train_period": [
+        "2020-01-01",
+        "2021-04-01"
+      ],
+      "transaction_cost_assumptions": {
+        "commission_rate": 0.0003,
+        "enforce_limit_rules": true,
+        "enforce_suspension_rules": true,
+        "enforce_t_plus_one": true,
+        "slippage_bps": 5,
+        "stamp_duty_rate": 0.0005,
+        "transfer_fee_rate": 0.00001
+      },
+      "validation_period": [
+        "2021-04-02",
+        "2021-09-01"
+      ]
+    },
+    {
+      "benchmark": "000300",
+      "config_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/config.yaml",
+      "config_hash": "137b8c10fdf3a68bb416f8151da480619268ebe91a6ac2e411f23944e4c7683f",
+      "data_mode": "fixture",
+      "dataset_hash": "c5e311ea34aec2121e34de0b3f7c5b4ca4fb9ad13efa3b5b36fe292c281fa949",
+      "equity_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/equity.parquet",
+      "experiment_id": "rule_multifactor_oos",
+      "experiment_root": "experiments/stage2_wf_smoke2/rule_multifactor_oos",
+      "feature_version": "rule_features_v1",
+      "git_commit": "41eff1d4ec967bd2c6fbc2bf31730f0e53d1e719",
+      "library_versions": {
+        "a_share_quant": "0.1.0",
+        "akshare": "1.18.83",
+        "duckdb": "1.5.5",
+        "lightgbm": "4.7.0",
+        "numpy": "2.5.1",
+        "pandas": "2.3.3",
+        "pyarrow": "23.0.1",
+        "qlib": "0.9.7"
+      },
+      "metadata_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/metadata.json",
+      "metrics_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/metrics.json",
+      "model_version": "rule_none_v1",
+      "prediction_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/predictions.parquet",
+      "predictions_hash": "0db085f2f3b2e0d532f0b18a37c60e3c7c2cb910f417dad8e34e5e1fa90d876e",
+      "random_seed": 42,
+      "signal_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/signals.parquet",
+      "signals_hash": "548824972b847fc0cebb74df8192c641fc05ce36b0881d83a7ddd3be9d25126a",
+      "strategy_id": "rule_multifactor",
+      "strategy_version": "rule_multifactor_v1",
+      "test_period": [
+        "2021-09-02",
+        "2022-02-01"
+      ],
+      "trades_artifact_path": "experiments/stage2_wf_smoke2/rule_multifactor_oos/trades.parquet",
+      "train_period": [
+        "2020-01-01",
+        "2021-04-01"
+      ],
+      "transaction_cost_assumptions": {
+        "commission_rate": 0.0003,
+        "enforce_limit_rules": true,
+        "enforce_suspension_rules": true,
+        "enforce_t_plus_one": true,
+        "slippage_bps": 5,
+        "stamp_duty_rate": 0.0005,
+        "transfer_fee_rate": 0.00001
+      },
+      "validation_period": [
+        "2021-04-02",
+        "2021-09-01"
+      ]
+    }
+  ],
+  "immutable": true,
+  "manifest_version": "stage3a-v1"
+}

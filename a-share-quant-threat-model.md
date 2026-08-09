@@ -149,3 +149,38 @@ flowchart TD
 - [x] Separated runtime behavior from tests/dev dependencies and future optional components.
 - [x] Recorded the fixed local/paper-only assumptions and open questions that would change risk.
 - [x] Listed concrete focus paths and residual gaps.
+
+## Stage 3A security addendum (2026-08-09)
+
+This addendum extends the existing local-CLI threat model to the Stage 3A
+baseline manifest, shared contracts, signal-quality report, and promotion gate.
+The user-confirmed context remains: single-machine Windows research, outbound
+market-data calls only, fixture baseline artifacts currently available, no
+broker credentials, and no live execution path.
+
+### New trust boundaries and controls
+
+| Boundary | Evidence | Control |
+|---|---|---|
+| Stage 2 artifacts -> baseline manifest | `src/a_share_quant/experiments/baseline_manifest.py` | Required artifact checks, config hash verification, content hashes, repository/experiment-root path checks, append-only write behavior |
+| Predictions -> Stage 3 contracts | `src/a_share_quant/contracts/stage3.py`, `src/a_share_quant/contracts/timing.py` | Required provenance, finite scores, duplicate-key rejection, timezone-aware signal timestamp, no same-bar execution and T+1 date validation |
+| Frozen signals -> analysis/report | `src/a_share_quant/analysis/signal_quality.py`, `src/a_share_quant/analysis/report.py` | Read-only analysis, causal regime calculation, JSON non-finite-value sanitization, explicit fixture/data limitations |
+| Gate result -> promotion state | `src/a_share_quant/promotion.py` | Sequential transitions, structural checks, explicit rejection of `LIVE` |
+| CLI path arguments -> local files | `scripts/freeze_stage2_baseline.py`, `scripts/run_stage3a_signal_quality.py` | Resolved paths must remain under repository root |
+
+### Stage 3A abuse paths and residual risk
+
+| ID | Abuse path | Priority | Mitigation/status |
+|---|---|---|---|
+| TM-009 | Local process changes a referenced Parquet file after the manifest is frozen -> signal-quality results use altered data | high | Manifest stores signal/prediction hashes and `verify()` checks them before analysis; filesystem ACLs and immutable remote snapshots remain out of scope |
+| TM-010 | Crafted prediction fields contain duplicate keys, non-finite scores, or same-day execution -> optimistic or ambiguous signal is accepted | high | `SignalFrame` rejects malformed provenance, scores, duplicates, timestamps, and execution dates; regression tests cover the boundary |
+| TM-011 | Fixture metrics are copied into an investment decision -> synthetic evidence is mistaken for market evidence | medium | Report and README label `data_mode=fixture`; report metadata includes source artifacts and limitations; real-market rerun is still required |
+| TM-012 | Future developer adds a live state or broker import -> paper signal can reach real funds | critical if enabled | `PromotionState` rejects `LIVE`, the current project has no broker package, and architecture requires a new threat-model review plus human approval before any such scope change |
+
+### Stage 3A security conclusion
+
+No new remote listener, authentication surface, account token, or live order
+route was introduced. The highest current risks are local artifact integrity,
+future leakage, and fixture-result misinterpretation. Before Stage 3F paper
+monitoring, rerun this review against the ledger/monitor paths and add a static
+guard against broker imports.
