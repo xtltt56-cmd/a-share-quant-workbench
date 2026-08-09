@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from threading import RLock
 from uuid import uuid4
 
 _FORMAT_VERSION = 1
@@ -83,10 +84,13 @@ class LocalBackupManager:
             set(self._managed_files),
         )
         self._audit_path = Path(audit_path)
-        if any(path == self._audit_path for path in self._managed_files.values()):
+        if any(_same_path(path, self._audit_path) for path in self._managed_files.values()):
             raise ValueError("restore audit file cannot be a managed backup file")
+        if _has_duplicate_destinations(self._managed_files.values()):
+            raise ValueError("managed backup files cannot share a duplicate local destination")
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pending_restores: dict[str, _PendingRestore] = {}
+        self._restore_lock = RLock()
 
     def create_backup(self, archive_path: Path) -> BackupManifest:
         """Write an archive containing the declared files that currently exist."""
@@ -136,22 +140,32 @@ class LocalBackupManager:
     def preflight_restore(self, archive_path: Path) -> RestorePreflight:
         """Validate archive members and hashes before issuing a one-use token."""
 
-        archive = Path(archive_path).resolve()
-        manifest, _ = self._read_validated_archive(archive)
-        confirmation_token = f"restore-{uuid4().hex}"
-        self._pending_restores[confirmation_token] = _PendingRestore(
-            archive_path=archive,
-            manifest_digest=_sha256(_canonical_json(manifest.to_dict()).encode("utf-8")),
-        )
-        return RestorePreflight(
-            manifest=manifest,
-            confirmation_token=confirmation_token,
-            files=tuple(item.path for item in manifest.files),
-        )
+        with self._restore_lock:
+            archive = Path(archive_path).resolve()
+            manifest, _ = self._read_validated_archive(archive)
+            confirmation_token = f"restore-{uuid4().hex}"
+            self._pending_restores[confirmation_token] = _PendingRestore(
+                archive_path=archive,
+                manifest_digest=_sha256(_canonical_json(manifest.to_dict()).encode("utf-8")),
+            )
+            return RestorePreflight(
+                manifest=manifest,
+                confirmation_token=confirmation_token,
+                files=tuple(item.path for item in manifest.files),
+            )
 
     def restore(self, archive_path: Path, *, confirmation_token: str) -> RestoreReceipt:
         """Stage verified bytes, audit intent, then replace only declared files."""
 
+        with self._restore_lock:
+            return self._restore_locked(archive_path, confirmation_token=confirmation_token)
+
+    def _restore_locked(
+        self,
+        archive_path: Path,
+        *,
+        confirmation_token: str,
+    ) -> RestoreReceipt:
         pending = self._pending_restores.pop(str(confirmation_token), None)
         archive = Path(archive_path).resolve()
         if pending is None or pending.archive_path != archive:
@@ -162,6 +176,9 @@ class LocalBackupManager:
             raise ValueError("explicit restore confirmation is required")
 
         staged: list[tuple[Path, Path]] = []
+        rollback_snapshots: dict[Path, Path | None] = {}
+        replaced_destinations: list[Path] = []
+        rollback_failed = False
         try:
             for logical_path, content in contents.items():
                 destination = self._managed_files[logical_path]
@@ -179,9 +196,20 @@ class LocalBackupManager:
                     os.fsync(handle.fileno())
                 staged.append((destination, Path(handle.name)))
 
+            for destination, _ in staged:
+                rollback_snapshots[destination] = _snapshot_restore_target(destination)
             audit_id = self._append_restore_audit(manifest)
-            for destination, temporary in staged:
-                os.replace(temporary, destination)
+            try:
+                for destination, temporary in staged:
+                    os.replace(temporary, destination)
+                    replaced_destinations.append(destination)
+            except OSError:
+                try:
+                    _rollback_replaced_targets(replaced_destinations, rollback_snapshots)
+                except OSError:
+                    rollback_failed = True
+                    raise
+                raise
             return RestoreReceipt(
                 restored_files=tuple(item.path for item in manifest.files),
                 audit_id=audit_id,
@@ -190,6 +218,10 @@ class LocalBackupManager:
             for _, temporary in staged:
                 if temporary.exists():
                     temporary.unlink()
+            if not rollback_failed:
+                for snapshot in rollback_snapshots.values():
+                    if snapshot is not None and snapshot.exists():
+                        snapshot.unlink()
 
     def _read_validated_archive(
         self,
@@ -334,6 +366,50 @@ def _validate_zip_member(name: str) -> None:
         raise ValueError("zip traversal rejected")
 
 
+def _snapshot_restore_target(destination: Path) -> Path | None:
+    if destination.is_symlink():
+        raise ValueError("managed restore target must be a regular local file")
+    if not destination.exists():
+        return None
+    if not destination.is_file():
+        raise ValueError("managed restore target must be a regular local file")
+    try:
+        content = destination.read_bytes()
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{destination.name}.",
+            suffix=".rollback",
+            dir=destination.parent,
+            delete=False,
+        )
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return Path(handle.name)
+    except OSError as exc:
+        raise ValueError("managed restore target cannot be snapshotted") from exc
+
+
+def _rollback_replaced_targets(
+    replaced_destinations: list[Path],
+    rollback_snapshots: Mapping[Path, Path | None],
+) -> None:
+    rollback_error: OSError | None = None
+    for destination in reversed(replaced_destinations):
+        snapshot = rollback_snapshots[destination]
+        try:
+            if snapshot is None:
+                destination.unlink(missing_ok=True)
+            else:
+                os.replace(snapshot, destination)
+        except OSError as exc:
+            if rollback_error is None:
+                rollback_error = exc
+    if rollback_error is not None:
+        raise rollback_error
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -354,4 +430,24 @@ def _temporary_path(destination: Path) -> Path:
 
 
 def _same_path(left: Path, right: Path) -> bool:
-    return left.resolve() == right.resolve()
+    try:
+        return left.samefile(right)
+    except OSError:
+        return _canonical_path(left) == _canonical_path(right)
+
+
+def _has_duplicate_destinations(paths: Iterable[Path]) -> bool:
+    seen_paths: list[Path] = []
+    for path in paths:
+        if any(_same_path(path, seen) for seen in seen_paths):
+            return True
+        seen_paths.append(path)
+    return False
+
+
+def _canonical_path(path: Path) -> str:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normcase(os.path.normpath(str(resolved)))
