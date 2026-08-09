@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -671,6 +672,50 @@ def test_backup_manager_rejects_managed_file_symlink_before_backup_or_restore(tm
         )
 
     assert external_file.read_text(encoding="utf-8") == '{"model":"external"}\n'
+
+
+def test_backup_manager_rejects_managed_path_below_directory_junction(tmp_path) -> None:
+    external_directory = tmp_path / "external-state"
+    junction_directory = tmp_path / "linked-state"
+    external_ledger = external_directory / "account-ledger.jsonl"
+    external_directory.mkdir()
+    external_ledger.write_text('{"kind":"external"}\n', encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction_directory),
+                str(external_directory),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as exc:
+        pytest.skip(f"creating a directory junction is unavailable: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        pytest.skip(f"creating a directory junction is unavailable: {detail}")
+
+    is_junction = getattr(junction_directory, "is_junction", None)
+    if is_junction is not None:
+        assert is_junction()
+    managed_ledger = junction_directory / "account-ledger.jsonl"
+    assert not managed_ledger.is_symlink()
+    try:
+        with pytest.raises(ValueError, match="symbolic link or junction"):
+            LocalBackupManager(
+                managed_files={"account-ledger.jsonl": managed_ledger},
+                audit_path=tmp_path / "restore-audit.jsonl",
+            )
+    finally:
+        junction_directory.rmdir()
+
+    assert external_ledger.read_text(encoding="utf-8") == '{"kind":"external"}\n'
 
 
 def test_backup_manager_checks_declared_path_for_symlink_before_resolution(

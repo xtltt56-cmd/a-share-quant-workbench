@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 import zipfile
@@ -143,7 +144,7 @@ class LocalBackupManager:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._managed_files = {
-            _validate_logical_path(logical_path): _resolve_non_symlink_path(
+            _validate_logical_path(logical_path): _resolve_non_linked_path(
                 local_path,
                 description="managed backup file",
             )
@@ -153,7 +154,7 @@ class LocalBackupManager:
             consistency_groups,
             set(self._managed_files),
         )
-        self._audit_path = _resolve_non_symlink_path(
+        self._audit_path = _resolve_non_linked_path(
             audit_path,
             description="restore audit file",
         )
@@ -166,10 +167,14 @@ class LocalBackupManager:
         self._pending_restores: dict[str, _PendingRestore] = {}
         self._journal_path = _restore_journal_path(self._audit_path)
         self._restore_lock_path = _restore_lock_path(self._journal_path)
-        if self._journal_path.is_symlink():
-            raise ValueError("restore journal file cannot be a symbolic link")
-        if self._restore_lock_path.is_symlink():
-            raise ValueError("restore lock file cannot be a symbolic link")
+        _validate_no_linked_ancestors(
+            self._journal_path,
+            description="restore journal file",
+        )
+        _validate_no_linked_ancestors(
+            self._restore_lock_path,
+            description="restore lock file",
+        )
         if any(_same_path(path, self._journal_path) for path in self._managed_files.values()):
             raise ValueError("restore journal file cannot be a managed backup file")
         if _same_path(self._journal_path, self._audit_path):
@@ -1088,11 +1093,34 @@ def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
     return _sha256(_canonical_json(configuration).encode("utf-8"))
 
 
-def _resolve_non_symlink_path(path: Path, *, description: str) -> Path:
+def _resolve_non_linked_path(path: Path, *, description: str) -> Path:
     candidate = Path(path)
-    if candidate.is_symlink():
-        raise ValueError(f"{description} cannot be a symbolic link")
+    _validate_no_linked_ancestors(candidate, description=description)
     return _resolve_local_path(candidate)
+
+
+def _validate_no_linked_ancestors(path: Path, *, description: str) -> None:
+    current = Path(path).absolute()
+    while True:
+        if _is_symbolic_link_or_junction(current):
+            raise ValueError(f"{description} cannot contain a symbolic link or junction")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+def _is_symbolic_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
 def _resolve_local_path(path: Path) -> Path:
