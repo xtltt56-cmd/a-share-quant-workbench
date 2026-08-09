@@ -115,6 +115,7 @@ def test_backup_includes_explicit_account_initialization_metadata(tmp_path) -> N
     service.confirm_manual_buy(preview["confirmation_token"])
     manager = LocalBackupManager(
         managed_files=service.managed_local_files(),
+        consistency_groups=service.managed_local_file_consistency_groups(),
         audit_path=tmp_path / "restore-audit.jsonl",
     )
 
@@ -124,3 +125,64 @@ def test_backup_includes_explicit_account_initialization_metadata(tmp_path) -> N
         "account-ledger.jsonl",
         "account-ledger.jsonl.initialization.json",
     }
+
+
+def test_restore_preflight_rejects_ledger_only_archive_for_account_state_pair(tmp_path) -> None:
+    source_ledger = tmp_path / "source" / "account-ledger.jsonl"
+    source = AdvisoryWorkbenchService(
+        initial_cash=Decimal("100000"),
+        ledger_path=source_ledger,
+        today=lambda: date(2026, 8, 10),
+    )
+    preview = source.preview_manual_buy(
+        name="平安银行", code="000001", quantity=100, price=10
+    )
+    source.confirm_manual_buy(preview["confirmation_token"])
+    legacy_manager = LocalBackupManager(
+        managed_files={"account-ledger.jsonl": source_ledger},
+        audit_path=tmp_path / "source" / "restore-audit.jsonl",
+    )
+    ledger_only_archive = tmp_path / "ledger-only-v1.zip"
+    legacy_manager.create_backup(ledger_only_archive)
+
+    target_ledger = tmp_path / "target" / "account-ledger.jsonl"
+    target = AdvisoryWorkbenchService(
+        initial_cash=Decimal("200000"),
+        ledger_path=target_ledger,
+        today=lambda: date(2026, 8, 10),
+    )
+    target_preview = target.preview_manual_buy(
+        name="平安银行", code="000001", quantity=100, price=10
+    )
+    target.confirm_manual_buy(target_preview["confirmation_token"])
+    assert target.managed_local_files()[
+        "account-ledger.jsonl.initialization.json"
+    ].exists()
+    manager = LocalBackupManager(
+        managed_files=target.managed_local_files(),
+        consistency_groups=target.managed_local_file_consistency_groups(),
+        audit_path=tmp_path / "target" / "restore-audit.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="consistency group"):
+        manager.preflight_restore(ledger_only_archive)
+
+
+def test_unconfirmed_initial_account_state_has_no_partial_backup_pair(tmp_path) -> None:
+    service = AdvisoryWorkbenchService(
+        initial_cash=Decimal("100000"),
+        ledger_path=tmp_path / "account-ledger.jsonl",
+        today=lambda: date(2026, 8, 10),
+    )
+    manager = LocalBackupManager(
+        managed_files=service.managed_local_files(),
+        consistency_groups=service.managed_local_file_consistency_groups(),
+        audit_path=tmp_path / "restore-audit.jsonl",
+    )
+
+    manifest = manager.create_backup(tmp_path / "uninitialized.zip")
+
+    assert manifest.files == ()
+    assert not service.managed_local_files()[
+        "account-ledger.jsonl.initialization.json"
+    ].exists()

@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -71,12 +71,17 @@ class LocalBackupManager:
         *,
         managed_files: Mapping[str, Path],
         audit_path: Path,
+        consistency_groups: Mapping[str, Iterable[str]] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._managed_files = {
             _validate_logical_path(logical_path): Path(local_path)
             for logical_path, local_path in managed_files.items()
         }
+        self._consistency_groups = _validate_consistency_groups(
+            consistency_groups,
+            set(self._managed_files),
+        )
         self._audit_path = Path(audit_path)
         if any(path == self._audit_path for path in self._managed_files.values()):
             raise ValueError("restore audit file cannot be a managed backup file")
@@ -108,6 +113,7 @@ class LocalBackupManager:
                     size=len(content),
                 )
             )
+        self._ensure_consistency_groups_complete(set(contents))
         manifest = BackupManifest(
             format_version=_FORMAT_VERSION,
             backup_id=f"backup-{uuid4().hex}",
@@ -212,6 +218,7 @@ class LocalBackupManager:
                     if len(content) != item.size or _sha256(content) != item.sha256:
                         raise ValueError("backup hash validation failed")
                     contents[item.path] = content
+                self._ensure_consistency_groups_complete(set(contents))
                 return manifest, contents
         except (OSError, zipfile.BadZipFile) as exc:
             raise ValueError("backup archive cannot be read") from exc
@@ -233,6 +240,12 @@ class LocalBackupManager:
             handle.flush()
             os.fsync(handle.fileno())
         return audit_id
+
+    def _ensure_consistency_groups_complete(self, present_paths: set[str]) -> None:
+        for group_name, group_paths in self._consistency_groups.items():
+            included_paths = group_paths.intersection(present_paths)
+            if included_paths and included_paths != group_paths:
+                raise ValueError(f"backup consistency group '{group_name}' is incomplete")
 
 
 def _manifest_from_bytes(content: bytes) -> BackupManifest:
@@ -287,6 +300,32 @@ def _validate_logical_path(value: object) -> str:
     if normalized != value or normalized == ".":
         raise ValueError("backup logical path is invalid")
     return normalized
+
+
+def _validate_consistency_groups(
+    consistency_groups: Mapping[str, Iterable[str]] | None,
+    managed_paths: set[str],
+) -> dict[str, frozenset[str]]:
+    if consistency_groups is None:
+        return {}
+    if not isinstance(consistency_groups, Mapping):
+        raise ValueError("backup consistency groups are invalid")
+    validated: dict[str, frozenset[str]] = {}
+    for group_name, paths in consistency_groups.items():
+        if not isinstance(group_name, str) or not group_name.strip():
+            raise ValueError("backup consistency groups are invalid")
+        if isinstance(paths, (str, bytes)):
+            raise ValueError("backup consistency groups are invalid")
+        try:
+            normalized_paths = tuple(_validate_logical_path(path) for path in paths)
+        except TypeError as exc:
+            raise ValueError("backup consistency groups are invalid") from exc
+        if len(normalized_paths) < 2 or len(normalized_paths) != len(set(normalized_paths)):
+            raise ValueError("backup consistency groups are invalid")
+        if not set(normalized_paths).issubset(managed_paths):
+            raise ValueError("backup consistency groups reference unmanaged files")
+        validated[group_name] = frozenset(normalized_paths)
+    return validated
 
 
 def _validate_zip_member(name: str) -> None:

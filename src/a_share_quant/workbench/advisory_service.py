@@ -54,12 +54,13 @@ class AdvisoryWorkbenchService:
         if requested_initial_cash < 0:
             raise ValueError("initial_cash must be non-negative")
         recorded_initial_cash = _load_initialization_metadata(self._initialization_path)
+        ledger_exists = self._ledger_store.path.exists()
         if recorded_initial_cash is not None:
             if requested_initial_cash > 0 and requested_initial_cash != recorded_initial_cash:
                 raise ValueError("initial_cash conflicts with recorded account initialization")
             effective_initial_cash = recorded_initial_cash
         else:
-            if self._ledger_store.path.exists() and requested_initial_cash <= 0:
+            if ledger_exists and requested_initial_cash <= 0:
                 raise ValueError(
                     "existing ledger requires initialization metadata "
                     "or explicit positive initial cash"
@@ -70,8 +71,12 @@ class AdvisoryWorkbenchService:
             records=self._ledger_store.load_records(),
             known_instruments=self._known_instruments,
         )
+        self._pending_initialization_cash: Decimal | None = None
         if recorded_initial_cash is None and requested_initial_cash > 0:
-            _write_initialization_metadata(self._initialization_path, requested_initial_cash)
+            if ledger_exists:
+                _write_initialization_metadata(self._initialization_path, requested_initial_cash)
+            else:
+                self._pending_initialization_cash = requested_initial_cash
         self._advisory_engine = AdvisoryEngine(risk_policy or RiskPolicy.conservative())
         self._prediction_store = prediction_store or PredictionLedgerStore()
         self._today = today or date.today
@@ -130,9 +135,28 @@ class AdvisoryWorkbenchService:
                 raise ValueError("unknown or expired manual buy confirmation")
             prospective = self._copy_ledger()
             prospective_receipt = prospective.record_fill(preview.receipt.event)
-            if not prospective_receipt.idempotent:
-                self._ledger_store.append_fill(preview.receipt.event)
-            receipt = self._ledger.record_fill(preview.receipt.event)
+            initialization_written = False
+            durable_append_completed = False
+            try:
+                if (
+                    not prospective_receipt.idempotent
+                    and self._pending_initialization_cash is not None
+                ):
+                    _write_initialization_metadata(
+                        self._initialization_path,
+                        self._pending_initialization_cash,
+                    )
+                    initialization_written = True
+                if not prospective_receipt.idempotent:
+                    self._ledger_store.append_fill(preview.receipt.event)
+                    durable_append_completed = True
+                receipt = self._ledger.record_fill(preview.receipt.event)
+            except Exception:
+                if initialization_written and not durable_append_completed:
+                    _remove_initialization_metadata(self._initialization_path)
+                raise
+            if initialization_written:
+                self._pending_initialization_cash = None
             if receipt.idempotent != prospective_receipt.idempotent:
                 raise RuntimeError("manual ledger state changed during confirmation")
             return {
@@ -231,6 +255,16 @@ class AdvisoryWorkbenchService:
             "account-ledger.jsonl.initialization.json": self._initialization_path,
         }
 
+    def managed_local_file_consistency_groups(self) -> dict[str, tuple[str, ...]]:
+        """Require the durable account ledger and baseline metadata together."""
+
+        return {
+            "account-state": (
+                "account-ledger.jsonl",
+                "account-ledger.jsonl.initialization.json",
+            )
+        }
+
     def _copy_ledger(self) -> AccountLedger:
         return AccountLedger.from_records(
             initial_cash=self._ledger.initial_cash,
@@ -310,3 +344,10 @@ def _write_initialization_metadata(path: Path, initial_cash: Decimal) -> None:
     finally:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+
+
+def _remove_initialization_metadata(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ValueError("account initialization metadata cannot be removed") from exc

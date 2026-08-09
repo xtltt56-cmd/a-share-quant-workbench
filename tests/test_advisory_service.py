@@ -125,6 +125,7 @@ def test_manual_buy_preview_accepts_only_four_fields_and_does_not_persist_until_
     assert preview["estimated_total_cost"] == "1005.00"
     assert service.holdings()["positions"] == []
     assert not (tmp_path / "account-ledger.jsonl").exists()
+    assert not (tmp_path / "account-ledger.jsonl.initialization.json").exists()
     assert not any("order" in name.lower() for name in dir(service) if not name.startswith("_"))
 
     confirmed = service.confirm_manual_buy(preview["confirmation_token"])
@@ -177,7 +178,9 @@ def test_initial_cash_metadata_replays_a_confirmed_fill_after_zero_value_restart
 
 
 def test_conflicting_nonzero_initial_cash_is_rejected_after_initialization(tmp_path) -> None:
-    _service(tmp_path)
+    service = _service(tmp_path)
+    preview = service.preview_manual_buy(name="平安银行", code="000001", quantity=100, price=10)
+    service.confirm_manual_buy(preview["confirmation_token"])
 
     with pytest.raises(ValueError, match="conflicts"):
         AdvisoryWorkbenchService(
