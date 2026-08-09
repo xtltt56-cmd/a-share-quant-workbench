@@ -11,7 +11,7 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -23,6 +23,7 @@ _MANIFEST_NAME = "backup-manifest.json"
 _MANAGED_PREFIX = "managed/"
 _RESTORE_JOURNAL_FORMAT_VERSION = 2
 _LEGACY_RESTORE_JOURNAL_FORMAT_VERSION = 1
+_PENDING_RESTORE_MARKER_FORMAT_VERSION = 1
 _SHARED_RESTORE_LOCKS: dict[str, RLock] = {}
 _SHARED_RESTORE_LOCKS_GUARD = RLock()
 
@@ -70,6 +71,13 @@ class RestoreReceipt:
 class _PendingRestore:
     archive_path: Path
     manifest_digest: str
+
+
+@dataclass(frozen=True)
+class _PendingRestoreMarker:
+    transaction_id: str
+    configuration_digest: str
+    journal_path: str
 
 
 @dataclass(frozen=True)
@@ -166,7 +174,18 @@ class LocalBackupManager:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pending_restores: dict[str, _PendingRestore] = {}
         self._journal_path = _restore_journal_path(self._audit_path)
-        self._restore_lock_path = _resource_restore_lock_path(self._managed_files)
+        self._restore_lock_path = _audit_restore_lock_path(self._journal_path)
+        self._destination_paths = tuple(
+            sorted(self._managed_files.values(), key=_canonical_path)
+        )
+        self._destination_lock_paths = tuple(
+            _destination_restore_lock_path(destination)
+            for destination in self._destination_paths
+        )
+        self._destination_marker_paths = {
+            destination: _pending_restore_marker_path(destination)
+            for destination in self._destination_paths
+        }
         _validate_no_linked_ancestors(
             self._journal_path,
             description="restore journal file",
@@ -175,6 +194,16 @@ class LocalBackupManager:
             self._restore_lock_path,
             description="restore lock file",
         )
+        for lock_path in self._destination_lock_paths:
+            _validate_no_linked_ancestors(
+                lock_path,
+                description="destination restore lock file",
+            )
+        for marker_path in self._destination_marker_paths.values():
+            _validate_no_linked_ancestors(
+                marker_path,
+                description="pending restore marker",
+            )
         if any(_same_path(path, self._journal_path) for path in self._managed_files.values()):
             raise ValueError("restore journal file cannot be a managed backup file")
         if _same_path(self._journal_path, self._audit_path):
@@ -185,7 +214,26 @@ class LocalBackupManager:
             raise ValueError("restore lock file cannot be the audit file")
         if _same_path(self._restore_lock_path, self._journal_path):
             raise ValueError("restore lock file cannot be the restore journal file")
-        self._restore_lock = _shared_restore_lock(self._restore_lock_path)
+        protected_paths = (
+            *self._managed_files.values(),
+            self._audit_path,
+            self._journal_path,
+            self._restore_lock_path,
+            *self._destination_lock_paths,
+            *self._destination_marker_paths.values(),
+        )
+        if _has_duplicate_destinations(protected_paths):
+            raise ValueError("backup coordination paths cannot share a local destination")
+        self._coordination_lock_paths = tuple(
+            sorted(
+                (*self._destination_lock_paths, self._restore_lock_path),
+                key=_canonical_path,
+            )
+        )
+        self._coordination_locks = tuple(
+            _shared_restore_lock(lock_path)
+            for lock_path in self._coordination_lock_paths
+        )
         with self._coordinated_restore_lock():
             self._recover_pending_restore()
 
@@ -203,6 +251,8 @@ class LocalBackupManager:
             self._audit_path,
             self._journal_path,
             self._restore_lock_path,
+            *self._destination_lock_paths,
+            *self._destination_marker_paths.values(),
         )
         if any(_same_path(archive, path) for path in protected_paths):
             raise ValueError("backup archive cannot replace a protected file")
@@ -272,9 +322,9 @@ class LocalBackupManager:
 
     @contextmanager
     def _coordinated_restore_lock(self) -> Iterator[None]:
-        with self._restore_lock:
+        with _in_process_restore_locks(self._coordination_locks):
             self._validate_operation_paths()
-            with _durable_restore_lock(self._restore_lock_path):
+            with _durable_restore_locks(self._coordination_lock_paths):
                 self._validate_operation_paths()
                 yield
 
@@ -296,6 +346,16 @@ class LocalBackupManager:
             self._restore_lock_path,
             description="restore lock file",
         )
+        for lock_path in self._destination_lock_paths:
+            _validate_no_linked_ancestors(
+                lock_path,
+                description="destination restore lock file",
+            )
+        for marker_path in self._destination_marker_paths.values():
+            _validate_no_linked_ancestors(
+                marker_path,
+                description="pending restore marker",
+            )
 
     def _restore_locked(
         self,
@@ -314,6 +374,8 @@ class LocalBackupManager:
 
         staged: list[tuple[str, Path, Path]] = []
         journal: _RestoreJournal | None = None
+        marker_paths: tuple[Path, ...] = ()
+        transaction_id: str | None = None
         try:
             for logical_path, content in contents.items():
                 destination = self._managed_files[logical_path]
@@ -325,7 +387,16 @@ class LocalBackupManager:
                     )
                 )
 
-            journal = self._create_restore_journal(staged, contents)
+            transaction_id = f"restore-{uuid4().hex}"
+            marker_paths = self._write_pending_restore_markers(
+                transaction_id,
+                (destination for _, destination, _ in staged),
+            )
+            journal = self._create_restore_journal(
+                staged,
+                contents,
+                transaction_id=transaction_id,
+            )
             self._write_restore_journal(journal)
             audit_id = self._append_restore_audit(manifest)
             for _, destination, temporary in staged:
@@ -342,6 +413,14 @@ class LocalBackupManager:
                     self._recover_pending_restore()
                 except BaseException as recovery_error:
                     raise ValueError("restore journal recovery failed") from recovery_error
+            elif marker_paths:
+                try:
+                    self._clear_pending_restore_markers(
+                        marker_paths,
+                        transaction_id=transaction_id,
+                    )
+                except BaseException as cleanup_error:
+                    raise ValueError("restore marker cleanup failed") from cleanup_error
             raise
         finally:
             for _, _, temporary in staged:
@@ -352,8 +431,9 @@ class LocalBackupManager:
         self,
         staged: list[tuple[str, Path, Path]],
         contents: Mapping[str, bytes],
+        *,
+        transaction_id: str,
     ) -> _RestoreJournal:
-        transaction_id = f"restore-{uuid4().hex}"
         entries: list[_RestoreJournalEntry] = []
         for index, (logical_path, destination, _) in enumerate(staged):
             snapshot_path = _journal_snapshot_path(
@@ -391,14 +471,117 @@ class LocalBackupManager:
         )
 
     def _recover_pending_restore(self) -> None:
+        markers = self._read_pending_restore_markers()
+        transaction_id = self._validate_pending_restore_marker_ownership(markers)
         journal = self._read_pending_restore_journal()
         if journal is None:
+            if transaction_id is not None:
+                self._clear_pending_restore_markers(
+                    tuple(markers),
+                    transaction_id=transaction_id,
+                )
             return
         try:
+            self._validate_pending_restore_markers_for_journal(markers, journal)
             recovery_targets = self._journal_recovery_targets(journal)
-            self._recover_restore_journal(journal, recovery_targets)
+            self._recover_restore_journal(
+                journal,
+                recovery_targets,
+                clear_pending_markers=bool(markers),
+            )
         except ValueError as exc:
             raise ValueError(f"restore journal cannot be recovered: {exc}") from exc
+
+    def _read_pending_restore_markers(self) -> dict[Path, _PendingRestoreMarker]:
+        markers: dict[Path, _PendingRestoreMarker] = {}
+        for marker_path in self._destination_marker_paths.values():
+            marker = _read_pending_restore_marker(marker_path)
+            if marker is not None:
+                markers[marker_path] = marker
+        return markers
+
+    def _validate_pending_restore_marker_ownership(
+        self,
+        markers: Mapping[Path, _PendingRestoreMarker],
+    ) -> str | None:
+        if not markers:
+            return None
+        expected_journal_path = _canonical_path(self._journal_path)
+        transaction_ids: set[str] = set()
+        for marker in markers.values():
+            if (
+                marker.configuration_digest != self._managed_configuration_digest
+                or marker.journal_path != expected_journal_path
+            ):
+                raise ValueError("pending restore is owned by another configuration")
+            transaction_ids.add(marker.transaction_id)
+        if len(transaction_ids) != 1:
+            raise ValueError("pending restore marker is invalid")
+        return next(iter(transaction_ids))
+
+    def _validate_pending_restore_markers_for_journal(
+        self,
+        markers: Mapping[Path, _PendingRestoreMarker],
+        journal: _RestoreJournal,
+    ) -> None:
+        if not markers:
+            return
+        expected_marker_paths = {
+            self._destination_marker_paths[self._managed_files[entry.path]]
+            for entry in journal.entries
+        }
+        if set(markers) != expected_marker_paths:
+            raise ValueError("pending restore marker is invalid")
+        if any(marker.transaction_id != journal.transaction_id for marker in markers.values()):
+            raise ValueError("pending restore marker is invalid")
+
+    def _write_pending_restore_markers(
+        self,
+        transaction_id: str,
+        destinations: Iterable[Path],
+    ) -> tuple[Path, ...]:
+        marker_paths = tuple(
+            self._destination_marker_paths[destination] for destination in destinations
+        )
+        if not marker_paths:
+            return ()
+        marker = _PendingRestoreMarker(
+            transaction_id=transaction_id,
+            configuration_digest=self._managed_configuration_digest,
+            journal_path=_canonical_path(self._journal_path),
+        )
+        written_paths: list[Path] = []
+        try:
+            for marker_path in marker_paths:
+                _write_pending_restore_marker(marker_path, marker)
+                written_paths.append(marker_path)
+        except BaseException:
+            for marker_path in reversed(written_paths):
+                _remove_pending_restore_marker(marker_path, marker)
+            raise
+        return marker_paths
+
+    def _clear_pending_restore_markers(
+        self,
+        marker_paths: Iterable[Path],
+        *,
+        transaction_id: str | None,
+    ) -> None:
+        if transaction_id is None:
+            raise ValueError("pending restore marker is invalid")
+        marker = _PendingRestoreMarker(
+            transaction_id=transaction_id,
+            configuration_digest=self._managed_configuration_digest,
+            journal_path=_canonical_path(self._journal_path),
+        )
+        for marker_path in marker_paths:
+            _remove_pending_restore_marker(marker_path, marker)
+
+    def _pending_restore_marker_paths(self, journal: _RestoreJournal) -> tuple[Path, ...]:
+        return tuple(
+            self._destination_marker_paths[self._managed_files[entry.path]]
+            for entry in journal.entries
+        )
 
     def _read_pending_restore_journal(self) -> _RestoreJournal | None:
         if self._journal_path.is_symlink():
@@ -488,6 +671,8 @@ class LocalBackupManager:
         self,
         journal: _RestoreJournal,
         recovery_targets: tuple[_JournalRecoveryTarget, ...],
+        *,
+        clear_pending_markers: bool,
     ) -> None:
         staged: list[tuple[Path, Path]] = []
         try:
@@ -515,7 +700,10 @@ class LocalBackupManager:
             for _, temporary in staged:
                 if temporary.exists():
                     temporary.unlink()
-        self._finalize_restore_journal(journal)
+        self._finalize_restore_journal(
+            journal,
+            clear_pending_markers=clear_pending_markers,
+        )
 
     def _verify_restored_contents(self, contents: Mapping[str, bytes]) -> None:
         for logical_path, expected_content in contents.items():
@@ -528,7 +716,12 @@ class LocalBackupManager:
             if actual_content != expected_content:
                 raise ValueError("restored file cannot be verified")
 
-    def _finalize_restore_journal(self, journal: _RestoreJournal) -> None:
+    def _finalize_restore_journal(
+        self,
+        journal: _RestoreJournal,
+        *,
+        clear_pending_markers: bool = True,
+    ) -> None:
         if self._journal_path.is_symlink() or not self._journal_path.is_file():
             raise ValueError("restore journal is invalid")
         try:
@@ -547,6 +740,11 @@ class LocalBackupManager:
                 snapshot_path.unlink(missing_ok=True)
             except OSError as exc:
                 raise ValueError("restore journal cannot be finalized") from exc
+        if clear_pending_markers:
+            self._clear_pending_restore_markers(
+                self._pending_restore_marker_paths(journal),
+                transaction_id=journal.transaction_id,
+            )
 
     def _read_validated_archive(
         self,
@@ -789,6 +987,36 @@ def _restore_journal_from_bytes(content: bytes, journal_path: Path) -> _RestoreJ
     )
 
 
+def _pending_restore_marker_from_bytes(content: bytes) -> _PendingRestoreMarker:
+    try:
+        raw = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("pending restore marker is invalid") from exc
+    expected_keys = {
+        "format_version",
+        "transaction_id",
+        "configuration_digest",
+        "journal_path",
+    }
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != expected_keys
+        or raw["format_version"] != _PENDING_RESTORE_MARKER_FORMAT_VERSION
+        or not _is_restore_transaction_id(raw["transaction_id"])
+        or not _is_sha256(raw["configuration_digest"])
+        or not isinstance(raw["journal_path"], str)
+        or not raw["journal_path"]
+        or raw["journal_path"].strip() != raw["journal_path"]
+        or "\x00" in raw["journal_path"]
+    ):
+        raise ValueError("pending restore marker is invalid")
+    return _PendingRestoreMarker(
+        transaction_id=raw["transaction_id"],
+        configuration_digest=raw["configuration_digest"],
+        journal_path=raw["journal_path"],
+    )
+
+
 def _legacy_restore_journal_from_dict(
     raw: dict[object, object],
     journal_path: Path,
@@ -868,13 +1096,21 @@ def _restore_journal_path(audit_path: Path) -> Path:
     return audit_path.with_name(f".{audit_path.name}.restore-journal.json")
 
 
-def _resource_restore_lock_path(managed_files: Mapping[str, Path]) -> Path:
-    configuration_digest = _managed_destination_configuration_digest(managed_files)
+def _audit_restore_lock_path(journal_path: Path) -> Path:
+    return journal_path.with_name(f"{journal_path.name}.lock")
+
+
+def _destination_restore_lock_path(destination: Path) -> Path:
     return _resolve_non_linked_path(
-        Path(tempfile.gettempdir())
-        / "a-share-quant-backup-locks"
-        / f"{configuration_digest}.restore.lock",
-        description="restore lock file",
+        destination.with_name(f".{destination.name}.restore-resource.lock"),
+        description="destination restore lock file",
+    )
+
+
+def _pending_restore_marker_path(destination: Path) -> Path:
+    return _resolve_non_linked_path(
+        destination.with_name(f".{destination.name}.restore-pending.json"),
+        description="pending restore marker",
     )
 
 
@@ -886,6 +1122,22 @@ def _shared_restore_lock(lock_path: Path) -> RLock:
             lock = RLock()
             _SHARED_RESTORE_LOCKS[lock_key] = lock
         return lock
+
+
+@contextmanager
+def _in_process_restore_locks(locks: Iterable[RLock]) -> Iterator[None]:
+    with ExitStack() as stack:
+        for lock in locks:
+            stack.enter_context(lock)
+        yield
+
+
+@contextmanager
+def _durable_restore_locks(lock_paths: Iterable[Path]) -> Iterator[None]:
+    with ExitStack() as stack:
+        for lock_path in lock_paths:
+            stack.enter_context(_durable_restore_lock(lock_path))
+        yield
 
 
 @contextmanager
@@ -912,6 +1164,59 @@ def _durable_restore_lock(lock_path: Path) -> Iterator[None]:
             _release_restore_lock_file_descriptor(file_descriptor)
         finally:
             os.close(file_descriptor)
+
+
+def _read_pending_restore_marker(marker_path: Path) -> _PendingRestoreMarker | None:
+    _validate_no_linked_ancestors(marker_path, description="pending restore marker")
+    if marker_path.is_symlink():
+        raise ValueError("pending restore marker is invalid")
+    if not marker_path.exists():
+        return None
+    if not marker_path.is_file():
+        raise ValueError("pending restore marker is invalid")
+    try:
+        content = marker_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("pending restore marker cannot be read") from exc
+    if not content or len(content) > 4096:
+        raise ValueError("pending restore marker is invalid")
+    return _pending_restore_marker_from_bytes(content)
+
+
+def _write_pending_restore_marker(
+    marker_path: Path,
+    marker: _PendingRestoreMarker,
+) -> None:
+    _validate_no_linked_ancestors(marker_path, description="pending restore marker")
+    if marker_path.is_symlink() or (marker_path.exists() and not marker_path.is_file()):
+        raise ValueError("pending restore marker is invalid")
+    if marker_path.exists():
+        raise ValueError("pending restore marker is already present")
+    content = _canonical_json(
+        {
+            "format_version": _PENDING_RESTORE_MARKER_FORMAT_VERSION,
+            "transaction_id": marker.transaction_id,
+            "configuration_digest": marker.configuration_digest,
+            "journal_path": marker.journal_path,
+        }
+    ).encode("utf-8")
+    try:
+        _write_durable_bytes(marker_path, content)
+    except ValueError as exc:
+        raise ValueError("pending restore marker cannot be written") from exc
+
+
+def _remove_pending_restore_marker(
+    marker_path: Path,
+    expected_marker: _PendingRestoreMarker,
+) -> None:
+    marker = _read_pending_restore_marker(marker_path)
+    if marker != expected_marker:
+        raise ValueError("pending restore marker is invalid")
+    try:
+        marker_path.unlink()
+    except OSError as exc:
+        raise ValueError("pending restore marker cannot be finalized") from exc
 
 
 def _acquire_restore_lock_file_descriptor(file_descriptor: int) -> None:
@@ -1125,11 +1430,6 @@ def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
         for logical_path, destination in sorted(managed_files.items())
     ]
     return _sha256(_canonical_json(configuration).encode("utf-8"))
-
-
-def _managed_destination_configuration_digest(managed_files: Mapping[str, Path]) -> str:
-    destinations = sorted(_canonical_path(destination) for destination in managed_files.values())
-    return _sha256(_canonical_json(destinations).encode("utf-8"))
 
 
 def _resolve_non_linked_path(path: Path, *, description: str) -> Path:
