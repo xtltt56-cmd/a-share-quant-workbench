@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Any
 
 from a_share_quant.signals.realtime import OfficialModelSignal
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.realtime_store import EODFinalizationReceipt, RealTimeStore
 
 
@@ -34,6 +35,7 @@ class EODPipeline:
         update_pit: Callable[[tuple[Any, ...]], None],
         generate_official_signals: Callable[[tuple[Any, ...]], Iterable[OfficialModelSignal]],
         write_report: Callable[[tuple[OfficialModelSignal, ...]], None],
+        official_signal_store: OfficialSignalStore | None = None,
     ) -> None:
         self.store = store
         self.confirm_close = confirm_close
@@ -42,6 +44,7 @@ class EODPipeline:
         self.update_pit = update_pit
         self.generate_official_signals = generate_official_signals
         self.write_report = write_report
+        self.official_signal_store = official_signal_store
 
     def run(self, trade_date: date | str | datetime) -> EODPipelineResult:
         parsed_date = _parse_date(trade_date)
@@ -64,6 +67,9 @@ class EODPipeline:
             if any(signal.frequency.value != "daily" for signal in signals):
                 raise ValueError("EOD pipeline received a non-daily official signal")
             steps.append("official_daily_signals_generated")
+            if self.official_signal_store is not None:
+                self.official_signal_store.put_signals(signals)
+            steps.append("official_daily_signals_stored")
             self.write_report(signals)
             steps.append("candidate_report_written")
             return EODPipelineResult(parsed_date, "COMPLETED", tuple(steps), receipt, signals)

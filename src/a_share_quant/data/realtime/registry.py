@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any
 
 from a_share_quant.contracts.realtime import (
@@ -100,6 +101,11 @@ def build_default_registry(
         ),
         "tushare": lambda: TushareRealTimeProvider(token=os.getenv("TUSHARE_TOKEN")),
         "akshare": lambda: AKShareRealTimeProvider(
+            market_snapshot_timeout_seconds=_environment_positive_float(
+                "A_SHARE_QUANT_AKSHARE_MARKET_SNAPSHOT_TIMEOUT_SECONDS",
+                default=120.0,
+                maximum=300.0,
+            ),
             use_system_proxy=_environment_flag("A_SHARE_QUANT_USE_SYSTEM_PROXY", default=True),
             isolated_transport_authorized=_environment_flag(
                 "A_SHARE_QUANT_ISOLATED_TRANSPORT_APPROVED",
@@ -124,6 +130,26 @@ def _environment_flag(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be true or false")
+
+
+def _environment_positive_float(
+    name: str,
+    *,
+    default: float,
+    maximum: float,
+) -> float:
+    """Read a bounded timeout without accepting an unbounded wait."""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if not isfinite(parsed) or not 0 < parsed <= maximum:
+        raise ValueError(f"{name} must be greater than zero and at most {maximum:g}")
+    return parsed
 
 
 class FailoverRealTimeProvider:

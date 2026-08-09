@@ -35,10 +35,26 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/state":
             self._write_json(self.server.service.snapshot())
         elif path == "/api/refresh":
-            self.server.service.refresh()
-            self._write_json(self.server.service.snapshot())
+            self._write_json(
+                {"error": "use POST with the local refresh request header"},
+                status=HTTPStatus.METHOD_NOT_ALLOWED,
+            )
         else:
             self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        path = urlparse(self.path).path
+        if path != "/api/refresh":
+            self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+        if self.headers.get("X-Quant-Workbench-Request") != "refresh":
+            self._write_json(
+                {"error": "local refresh request header required"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+        self.server.service.refresh()
+        self._write_json(self.server.service.snapshot())
 
     def log_message(self, format: str, *args: Any) -> None:
         # Keep the default access log local and payload-free.
@@ -179,7 +195,7 @@ async function load(){
     document.getElementById('error').textContent='Status: local dashboard response unavailable';
   }
 }
-async function refresh(){await fetch('/api/refresh',{cache:'no-store'});await load()}
+async function refresh(){await fetch('/api/refresh',{method:'POST',headers:{'X-Quant-Workbench-Request':'refresh'},cache:'no-store'});await load()}
 load(); setInterval(load,15000);
 </script></body></html>"""
 

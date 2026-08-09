@@ -139,6 +139,50 @@ def test_akshare_provider_reports_missing_endpoints_and_bounded_failure(
         provider.get_minute_bars(["000001"], "1m")
 
 
+def test_akshare_full_market_snapshot_uses_a_dedicated_pagination_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = AKShareRealTimeProvider(
+        timeout_seconds=1,
+        market_snapshot_timeout_seconds=90,
+        retry_count=0,
+        delay_seconds=0,
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call(function_name: str, **kwargs: object) -> pd.DataFrame:
+        calls.append({"function_name": function_name, **kwargs})
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": "000001",
+                    "name": "sample",
+                    "last": 10.0,
+                    "open": 10.0,
+                    "high": 10.1,
+                    "low": 9.9,
+                    "previous_close": 10.0,
+                    "volume": 100,
+                    "amount": 1000,
+                    "timestamp": NOW.isoformat(),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(provider, "_call", fake_call)
+
+    snapshot = provider.get_market_snapshot()
+
+    assert snapshot.quotes[0].symbol == "000001"
+    assert calls == [
+        {
+            "function_name": "stock_zh_a_spot_em",
+            "timeout_seconds": 90.0,
+            "retry_on_timeout": False,
+        }
+    ]
+
+
 def test_akshare_minute_provider_retries_without_adjust_keyword(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -317,3 +317,62 @@ monitoring with an explicit real-data availability limitation. The boundary
 is fail-closed for remote binding, provider failure, and live execution. Any
 future broker or external deployment must trigger a new threat-model review,
 new human approval, and a separate execution package.
+
+## Stage 3RT-E security addendum (2026-08-09)
+
+### Scope and assumptions
+
+This is a rerun for the real-market verification and network-remediation work:
+`src/a_share_quant/data/realtime/`, `src/a_share_quant/runtime/`,
+`src/a_share_quant/workbench/`, `scripts/run_*`, `scripts/quant_cli.py`,
+`.env.example`, generated Markdown reports, and the Windows launcher. The
+confirmed operating model remains a single-user Windows workstation, outbound
+market-data requests, loopback-only dashboard, paper monitoring, and no
+broker/account/order API. The user explicitly requested autonomous progress
+unless a real-funds safety decision is required; consequently this review uses
+those established assumptions rather than pausing for additional context.
+
+### New trust boundaries and controls
+
+```mermaid
+flowchart LR
+  operator["Local operator"] --> cli["CLI and launcher"]
+  env["Env and proxy config"] --> provider["Provider adapter"]
+  market["Market data source"] --> provider
+  provider --> quality["Normalization and quality gate"]
+  quality --> stores["Signals and overlays"]
+  stores --> dashboard["Loopback dashboard"]
+  dashboard --> operator
+```
+
+| Boundary | Evidence anchor | Existing control | Residual risk |
+|---|---|---|---|
+| Environment/proxy -> provider transport | `src/a_share_quant/data/realtime/transport.py`, `registry.py`, `.env.example` | System proxy is the default; isolated transport requires explicit authorization and still fails closed; no global proxy mutation or TLS downgrade | A local user can still alter their own proxy or environment settings |
+| Diagnostic -> Markdown/CLI output | `diagnostics.py`, `scripts/run_network_diagnostics.py`, `scripts/quant_cli.py` | Proxy URI, credentials, raw exceptions, and TLS bypass are not emitted; reports expose only redacted fields and exception classes | Local operators can still infer basic topology from the intentionally retained port/status fields |
+| Provider credentials -> capability discovery | `scripts/run_real_market_validation.py`, `registry.py` | Presence/permission state only; no credential value, raw API response, or exception text is stored | A compromised local process can read the process environment before application controls run |
+| Market snapshot -> live state | `realtime_telemetry.py`, `run_real_market_validation.py` | Schema, freshness, nondecreasing timestamp, two distinct updates, and circuit-breaker checks are all required before GOOD | An upstream provider can still withhold or delay data, causing availability loss |
+| Official signal -> real-time overlay | `official_signal_store.py`, `realtime_overlay_store.py`, `workbench/service.py` | Separate in-memory stores; overlay schema contains no daily model score and READY is monitor-only | Local memory is not durable or independently tamper-evident |
+| Browser -> refresh operation | `workbench/app.py` | Loopback binding, no-store responses, POST-only refresh, and a custom request header prevent cross-site simple-request refreshes | A same-user local process can still make an authenticated-looking loopback request |
+| Desktop shortcut -> PowerShell launcher | `scripts/create_desktop_shortcut.ps1`, `start_quant_workbench.ps1` | Stable repository target, hidden child process, bounded health check, local logs, and PID ownership | Shortcut uses `-ExecutionPolicy Bypass`; it is not an authorization boundary if a local attacker can modify the repository |
+
+### Threat and remediation update
+
+| ID | Abuse path | Likelihood | Impact | Priority | Evidence and disposition |
+|---|---|---:|---:|---|---|
+| TM-028 | A proxy URL, user name, password, token, or raw provider exception is copied into diagnostics, smoke output, or the dashboard | medium | high | high | Mitigated in `diagnostics.py`, `run_realtime_smoke_test.py`, and `run_real_market_validation.py` through redacted contracts and safe status rendering; add a secret-pattern scan to CI before remote sharing of reports |
+| TM-029 | An operator attempts a silent proxy bypass or disables certificate verification to make AKShare work | medium | high | high | Mitigated: `TransportPolicy` preserves system proxy by default and rejects isolated transport without approval; diagnostics explicitly use TLS verification. Keep a reviewed adapter boundary if isolated transport is ever implemented |
+| TM-030 | A malicious web page causes repeated local dashboard refreshes and exhausts a public provider | medium | medium | medium | Fixed in `workbench/app.py`: refresh is POST-only and requires `X-Quant-Workbench-Request`; no CORS grant is emitted. Consider a local per-minute refresh cap if the dashboard is ever exposed beyond one operator |
+| TM-031 | A changed local repository script is launched through the Desktop shortcut with PowerShell execution-policy bypass | low | high | medium | Residual local-integrity risk. Before wider distribution, sign launcher scripts or remove the bypass after the host execution policy is configured; preserve file ACLs and review shortcut target changes |
+| TM-032 | A partial, stale, replayed, or timestamp-rolled-back quote is presented as real-time GOOD | medium | high | high | Mitigated by `LiveDataQualityGate`, `ProviderTelemetry`, and the real-market gate. Continue to fail closed; do not lower update, freshness, or full-universe thresholds for public-source failures |
+| TM-033 | Tushare/RQData credentials or permission errors are exposed during capability probing | low | high | medium | Mitigated by presence-only discovery and sanitized exception classes. Add least-privilege provider accounts and rotate credentials if a local report/log is ever shared |
+| TM-034 | Intraday monitoring changes an official daily score or turns READY into a buy instruction | low | high | medium | Mitigated by separate stores/contracts and dashboard copy. Add an architectural test for the absence of model-score fields in `RealtimeOverlay` as the schema evolves |
+
+### Stage 3RT-E review conclusion
+
+No broker, order, account, or automatic execution path was found in the
+Stage 3RT-E scope. The highest remaining risks are local secret/integrity
+protection and upstream/public-provider availability, not remote trading
+execution. Security code review is PASS for the current paper-only boundary;
+the final real-market security gate remains pending because it requires a
+successful live trading-session validation, not because a security control was
+weakened.

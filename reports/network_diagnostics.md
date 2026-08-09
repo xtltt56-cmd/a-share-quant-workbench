@@ -2,8 +2,8 @@
 
 > This report is redacted by construction: it contains no proxy URI, user name, password, token, or raw exception payload.
 
-- Generated at: 2026-08-09T05:25:41.086083+00:00
-- Assessment: AKSHARE_INDIVIDUAL_QUOTE_ENDPOINT_UNAVAILABLE_OR_REJECTED
+- Generated at: 2026-08-09T08:51:29.665054+00:00
+- Assessment: NETWORK_PROBES_NOT_REQUESTED
 - TLS verification: ENABLED
 
 ## Proxy observations
@@ -23,12 +23,12 @@
 
 | Check | Status | HTTP status | Elapsed ms | Error type |
 |---|---|---:|---:|---|
-| Eastmoney DNS | PASS | n/a | 15.0 | none |
-| HTTPS connectivity | PASS | 200 | 407.0 | none |
-| AKShare endpoint reachability | PASS | 200 | 1312.0 | none |
-| AKShare individual quote endpoint | FAILED | n/a | 344.0 | ProxyError |
-| Python requests connectivity | PASS | 200 | 391.0 | none |
-| aiohttp connectivity | PASS | 200 | 4953.0 | none |
+| Eastmoney DNS | NOT_REQUESTED | n/a | n/a | none |
+| HTTPS connectivity | NOT_REQUESTED | n/a | n/a | none |
+| AKShare endpoint reachability | NOT_REQUESTED | n/a | n/a | none |
+| AKShare individual quote endpoint | NOT_REQUESTED | n/a | n/a | none |
+| Python requests connectivity | NOT_REQUESTED | n/a | n/a | none |
+| aiohttp connectivity | NOT_REQUESTED | n/a | n/a | none |
 
 ## Runtime and browser boundary
 

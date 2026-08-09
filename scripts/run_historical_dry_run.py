@@ -12,13 +12,21 @@ import pandas as pd
 
 from a_share_quant.data.normalization import normalize_symbol
 
+MIN_REAL_TRADABLE_SYMBOLS = 10
+DEFAULT_REAL_TRADABLE_SYMBOLS = 15
+MAX_REAL_TRADABLE_SYMBOLS = 20
+MIN_LISTING_DAYS = 60
+
 
 def choose_production_symbols(
     rows: Iterable[dict[str, Any]],
     *,
     fixture_symbols: set[str],
     limit: int,
+    as_of: date | None = None,
+    min_listing_days: int = MIN_LISTING_DAYS,
 ) -> tuple[str, ...]:
+    reference_date = as_of or date.today()
     selected: set[str] = set()
     for row in rows:
         try:
@@ -27,10 +35,15 @@ def choose_production_symbols(
             continue
         if symbol in fixture_symbols:
             continue
+        if symbol == "000300" or str(row.get("asset_type", "")).upper() == "INDEX":
+            continue
         if any(
             bool(row.get(field, False))
             for field in ("is_st", "is_delisting_risk", "is_suspended")
         ):
+            continue
+        listed_date = _parse_date(row.get("listed_date"))
+        if listed_date is None or (reference_date - listed_date).days < min_listing_days:
             continue
         selected.add(symbol)
     return tuple(sorted(selected))[: max(0, limit)]
@@ -41,8 +54,9 @@ def inspect_inputs(
     *,
     fixture_symbols: set[str],
     benchmark: str = "000300",
-    limit: int = 4,
+    limit: int = DEFAULT_REAL_TRADABLE_SYMBOLS,
 ) -> dict[str, Any]:
+    _validate_symbol_limit(limit)
     instrument_paths = sorted((repo_root / "data" / "lake" / "instruments").glob("*.parquet"))
     if not instrument_paths:
         return {
@@ -54,13 +68,21 @@ def inspect_inputs(
         }
     frame = pd.read_parquet(instrument_paths[-1])
     symbols = choose_production_symbols(
-        frame.to_dict(orient="records"), fixture_symbols=fixture_symbols, limit=limit
+        frame.to_dict(orient="records"),
+        fixture_symbols=fixture_symbols,
+        limit=limit,
+        as_of=_latest_instrument_date(frame),
     )
     available = {
         path.stem
         for path in (repo_root / "data" / "lake" / "daily_bars").glob("*.parquet")
     }
     missing = [f"historical bars for {symbol}" for symbol in symbols if symbol not in available]
+    if len(symbols) < MIN_REAL_TRADABLE_SYMBOLS:
+        missing.append(
+            f"at least {MIN_REAL_TRADABLE_SYMBOLS} eligible real tradable equities "
+            f"are required (found {len(symbols)})"
+        )
     if benchmark not in available:
         missing.append(f"benchmark daily bars for {benchmark}")
     manifest_path = repo_root / "artifacts" / "baselines" / "STAGE2_BASELINE_MANIFEST.json"
@@ -76,6 +98,7 @@ def inspect_inputs(
         "status": "READY_FOR_HISTORICAL_PIPELINE" if not missing else "NOT_READY",
         "symbols": list(symbols),
         "benchmark": benchmark,
+        "required_symbol_count": MIN_REAL_TRADABLE_SYMBOLS,
         "missing": missing,
         "note": (
             "No fixture signal or fixture symbol was substituted. A historical model run requires "
@@ -97,6 +120,7 @@ def fetch_production_inputs(
     from a_share_quant.data.providers.akshare import AKShareDataProvider
     from a_share_quant.storage.market_store import MarketDataStore
 
+    _validate_symbol_limit(limit)
     settings = Settings.load()
     provider = AKShareDataProvider(
         timeout_seconds=settings.request_timeout_seconds,
@@ -118,6 +142,7 @@ def fetch_production_inputs(
             rows,
             fixture_symbols={"000001", "000002", "000003", "000004"},
             limit=limit,
+            as_of=end_date,
         )
         summary["symbols"] = list(symbols)
         for symbol in symbols:
@@ -170,6 +195,10 @@ def write_report(payload: dict[str, Any], output: Path) -> None:
         "model outputs are never substituted.",
         "",
         f"- Status: **{payload['status']}**",
+        (
+            "- Required real tradable symbols: "
+            f"{payload.get('required_symbol_count', MIN_REAL_TRADABLE_SYMBOLS)}"
+        ),
         f"- Production symbols: `{', '.join(payload['symbols']) or 'none'}`",
         f"- Benchmark mapping: `{payload['benchmark']}`",
         f"- Missing: `{'; '.join(payload['missing']) or 'none'}`",
@@ -198,13 +227,17 @@ def main() -> int:
     parser.add_argument(
         "--output", type=Path, default=Path("reports/historical_dry_run_readiness.md")
     )
-    parser.add_argument("--limit", type=int, default=4)
+    parser.add_argument("--limit", type=int, default=DEFAULT_REAL_TRADABLE_SYMBOLS)
     parser.add_argument(
         "--network", action="store_true", help="explicitly fetch external historical data"
     )
     parser.add_argument("--start-date", type=date.fromisoformat, default=date(2020, 1, 1))
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
     args = parser.parse_args()
+    try:
+        _validate_symbol_limit(args.limit)
+    except ValueError as exc:
+        parser.error(str(exc))
     repo_root = args.repo_root.resolve()
     payload = inspect_inputs(
         repo_root,
@@ -235,6 +268,30 @@ def main() -> int:
     print(f"wrote {output}")
     print(f"status={payload['status']}")
     return 0 if payload["status"] == "READY_FOR_HISTORICAL_PIPELINE" else 1
+
+
+def _parse_date(value: Any) -> date | None:
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def _latest_instrument_date(frame: pd.DataFrame) -> date:
+    if "as_of" not in frame or frame.empty:
+        return date.today()
+    values = pd.to_datetime(frame["as_of"], errors="coerce").dropna()
+    return values.max().date() if not values.empty else date.today()
+
+
+def _validate_symbol_limit(limit: int) -> None:
+    if not MIN_REAL_TRADABLE_SYMBOLS <= limit <= MAX_REAL_TRADABLE_SYMBOLS:
+        raise ValueError(
+            f"limit must be between {MIN_REAL_TRADABLE_SYMBOLS} and "
+            f"{MAX_REAL_TRADABLE_SYMBOLS}"
+        )
 
 
 if __name__ == "__main__":

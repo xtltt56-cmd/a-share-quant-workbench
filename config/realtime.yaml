@@ -44,6 +44,10 @@ realtime:
   transport:
     use_system_proxy: true
     isolated_transport_authorized: false
+    # Runtime override: A_SHARE_QUANT_AKSHARE_MARKET_SNAPSHOT_TIMEOUT_SECONDS.
+    # Keep this bounded; the provider never disables TLS verification or bypasses
+    # the system proxy without a saved diagnostic approval.
+    akshare_market_snapshot_timeout_seconds: 120
   live_validation:
     minimum_distinct_updates: 2
     telemetry_latency_samples: 256

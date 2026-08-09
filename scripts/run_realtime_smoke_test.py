@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from a_share_quant.contracts.identifiers import AssetType, SecurityIdentifier
 from a_share_quant.data.realtime.registry import build_default_registry
 from a_share_quant.data.realtime.validation import assess_quote_quality
+
+try:
+    from scripts.run_real_market_validation import validate_snapshot
+except ModuleNotFoundError:  # direct Python script execution places scripts/ first
+    from run_real_market_validation import validate_snapshot
+
+
+_SAFE_STATUS = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,79}$")
 
 
 def _safe_path(repo_root: Path, value: Path) -> Path:
@@ -19,7 +29,7 @@ def _safe_path(repo_root: Path, value: Path) -> Path:
     return candidate
 
 
-def run_smoke() -> dict[str, Any]:
+def run_smoke(*, minimum_full_market_quotes: int = 1000) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     registry = build_default_registry()
     capabilities = registry.discover()
@@ -34,6 +44,8 @@ def run_smoke() -> dict[str, Any]:
         "index_symbols": [],
         "latency_ms": None,
         "data_quality": "FAILED",
+        "snapshot_validation": {},
+        "csi300_index_identity": False,
         "error": None,
     }
     if not registry.providers:
@@ -53,17 +65,49 @@ def run_smoke() -> dict[str, Any]:
             stale_after_seconds=60,
         )
         index_quotes = failover.get_index_snapshot(("000300",))
+        csi300 = SecurityIdentifier(
+            symbol="000300",
+            exchange="SSE",
+            asset_type=AssetType.INDEX,
+        )
+        validation = validate_snapshot(
+            snapshot,
+            csi300=csi300,
+            now=datetime.now(timezone.utc),
+            minimum_full_market_quotes=minimum_full_market_quotes,
+        )
+        index_pass = any(
+            quote.symbol == "000300"
+            and quote.last is not None
+            and quote.last > 0
+            for quote in index_quotes
+        )
+        validation["csi300_index_identity"] = bool(
+            validation["csi300_index_identity"] and index_pass
+        )
+        success = all(
+            bool(validation.get(name, False))
+            for name in (
+                "schema_pass",
+                "required_symbols_pass",
+                "freshness_pass",
+                "full_market_snapshot",
+                "csi300_index_identity",
+            )
+        )
         payload.update(
             {
-                "status": "SUCCESS" if sample_symbols else "DEGRADED",
+                "status": "SUCCESS" if success else "DEGRADED",
                 "active_provider": failover.active_provider_name,
                 "sample_symbols": [_quote_dict(observed[symbol]) for symbol in sample_symbols],
                 "index_symbols": [_quote_dict(quote) for quote in index_quotes],
+                "snapshot_validation": validation,
+                "csi300_index_identity": validation["csi300_index_identity"],
                 "latency_ms": round(
                     (datetime.now(timezone.utc) - started).total_seconds() * 1000, 2
                 ),
                 "data_quality": quality.status.value,
-                "error": None if sample_symbols else "requested sample symbols were not returned",
+                "error": None if success else "SMOKE_REQUIREMENTS_NOT_MET",
             }
         )
     except Exception as exc:
@@ -85,19 +129,20 @@ def run_smoke() -> dict[str, Any]:
 def write_smoke_report(payload: dict[str, Any], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     latency = payload.get("latency_ms") if payload.get("latency_ms") is not None else "n/a"
+    validation = dict(payload.get("snapshot_validation") or {})
     lines = [
         "# Real-Time Data Smoke Test",
         "",
         "> This report records an explicit provider smoke attempt. It is not investment "
         "evidence and contains no credentials.",
         "",
-        f"- Status: **{payload.get('status', 'UNKNOWN')}**",
+        f"- Status: **{_safe_status(payload.get('status'), default='UNKNOWN')}**",
         f"- Started: `{payload.get('started_at', '')}`",
         f"- Completed: `{payload.get('completed_at', '')}`",
-        f"- Active provider: `{payload.get('active_provider') or 'none'}`",
+        f"- Active provider: `{_safe_provider(payload.get('active_provider'))}`",
         f"- Latency: `{latency}` ms",
-        f"- Data quality: `{payload.get('data_quality', 'UNKNOWN')}`",
-        f"- Error: `{payload.get('error') or 'none'}`",
+        f"- Data quality: `{_safe_status(payload.get('data_quality'), default='UNKNOWN')}`",
+        f"- Error: `{_safe_error(payload.get('error'))}`",
         "",
         "## Capability discovery",
         "",
@@ -105,12 +150,28 @@ def write_smoke_report(payload: dict[str, Any], output: Path) -> None:
         "|---|---:|---|---|---|---|",
     ]
     for item in payload.get("providers", []):
-        permissions = ", ".join(item.get("permissions", [])) or "none"
+        permissions = ", ".join(
+            _safe_permission(permission)
+            for permission in item.get("permissions", [])
+        ) or "none"
         lines.append(
-            f"| {item.get('provider', '')} | {item.get('authenticated', False)} | "
-            f"{item.get('market', '')} | {item.get('frequency', '') or 'n/a'} | "
-            f"{permissions} | {item.get('status', '')} |"
+            f"| {_safe_provider(item.get('provider'))} | {item.get('authenticated', False)} | "
+            f"{_safe_status(item.get('market'), default='UNKNOWN')} | "
+            f"{_safe_frequency(item.get('frequency'))} | {permissions} | "
+            f"{_safe_status(item.get('status'), default='UNKNOWN')} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Snapshot schema and CSI300 identity",
+            "",
+            f"- Full market snapshot: {bool(validation.get('full_market_snapshot', False))}",
+            f"- Required stock samples: {bool(validation.get('required_symbols_pass', False))}",
+            f"- Quote schema: {bool(validation.get('schema_pass', False))}",
+            f"- Freshness: {bool(validation.get('freshness_pass', False))}",
+            f"- CSI300 is an index: {bool(payload.get('csi300_index_identity', False))}",
+        ]
+    )
     lines.extend(
         [
             "",
@@ -174,6 +235,35 @@ def _quote_dict(quote: Any) -> dict[str, Any]:
         "timestamp_received": quote.timestamp_received.isoformat(),
         "data_age_seconds": round(quote.data_age_seconds(), 3),
     }
+
+
+def _safe_status(value: object, *, default: str) -> str:
+    if value is None:
+        return default
+    candidate = str(value)
+    return candidate if _SAFE_STATUS.fullmatch(candidate) else "SanitizedValue"
+
+
+def _safe_error(value: object) -> str:
+    if value is None:
+        return "none"
+    candidate = str(value)
+    return candidate if _SAFE_STATUS.fullmatch(candidate) else "SanitizedError"
+
+
+def _safe_provider(value: object) -> str:
+    candidate = str(value or "").casefold()
+    return candidate if candidate in {"akshare", "rqdata", "tushare", "replay"} else "none"
+
+
+def _safe_frequency(value: object) -> str:
+    candidate = str(value or "")
+    return candidate if candidate in {"snapshot", "1m", "snapshot,1m"} else "n/a"
+
+
+def _safe_permission(value: object) -> str:
+    candidate = str(value or "")
+    return candidate if candidate in {"snapshot", "1m"} else "SanitizedValue"
 
 
 def main() -> int:

@@ -3,6 +3,7 @@ from datetime import date, datetime, timezone
 from a_share_quant.contracts.realtime import MinuteBar
 from a_share_quant.runtime.eod import EODPipeline
 from a_share_quant.signals.realtime import OfficialModelSignal
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.realtime_store import RealTimeStore
 
 
@@ -24,6 +25,7 @@ def _bar() -> MinuteBar:
 
 def test_eod_pipeline_orders_finalization_before_pit_signal_and_report() -> None:
     store = RealTimeStore()
+    official_store = OfficialSignalStore()
     store.put_minute_bars([_bar()])
     events: list[str] = []
     signal = OfficialModelSignal(
@@ -41,12 +43,14 @@ def test_eod_pipeline_orders_finalization_before_pit_signal_and_report() -> None
         update_pit=lambda daily: events.append("pit"),
         generate_official_signals=lambda daily: events.append("signal") or (signal,),
         write_report=lambda signals: events.append("report"),
+        official_signal_store=official_store,
     )
 
     result = pipeline.run(date(2026, 8, 10))
 
     assert result.status == "COMPLETED"
     assert result.official_signals == (signal,)
+    assert official_store.latest() == (signal,)
     assert events == ["confirm", "load", "reconcile", "pit", "signal", "report"]
     assert len(store.historical_bars()) == 1
 

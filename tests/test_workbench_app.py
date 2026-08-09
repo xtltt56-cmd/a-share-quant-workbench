@@ -1,7 +1,7 @@
 import json
 import threading
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -66,7 +66,24 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "Backend Quote Timestamp" in html
         assert "cache:'no-store'" in html
         assert "BUY" not in html
-        with urlopen(f"http://127.0.0.1:{port}/api/refresh", timeout=3) as response:
+        with pytest.raises(HTTPError) as get_refresh:
+            urlopen(f"http://127.0.0.1:{port}/api/refresh", timeout=3)
+        assert get_refresh.value.code == 405
+        with pytest.raises(HTTPError) as missing_header:
+            urlopen(
+                Request(
+                    f"http://127.0.0.1:{port}/api/refresh",
+                    method="POST",
+                ),
+                timeout=3,
+            )
+        assert missing_header.value.code == 403
+        request = Request(
+            f"http://127.0.0.1:{port}/api/refresh",
+            method="POST",
+            headers={"X-Quant-Workbench-Request": "refresh"},
+        )
+        with urlopen(request, timeout=3) as response:
             json.loads(response.read().decode("utf-8"))
         assert service.refreshed is True
         with pytest.raises(HTTPError):

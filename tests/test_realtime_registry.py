@@ -189,3 +189,27 @@ def test_default_registry_keeps_configured_priority_and_skips_missing_credential
     registry = build_default_registry()
 
     assert registry.provider_names == ("rqdata", "tushare", "akshare")
+
+
+def test_default_registry_passes_bounded_full_market_timeout_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("A_SHARE_QUANT_AKSHARE_MARKET_SNAPSHOT_TIMEOUT_SECONDS", "90")
+
+    registry = build_default_registry()
+    factories = dict(registry._factories)
+    provider = factories["akshare"]()
+
+    assert provider.market_snapshot_timeout_seconds == 90.0
+
+
+def test_default_registry_rejects_invalid_full_market_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("A_SHARE_QUANT_AKSHARE_MARKET_SNAPSHOT_TIMEOUT_SECONDS", "0")
+
+    registry = build_default_registry()
+    factories = dict(registry._factories)
+
+    with pytest.raises(ValueError, match="MARKET_SNAPSHOT_TIMEOUT"):
+        factories["akshare"]()

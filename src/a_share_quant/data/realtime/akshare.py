@@ -33,12 +33,17 @@ class AKShareRealTimeProvider:
         self,
         *,
         timeout_seconds: float = 20.0,
+        market_snapshot_timeout_seconds: float = 120.0,
         retry_count: int = 3,
         delay_seconds: float = 0.5,
         use_system_proxy: bool = True,
         isolated_transport_authorized: bool = False,
     ) -> None:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
+        self.market_snapshot_timeout_seconds = max(
+            0.1,
+            float(market_snapshot_timeout_seconds),
+        )
         self.retry_count = max(0, int(retry_count))
         self.delay_seconds = max(0.0, float(delay_seconds))
         self.transport_policy = TransportPolicy(
@@ -56,26 +61,42 @@ class AKShareRealTimeProvider:
                 raise ProviderConfigurationError("AKShare is not installed") from exc
         return self._module
 
-    def _call(self, function_name: str, **kwargs: Any) -> Any:
+    def _call(
+        self,
+        function_name: str,
+        *,
+        timeout_seconds: float | None = None,
+        retry_count: int | None = None,
+        retry_on_timeout: bool = True,
+        **kwargs: Any,
+    ) -> Any:
         self.transport_policy.require_provider_transport()
         function = getattr(self._client(), function_name, None)
         if function is None:
             raise ProviderRequestError(f"AKShare endpoint unavailable: {function_name}")
         last_error: Exception | None = None
-        for attempt in range(self.retry_count + 1):
+        call_timeout = (
+            self.timeout_seconds
+            if timeout_seconds is None
+            else max(0.1, timeout_seconds)
+        )
+        attempts = self.retry_count if retry_count is None else max(0, retry_count)
+        for attempt in range(attempts + 1):
             self._wait_for_rate_limit()
             executor = ThreadPoolExecutor(max_workers=1)
             future = executor.submit(function, **kwargs)
             try:
-                return future.result(timeout=self.timeout_seconds)
+                return future.result(timeout=call_timeout)
             except FutureTimeoutError as exc:
                 future.cancel()
                 last_error = exc
+                if not retry_on_timeout:
+                    break
             except Exception as exc:
                 last_error = exc
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
-            if attempt < self.retry_count:
+            if attempt < attempts:
                 time.sleep(self.delay_seconds * (2**attempt))
         raise ProviderRequestError(
             f"AKShare real-time request failed: {function_name}"
@@ -122,7 +143,11 @@ class AKShareRealTimeProvider:
 
     def get_market_snapshot(self) -> MarketSnapshot:
         received = datetime.now(timezone.utc)
-        raw = self._call("stock_zh_a_spot_em")
+        raw = self._call(
+            "stock_zh_a_spot_em",
+            timeout_seconds=self.market_snapshot_timeout_seconds,
+            retry_on_timeout=False,
+        )
         quotes = normalize_realtime_quotes(raw, source=self.name, received_at=received)
         if not quotes:
             raise ProviderRequestError("AKShare snapshot returned no valid quotes")
