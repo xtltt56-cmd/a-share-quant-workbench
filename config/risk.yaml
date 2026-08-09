@@ -8,3 +8,20 @@ risk:
   max_portfolio_drawdown: 0.15
   reject_untradeable_orders: true
   require_paper_approval: true
+
+advisory:
+  normal_gross_cap: 0.70
+  cautious_gross_cap: 0.40
+  risk_off_gross_cap: 0.20
+  initial_position_cap: 0.04
+  absolute_single_name_cap: 0.08
+  industry_cap: 0.25
+  minimum_cash_reserve: 0.30
+  planned_risk_per_position: 0.0075
+  maximum_positions: 10
+  minimum_liquidity_amount: 10000000
+  maximum_forecast_uncertainty: 0.35
+  drawdown_caution: 0.06
+  drawdown_new_buy_freeze: 0.08
+  drawdown_protection: 0.12
+  lot_size: 100
