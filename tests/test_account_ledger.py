@@ -127,5 +127,7 @@ def test_correction_appends_audit_record_and_replaces_the_original_effect() -> N
 
     assert len(ledger.events()) == 2
     assert ledger.corrections()[0].original_event_id == "manual-buy-1"
+    assert ledger.records()[0].event_id == "manual-buy-1"
+    assert ledger.records()[1].original_event_id == "manual-buy-1"
     assert receipt.cash_after == Decimal("99095.00")
     assert receipt.position.average_cost == Decimal("9.0500")

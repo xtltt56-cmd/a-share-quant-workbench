@@ -82,6 +82,7 @@ class AccountLedger:
         self._events_by_id: dict[str, FillEvent] = {}
         self._corrections: list[LedgerCorrection] = []
         self._voided_event_ids: set[str] = set()
+        self._records: list[FillEvent | LedgerCorrection] = []
 
     @classmethod
     def from_records(
@@ -122,6 +123,11 @@ class AccountLedger:
     def corrections(self) -> tuple[LedgerCorrection, ...]:
         return tuple(self._corrections)
 
+    def records(self) -> tuple[FillEvent | LedgerCorrection, ...]:
+        """Return the append-only audit sequence, not the derived effective fills."""
+
+        return tuple(self._records)
+
     def record_buy(
         self,
         *,
@@ -133,15 +139,11 @@ class AccountLedger:
         event_id: str | None = None,
         source: str = "manual",
     ) -> LedgerReceipt:
-        normalized = normalize_symbol(symbol)
-        self._validate_name(normalized, name)
-        if quantity % self.lot_size != 0:
-            raise ValueError(f"buy quantity must be a multiple of {self.lot_size}")
-        return self._append(
+        return self.record_fill(
             FillEvent(
                 event_id=event_id or f"manual-buy-{uuid4().hex}",
                 side=TradeSide.BUY,
-                symbol=normalized,
+                symbol=symbol,
                 quantity=quantity,
                 price=price,
                 trade_date=trade_date,
@@ -165,7 +167,7 @@ class AccountLedger:
         current = snapshot.position(normalized)
         if current is None or current.available_quantity < quantity:
             raise ValueError("available quantity is insufficient for this sell")
-        return self._append(
+        return self.record_fill(
             FillEvent(
                 event_id=event_id or f"manual-sell-{uuid4().hex}",
                 side=TradeSide.SELL,
@@ -177,6 +179,20 @@ class AccountLedger:
                 source=source,
             )
         )
+
+    def record_fill(self, event: FillEvent) -> LedgerReceipt:
+        """Validate and append a preconstructed manual/import event."""
+
+        if event.side is TradeSide.BUY:
+            self._validate_name(event.symbol, event.name)
+            if event.quantity % self.lot_size != 0:
+                raise ValueError(f"buy quantity must be a multiple of {self.lot_size}")
+        else:
+            snapshot = self.snapshot(as_of=event.trade_date)
+            current = snapshot.position(event.symbol)
+            if current is None or current.available_quantity < event.quantity:
+                raise ValueError("available quantity is insufficient for this sell")
+        return self._append(event)
 
     def append_correction(
         self,
@@ -207,10 +223,12 @@ class AccountLedger:
         original_index = self._events_by_id
         original_corrections = self._corrections
         original_voided = self._voided_event_ids
+        original_records = self._records
         self._events = [*self._events, replacement]
         self._events_by_id = {**self._events_by_id, replacement.event_id: replacement}
         self._corrections = [*self._corrections, correction]
         self._voided_event_ids = {*self._voided_event_ids, original_event_id}
+        self._records = [*self._records, correction]
         try:
             receipt = self._receipt_for(replacement, idempotent=False)
             self.snapshot()
@@ -219,6 +237,7 @@ class AccountLedger:
             self._events_by_id = original_index
             self._corrections = original_corrections
             self._voided_event_ids = original_voided
+            self._records = original_records
             raise
         return receipt
 
@@ -329,6 +348,7 @@ class AccountLedger:
             self._events = original_events
             raise
         self._events_by_id[event.event_id] = event
+        self._records.append(event)
         return receipt
 
     def _receipt_for(self, event: FillEvent, *, idempotent: bool) -> LedgerReceipt:

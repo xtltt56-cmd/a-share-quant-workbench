@@ -32,6 +32,14 @@ class JsonlLedgerStore:
 
     def append(self, record: LedgerRecord) -> str:
         rows = self._validated_rows()
+        identity = _record_identity(record)
+        for row in rows:
+            existing = _record_from_row(row)
+            if _record_identity(existing) != identity:
+                continue
+            if existing == record:
+                return str(row["record_hash"])
+            raise ValueError("ledger record identity already exists with different details")
         previous_hash = rows[-1]["record_hash"] if rows else ""
         row = {
             "kind": "fill" if isinstance(record, FillEvent) else "correction",
@@ -52,13 +60,7 @@ class JsonlLedgerStore:
         rows = self._validated_rows()
         records: list[LedgerRecord] = []
         for row in rows:
-            payload = row["payload"]
-            if row["kind"] == "fill":
-                records.append(FillEvent.from_dict(payload))
-            elif row["kind"] == "correction":
-                records.append(LedgerCorrection.from_dict(payload))
-            else:  # _validated_rows makes this unreachable, retain a defensive boundary
-                raise ValueError("unknown ledger record kind")
+            records.append(_record_from_row(row))
         return tuple(records)
 
     def load_fills(self) -> tuple[FillEvent, ...]:
@@ -101,3 +103,20 @@ def _canonical_json(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _record_from_row(row: dict[str, object]) -> LedgerRecord:
+    payload = row["payload"]
+    if not isinstance(payload, dict):
+        raise ValueError("ledger hash validation failed")
+    if row["kind"] == "fill":
+        return FillEvent.from_dict(payload)
+    if row["kind"] == "correction":
+        return LedgerCorrection.from_dict(payload)
+    raise ValueError("unknown ledger record kind")
+
+
+def _record_identity(record: LedgerRecord) -> tuple[str, str]:
+    if isinstance(record, FillEvent):
+        return ("fill", record.event_id)
+    return ("correction", record.correction_id)
