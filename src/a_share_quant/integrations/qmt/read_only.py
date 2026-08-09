@@ -129,9 +129,7 @@ def detect(
 ) -> QmtCapability:
     """Check SDK import metadata only; never import it or open a QMT session."""
 
-    module_name = str(sdk_module).strip()
-    if not module_name:
-        raise ValueError("sdk_module is required")
+    module_name = _official_sdk_module_name(sdk_module)
     finder = sdk_finder or importlib.util.find_spec
     try:
         sdk_available = finder(module_name) is not None
@@ -178,9 +176,7 @@ class QmtReadOnlyAdapter:
         sdk_finder: SdkFinder | None = None,
     ) -> None:
         self._client = client
-        self._sdk_module = str(sdk_module).strip()
-        if not self._sdk_module:
-            raise ValueError("sdk_module is required")
+        self._sdk_module = _official_sdk_module_name(sdk_module)
         self._sdk_finder = sdk_finder
 
     def detect(self) -> QmtCapability:
@@ -263,7 +259,7 @@ class QmtReadOnlyAdapter:
             position_deltas=tuple(position_deltas),
         )
 
-    def submit_order(self, **_: Any) -> None:
+    def submit_order(self, *_: Any, **__: Any) -> None:
         """Reject the only compatibility submission name permanently."""
 
         raise PermissionError("QMT requires manual execution; submission is permanently disabled.")
@@ -271,9 +267,9 @@ class QmtReadOnlyAdapter:
 
 def _normalize_snapshot(raw_snapshot: Mapping[str, Any] | QmtAccountSnapshot) -> QmtAccountSnapshot:
     if isinstance(raw_snapshot, QmtAccountSnapshot):
-        if not raw_snapshot.manual_execution_required:
+        if raw_snapshot.manual_execution_required is not True:
             raise ValueError("QMT snapshots must require manual execution")
-        return raw_snapshot
+        raw_snapshot = _direct_snapshot_mapping(raw_snapshot)
     if not isinstance(raw_snapshot, Mapping):
         raise ValueError("QMT read-only snapshot must be a mapping")
     cash = _money_value(
@@ -322,14 +318,13 @@ def _normalize_position(raw_position: object) -> QmtPositionSnapshot:
         ),
         field="available_quantity",
     )
-    frozen_value = _optional_value(
-        raw_position,
-        ("frozen_quantity", "frozen_volume", "冻结数量"),
-    )
-    frozen_quantity = (
-        total_quantity - available_quantity
-        if frozen_value is _MISSING
-        else _quantity(frozen_value, field="frozen_quantity")
+    frozen_quantity = _quantity(
+        _required_value(
+            raw_position,
+            ("frozen_quantity", "frozen_volume", "冻结数量"),
+            "frozen_quantity",
+        ),
+        field="frozen_quantity",
     )
     if available_quantity > total_quantity or frozen_quantity < 0:
         raise ValueError("position quantities are inconsistent")
@@ -356,6 +351,33 @@ def _optional_value(payload: Mapping[str, Any], names: tuple[str, ...]) -> Any:
         if name in payload:
             return payload[name]
     return _MISSING
+
+
+def _official_sdk_module_name(sdk_module: str) -> str:
+    if not isinstance(sdk_module, str) or sdk_module != QMT_SDK_MODULE:
+        raise ValueError("sdk_module must be the exact top-level official module 'xtquant'")
+    return sdk_module
+
+
+def _direct_snapshot_mapping(snapshot: QmtAccountSnapshot) -> Mapping[str, Any]:
+    try:
+        positions = tuple(
+            {
+                "symbol": position.symbol,
+                "name": position.name,
+                "total_quantity": position.total_quantity,
+                "available_quantity": position.available_quantity,
+                "frozen_quantity": position.frozen_quantity,
+            }
+            for position in snapshot.positions
+        )
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("QMT direct snapshot positions are invalid") from exc
+    return {
+        "as_of": snapshot.as_of,
+        "cash": snapshot.cash,
+        "positions": positions,
+    }
 
 
 def _money_value(value: Any) -> Decimal:

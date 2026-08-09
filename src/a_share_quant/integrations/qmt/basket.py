@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -225,20 +227,81 @@ def _prepare_output_path(output_path: str | Path, *, suffix: str) -> Path:
     if not isinstance(output_path, (str, Path)):
         raise ValueError("output path must be a local file path")
     raw_path = str(output_path).strip()
-    if not raw_path or "://" in raw_path or raw_path.casefold().startswith(("http:", "https:")):
-        raise ValueError("output path must be a local file path")
+    if not raw_path or _is_non_local_path_text(raw_path):
+        raise ValueError("output path must be a local-only file path")
     candidate = Path(raw_path)
     if not candidate.name or candidate.name in {".", ".."}:
         raise ValueError("output path must name a file")
     if candidate.suffix.casefold() != suffix:
         raise ValueError(f"output path must end in {suffix}")
-    target = candidate.resolve(strict=False)
+    lexical_target = candidate if candidate.is_absolute() else Path.cwd() / candidate
+    _assert_local_output_target(lexical_target)
+    target = lexical_target.resolve(strict=False)
+    _assert_local_output_target(target)
     if target.exists() and (target.is_symlink() or target.is_dir()):
         raise ValueError("output path must be a regular local file")
     target.parent.mkdir(parents=True, exist_ok=True)
+    _assert_local_output_target(target)
     if not target.parent.is_dir():
         raise ValueError("output path parent is not a directory")
     return target
+
+
+def _is_non_local_path_text(value: str) -> bool:
+    normalized = value.casefold()
+    return (
+        value.startswith(("\\\\", "//"))
+        or "://" in value
+        or normalized.startswith(("http:", "https:"))
+    )
+
+
+def _assert_local_output_target(target: Path) -> None:
+    if _is_network_target(target):
+        raise ValueError("output path must be local-only")
+    for ancestor in _path_and_parents(target):
+        if _is_link_or_junction(ancestor):
+            raise ValueError(
+                "output path must be local-only; symlink or junction parents are not allowed"
+            )
+
+
+def _path_and_parents(path: Path) -> tuple[Path, ...]:
+    result: list[Path] = []
+    current = path
+    while True:
+        result.append(current)
+        parent = current.parent
+        if parent == current:
+            return tuple(result)
+        current = parent
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if is_junction is not None and is_junction():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(reparse_point and attributes & reparse_point)
+    except OSError:
+        return False
+
+
+def _is_network_target(path: Path) -> bool:
+    if str(path).startswith(("\\\\", "//")):
+        return True
+    if os.name != "nt" or not path.drive:
+        return False
+    try:
+        import ctypes
+
+        return ctypes.windll.kernel32.GetDriveTypeW(f"{path.drive}\\") == 4
+    except (AttributeError, OSError):
+        return False
 
 
 __all__ = [
