@@ -475,6 +475,157 @@ def test_concurrent_restores_are_serialized_and_leave_one_coherent_archive_state
     }
 
 
+def test_separate_managers_wait_for_an_active_restore_journal(tmp_path, monkeypatch) -> None:
+    ledger = tmp_path / "account-ledger.jsonl"
+    initialization = tmp_path / "account-ledger.jsonl.initialization.json"
+    audit_path = tmp_path / "restore-audit.jsonl"
+    managed_files = {
+        "account-ledger.jsonl": ledger,
+        "account-ledger.jsonl.initialization.json": initialization,
+    }
+    consistency_groups = {
+        "account-state": (
+            "account-ledger.jsonl",
+            "account-ledger.jsonl.initialization.json",
+        )
+    }
+    manager_a = LocalBackupManager(
+        managed_files=managed_files,
+        consistency_groups=consistency_groups,
+        audit_path=audit_path,
+    )
+    archived_state = (b"archived-ledger", b"archived-initialization")
+    original_state = (b"original-ledger", b"original-initialization")
+    ledger.write_bytes(archived_state[0])
+    initialization.write_bytes(archived_state[1])
+    restore_archive = tmp_path / "restore-source.zip"
+    manager_a.create_backup(restore_archive)
+    ledger.write_bytes(original_state[0])
+    initialization.write_bytes(original_state[1])
+    preflight = manager_a.preflight_restore(restore_archive)
+
+    real_replace = os.replace
+    first_replacement = threading.Event()
+    release_restore = threading.Event()
+    paused = False
+
+    def pause_after_ledger_replacement(source, destination) -> None:
+        nonlocal paused
+        if not paused and destination == ledger and source.read_bytes() == archived_state[0]:
+            paused = True
+            real_replace(source, destination)
+            first_replacement.set()
+            if not release_restore.wait(timeout=3):
+                raise RuntimeError("test did not release the first restore")
+            return
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "a_share_quant.workbench.backup.os.replace",
+        pause_after_ledger_replacement,
+    )
+    manager_b_started = threading.Event()
+    manager_b_finished = threading.Event()
+    manager_b_archive = tmp_path / "manager-b-backup.zip"
+
+    def construct_and_use_manager_b() -> None:
+        manager_b_started.set()
+        try:
+            manager_b = LocalBackupManager(
+                managed_files=managed_files,
+                consistency_groups=consistency_groups,
+                audit_path=audit_path,
+            )
+            manager_b.create_backup(manager_b_archive)
+        finally:
+            manager_b_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        restore_future = executor.submit(
+            manager_a.restore,
+            restore_archive,
+            confirmation_token=preflight.confirmation_token,
+        )
+        assert first_replacement.wait(timeout=3)
+        manager_b_future = executor.submit(construct_and_use_manager_b)
+        assert manager_b_started.wait(timeout=3)
+        try:
+            assert not manager_b_finished.wait(timeout=0.2)
+            assert _restore_journal_path(audit_path).exists()
+            assert (ledger.read_bytes(), initialization.read_bytes()) == (
+                archived_state[0],
+                original_state[1],
+            )
+        finally:
+            release_restore.set()
+        restore_future.result(timeout=3)
+        manager_b_future.result(timeout=3)
+
+    assert (ledger.read_bytes(), initialization.read_bytes()) == archived_state
+    assert not _restore_journal_path(audit_path).exists()
+    with zipfile.ZipFile(manager_b_archive) as bundle:
+        assert (
+            bundle.read("managed/account-ledger.jsonl"),
+            bundle.read("managed/account-ledger.jsonl.initialization.json"),
+        ) == archived_state
+
+
+def test_restore_uses_constructor_resolved_paths_after_working_directory_changes(
+    tmp_path, monkeypatch
+) -> None:
+    cwd_a = tmp_path / "cwd-a"
+    cwd_b = tmp_path / "cwd-b"
+    ledger_a = cwd_a / "state" / "account-ledger.jsonl"
+    initialization_a = cwd_a / "state" / "account-ledger.jsonl.initialization.json"
+    audit_a = cwd_a / "audit" / "restore-audit.jsonl"
+    ledger_b = cwd_b / "state" / "account-ledger.jsonl"
+    initialization_b = cwd_b / "state" / "account-ledger.jsonl.initialization.json"
+    audit_b = cwd_b / "audit" / "restore-audit.jsonl"
+    ledger_a.parent.mkdir(parents=True)
+    audit_a.parent.mkdir(parents=True)
+    ledger_b.parent.mkdir(parents=True)
+    audit_b.parent.mkdir(parents=True)
+    archived_state = (b"archived-ledger", b"archived-initialization")
+    original_state = (b"original-ledger", b"original-initialization")
+    other_directory_state = (b"other-ledger", b"other-initialization")
+    ledger_a.write_bytes(archived_state[0])
+    initialization_a.write_bytes(archived_state[1])
+    ledger_b.write_bytes(other_directory_state[0])
+    initialization_b.write_bytes(other_directory_state[1])
+    archive = cwd_a / "archives" / "restore-source.zip"
+
+    monkeypatch.chdir(cwd_a)
+    manager = LocalBackupManager(
+        managed_files={
+            "account-ledger.jsonl": Path("state/account-ledger.jsonl"),
+            "account-ledger.jsonl.initialization.json": Path(
+                "state/account-ledger.jsonl.initialization.json"
+            ),
+        },
+        consistency_groups={
+            "account-state": (
+                "account-ledger.jsonl",
+                "account-ledger.jsonl.initialization.json",
+            )
+        },
+        audit_path=Path("audit/restore-audit.jsonl"),
+    )
+    manager.create_backup(archive)
+    ledger_a.write_bytes(original_state[0])
+    initialization_a.write_bytes(original_state[1])
+    preflight = manager.preflight_restore(archive)
+
+    monkeypatch.chdir(cwd_b)
+    manager.restore(archive, confirmation_token=preflight.confirmation_token)
+
+    assert (ledger_a.read_bytes(), initialization_a.read_bytes()) == archived_state
+    assert (ledger_b.read_bytes(), initialization_b.read_bytes()) == other_directory_state
+    assert audit_a.exists()
+    assert not audit_b.exists()
+    assert not _restore_journal_path(audit_a).exists()
+    assert not _restore_journal_path(audit_b).exists()
+
+
 def test_backup_manager_rejects_audit_log_destination_path_alias(tmp_path) -> None:
     audit_path = tmp_path / "restore-audit.jsonl"
     audit_path.write_text("existing audit entry\n", encoding="utf-8")

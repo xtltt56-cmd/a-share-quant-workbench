@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import tempfile
+import time
 import zipfile
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -19,6 +22,8 @@ _MANIFEST_NAME = "backup-manifest.json"
 _MANAGED_PREFIX = "managed/"
 _RESTORE_JOURNAL_FORMAT_VERSION = 2
 _LEGACY_RESTORE_JOURNAL_FORMAT_VERSION = 1
+_SHARED_RESTORE_LOCKS: dict[str, RLock] = {}
+_SHARED_RESTORE_LOCKS_GUARD = RLock()
 
 
 @dataclass(frozen=True)
@@ -138,14 +143,14 @@ class LocalBackupManager:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._managed_files = {
-            _validate_logical_path(logical_path): Path(local_path)
+            _validate_logical_path(logical_path): _resolve_local_path(local_path)
             for logical_path, local_path in managed_files.items()
         }
         self._consistency_groups = _validate_consistency_groups(
             consistency_groups,
             set(self._managed_files),
         )
-        self._audit_path = Path(audit_path)
+        self._audit_path = _resolve_local_path(audit_path)
         if any(_same_path(path, self._audit_path) for path in self._managed_files.values()):
             raise ValueError("restore audit file cannot be a managed backup file")
         if _has_duplicate_destinations(self._managed_files.values()):
@@ -153,24 +158,31 @@ class LocalBackupManager:
         self._managed_configuration_digest = _managed_configuration_digest(self._managed_files)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pending_restores: dict[str, _PendingRestore] = {}
-        self._restore_lock = RLock()
         self._journal_path = _restore_journal_path(self._audit_path)
+        self._restore_lock_path = _restore_lock_path(self._journal_path)
         if any(_same_path(path, self._journal_path) for path in self._managed_files.values()):
             raise ValueError("restore journal file cannot be a managed backup file")
         if _same_path(self._journal_path, self._audit_path):
             raise ValueError("restore journal file cannot be the audit file")
-        with self._restore_lock:
+        if any(_same_path(path, self._restore_lock_path) for path in self._managed_files.values()):
+            raise ValueError("restore lock file cannot be a managed backup file")
+        if _same_path(self._restore_lock_path, self._audit_path):
+            raise ValueError("restore lock file cannot be the audit file")
+        if _same_path(self._restore_lock_path, self._journal_path):
+            raise ValueError("restore lock file cannot be the restore journal file")
+        self._restore_lock = _shared_restore_lock(self._journal_path)
+        with self._coordinated_restore_lock():
             self._recover_pending_restore()
 
     def create_backup(self, archive_path: Path) -> BackupManifest:
         """Write an archive containing the declared files that currently exist."""
 
-        with self._restore_lock:
+        with self._coordinated_restore_lock():
             self._recover_pending_restore()
             return self._create_backup_locked(archive_path)
 
     def _create_backup_locked(self, archive_path: Path) -> BackupManifest:
-        archive = Path(archive_path)
+        archive = _resolve_local_path(archive_path)
         if any(_same_path(archive, path) for path in self._managed_files.values()):
             raise ValueError("backup archive cannot replace a managed local file")
         contents: dict[str, bytes] = {}
@@ -215,9 +227,9 @@ class LocalBackupManager:
     def preflight_restore(self, archive_path: Path) -> RestorePreflight:
         """Validate archive members and hashes before issuing a one-use token."""
 
-        with self._restore_lock:
+        with self._coordinated_restore_lock():
             self._recover_pending_restore()
-            archive = Path(archive_path).resolve()
+            archive = _resolve_local_path(archive_path)
             manifest, _ = self._read_validated_archive(archive)
             confirmation_token = f"restore-{uuid4().hex}"
             self._pending_restores[confirmation_token] = _PendingRestore(
@@ -233,9 +245,15 @@ class LocalBackupManager:
     def restore(self, archive_path: Path, *, confirmation_token: str) -> RestoreReceipt:
         """Stage verified bytes, audit intent, then replace only declared files."""
 
-        with self._restore_lock:
+        with self._coordinated_restore_lock():
             self._recover_pending_restore()
             return self._restore_locked(archive_path, confirmation_token=confirmation_token)
+
+    @contextmanager
+    def _coordinated_restore_lock(self) -> Iterator[None]:
+        with self._restore_lock:
+            with _durable_restore_lock(self._restore_lock_path):
+                yield
 
     def _restore_locked(
         self,
@@ -244,7 +262,7 @@ class LocalBackupManager:
         confirmation_token: str,
     ) -> RestoreReceipt:
         pending = self._pending_restores.pop(str(confirmation_token), None)
-        archive = Path(archive_path).resolve()
+        archive = _resolve_local_path(archive_path)
         if pending is None or pending.archive_path != archive:
             raise ValueError("explicit restore confirmation is required")
         manifest, contents = self._read_validated_archive(archive)
@@ -808,6 +826,76 @@ def _restore_journal_path(audit_path: Path) -> Path:
     return audit_path.with_name(f".{audit_path.name}.restore-journal.json")
 
 
+def _restore_lock_path(journal_path: Path) -> Path:
+    return journal_path.with_name(f"{journal_path.name}.lock")
+
+
+def _shared_restore_lock(journal_path: Path) -> RLock:
+    journal_key = _canonical_path(journal_path)
+    with _SHARED_RESTORE_LOCKS_GUARD:
+        lock = _SHARED_RESTORE_LOCKS.get(journal_key)
+        if lock is None:
+            lock = RLock()
+            _SHARED_RESTORE_LOCKS[journal_key] = lock
+        return lock
+
+
+@contextmanager
+def _durable_restore_lock(lock_path: Path) -> Iterator[None]:
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise ValueError("restore lock file is invalid")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise ValueError("restore lock file cannot be opened") from exc
+    try:
+        if lock_path.is_symlink():
+            raise ValueError("restore lock file is invalid")
+        _acquire_restore_lock_file_descriptor(file_descriptor)
+    except BaseException:
+        os.close(file_descriptor)
+        raise
+    try:
+        yield
+    finally:
+        try:
+            _release_restore_lock_file_descriptor(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+
+
+def _acquire_restore_lock_file_descriptor(file_descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        while True:
+            try:
+                os.lseek(file_descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(file_descriptor, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                time.sleep(0.01)
+    else:
+        import fcntl
+
+        fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+
+
+def _release_restore_lock_file_descriptor(file_descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(file_descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(file_descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+
+
 def _journal_snapshot_path(journal_path: Path, transaction_id: str, index: int) -> Path:
     return journal_path.with_name(f"{journal_path.name}.{transaction_id}.{index}.rollback")
 
@@ -988,6 +1076,14 @@ def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
         for logical_path, destination in sorted(managed_files.items())
     ]
     return _sha256(_canonical_json(configuration).encode("utf-8"))
+
+
+def _resolve_local_path(path: Path) -> Path:
+    candidate = Path(path)
+    try:
+        return candidate.resolve(strict=False)
+    except OSError:
+        return candidate.absolute()
 
 
 def _canonical_path(path: Path) -> str:
