@@ -145,6 +145,46 @@ def test_akshare_realtime_provider_retries_without_leaking_exception_payload(
     assert snapshot.source == "akshare"
 
 
+def test_akshare_realtime_provider_uses_official_single_stock_quote_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def stock_bid_ask_em(symbol: str) -> pd.DataFrame:
+        calls.append(symbol)
+        return pd.DataFrame(
+            [
+                {"item": "最新", "value": 10.5},
+                {"item": "今开", "value": 10.0},
+                {"item": "最高", "value": 10.8},
+                {"item": "最低", "value": 9.9},
+                {"item": "昨收", "value": 10.2},
+                {"item": "总手", "value": 1000},
+                {"item": "金额", "value": 10500},
+                {"item": "涨跌", "value": 0.3},
+                {"item": "涨幅", "value": 2.94},
+                {"item": "换手", "value": 1.2},
+                {"item": "buy_1", "value": 10.49},
+                {"item": "sell_1", "value": 10.51},
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(stock_bid_ask_em=stock_bid_ask_em),
+    )
+
+    quotes = AKShareRealTimeProvider(retry_count=0, delay_seconds=0).get_quotes(
+        ["000001", "000002"]
+    )
+
+    assert calls == ["000001", "000002"]
+    assert [quote.symbol for quote in quotes] == ["000001", "000002"]
+    assert quotes[0].last == pytest.approx(10.5)
+    assert quotes[0].quality_flag.value == "DEGRADED"
+
+
 def test_tushare_realtime_provider_requires_token_before_importing_client() -> None:
     with pytest.raises(ProviderConfigurationError, match="TUSHARE_TOKEN"):
         TushareRealTimeProvider(token="")

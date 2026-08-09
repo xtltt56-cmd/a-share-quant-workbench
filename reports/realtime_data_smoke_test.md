@@ -3,8 +3,8 @@
 > This report records an explicit provider smoke attempt. It is not investment evidence and contains no credentials.
 
 - Status: **FAILED**
-- Started: `2026-08-09T02:03:01.770418+00:00`
-- Completed: `2026-08-09T02:03:37.335780+00:00`
+- Started: `2026-08-09T05:14:19.163308+00:00`
+- Completed: `2026-08-09T05:14:48.051752+00:00`
 - Active provider: `akshare`
 - Latency: `n/a` ms
 - Data quality: `FAILED`

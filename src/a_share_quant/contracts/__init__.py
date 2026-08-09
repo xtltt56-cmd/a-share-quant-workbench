@@ -35,6 +35,11 @@ __all__ = [
     "TimeSemantics",
     "next_trading_date",
     "validate_execution_date",
+    "AssetType",
+    "SecurityIdentifier",
+    "Vendor",
+    "VendorSecurityIdentifier",
+    "VendorSymbolAdapter",
 ]
 
 
@@ -87,5 +92,27 @@ def __getattr__(name: str):
             "ProviderMetadata": ProviderMetadata,
             "ProviderSwitchEvent": ProviderSwitchEvent,
             "RealTimeQuote": RealTimeQuote,
+        }[name]
+    if name in {
+        "AssetType",
+        "SecurityIdentifier",
+        "Vendor",
+        "VendorSecurityIdentifier",
+        "VendorSymbolAdapter",
+    }:
+        from .identifiers import (
+            AssetType,
+            SecurityIdentifier,
+            Vendor,
+            VendorSecurityIdentifier,
+            VendorSymbolAdapter,
+        )
+
+        return {
+            "AssetType": AssetType,
+            "SecurityIdentifier": SecurityIdentifier,
+            "Vendor": Vendor,
+            "VendorSecurityIdentifier": VendorSecurityIdentifier,
+            "VendorSymbolAdapter": VendorSymbolAdapter,
         }[name]
     raise AttributeError(name)

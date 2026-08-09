@@ -41,6 +41,9 @@ realtime:
   fallback:
     enabled: true
     label: "AKShare Public Market Source"
+  transport:
+    use_system_proxy: true
+    isolated_transport_authorized: false
   eod:
     wait_seconds: 30
     confirmation_timeout_seconds: 300

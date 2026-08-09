@@ -99,13 +99,31 @@ def build_default_registry(
             config_path=os.getenv("RQDATA_CONFIG_PATH") or None,
         ),
         "tushare": lambda: TushareRealTimeProvider(token=os.getenv("TUSHARE_TOKEN")),
-        "akshare": lambda: AKShareRealTimeProvider(),
+        "akshare": lambda: AKShareRealTimeProvider(
+            use_system_proxy=_environment_flag("A_SHARE_QUANT_USE_SYSTEM_PROXY", default=True),
+            isolated_transport_authorized=_environment_flag(
+                "A_SHARE_QUANT_ISOLATED_TRANSPORT_APPROVED",
+                default=False,
+            ),
+        ),
     }
     ordered_names = tuple(dict.fromkeys(provider_priority))
     unknown = sorted(set(ordered_names).difference(factories))
     if unknown:
         raise ValueError(f"unknown real-time providers: {', '.join(unknown)}")
     return ProviderRegistry([(name, factories[name]) for name in ordered_names])
+
+
+def _environment_flag(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
 
 
 class FailoverRealTimeProvider:

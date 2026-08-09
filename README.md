@@ -169,6 +169,34 @@ and the execution plan is in
       state, no raw provider error payload, no broker import, and no
       `0.0.0.0` listener.
 
+### Stage 3RT-E E1 network evidence
+
+- [x] Added the safe operator command
+      .\.venv\Scripts\python.exe scripts\quant_cli.py realtime diagnose-network.
+      It inspects environment, WinHTTP, WinINET/system proxy, a local proxy
+      listener, DNS, HTTPS, official AKShare/Eastmoney endpoint reachability,
+      requests, and aiohttp without printing proxy addresses, user names,
+      passwords, tokens, raw exception payloads, or disabling TLS.
+- [x] Added explicit security identifiers and vendor adapters. CSI300 is now
+      represented as the non-tradable SSE index 000300 rather than an A-share
+      equity; AKShare, Tushare, RQData, and Qlib formatting stays at provider
+      boundaries.
+- [x] The installed AKShare 1.18.83 matched the current PyPI stable release
+      during this verification, so no untested upgrade or third-party proxy
+      patch was applied.
+- [x] The redacted live diagnostic found no environment or WinHTTP proxy,
+      a listening local WinINET/system proxy, working DNS/HTTPS/full-market
+      endpoint requests, but a ProxyError on AKShare's actual individual-quote
+      long-field request. This is a narrow proxy/provider request-path failure,
+      not evidence that AKShare, DNS, TLS, or all Python networking is broken.
+      The default system-proxy policy remains in force; no silent bypass was
+      enabled. See reports/network_diagnostics.md.
+- [ ] The real-market gate remains STAGE_3RT_OFFLINE_VALIDATED. It cannot be
+      promoted until an actual A-share trading session supplies valid, fresh,
+      continuously updating real quotes, complete breadth, intraday features,
+      real EOD finalization, and the remaining final-gate evidence. No broker,
+      order, or execution interface is added.
+
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 
 Stage 2 operator commands:

@@ -9,6 +9,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
+
 from a_share_quant.contracts.data import ProviderConfigurationError, ProviderRequestError
 from a_share_quant.contracts.realtime import (
     DataQualityStatus,
@@ -21,6 +23,7 @@ from a_share_quant.data.realtime.normalization import (
     normalize_minute_bars,
     normalize_realtime_quotes,
 )
+from a_share_quant.data.realtime.transport import TransportPolicy
 
 
 class AKShareRealTimeProvider:
@@ -32,10 +35,16 @@ class AKShareRealTimeProvider:
         timeout_seconds: float = 20.0,
         retry_count: int = 3,
         delay_seconds: float = 0.5,
+        use_system_proxy: bool = True,
+        isolated_transport_authorized: bool = False,
     ) -> None:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
         self.retry_count = max(0, int(retry_count))
         self.delay_seconds = max(0.0, float(delay_seconds))
+        self.transport_policy = TransportPolicy(
+            use_system_proxy=use_system_proxy,
+            isolated_transport_authorized=isolated_transport_authorized,
+        )
         self._module: Any | None = None
         self._last_call_at: float | None = None
 
@@ -48,6 +57,7 @@ class AKShareRealTimeProvider:
         return self._module
 
     def _call(self, function_name: str, **kwargs: Any) -> Any:
+        self.transport_policy.require_provider_transport()
         function = getattr(self._client(), function_name, None)
         if function is None:
             raise ProviderRequestError(f"AKShare endpoint unavailable: {function_name}")
@@ -131,6 +141,21 @@ class AKShareRealTimeProvider:
         )
 
     def get_quotes(self, symbols: list[str] | tuple[str, ...]) -> tuple:
+        if getattr(self._client(), "stock_bid_ask_em", None) is not None:
+            received = datetime.now(timezone.utc)
+            quotes = []
+            for symbol in symbols:
+                normalized = normalize_symbol(symbol)
+                raw = self._call("stock_bid_ask_em", symbol=normalized)
+                frame = _single_stock_quote_frame(raw, symbol=normalized)
+                quotes.extend(
+                    normalize_realtime_quotes(
+                        frame,
+                        source=self.name,
+                        received_at=received,
+                    )
+                )
+            return tuple(quotes)
         requested = {normalize_symbol(symbol) for symbol in symbols}
         return tuple(
             quote for quote in self.get_market_snapshot().quotes if quote.symbol in requested
@@ -187,3 +212,30 @@ class AKShareRealTimeProvider:
 
 
 _MINUTE_ENDPOINTS = ("stock_zh_a_hist_min_em", "stock_zh_a_minute")
+
+
+def _single_stock_quote_frame(raw: Any, *, symbol: str) -> pd.DataFrame:
+    """Convert AKShare official item/value quote output into canonical input columns."""
+
+    if not isinstance(raw, pd.DataFrame) or not {"item", "value"}.issubset(raw.columns):
+        raise ProviderRequestError("AKShare single-stock quote schema unavailable")
+    values = dict(zip(raw["item"].astype(str), raw["value"], strict=False))
+    return pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "last": values.get("最新"),
+                "open": values.get("今开"),
+                "high": values.get("最高"),
+                "low": values.get("最低"),
+                "previous_close": values.get("昨收"),
+                "volume": values.get("总手"),
+                "amount": values.get("金额"),
+                "bid1": values.get("buy_1"),
+                "ask1": values.get("sell_1"),
+                "change": values.get("涨跌"),
+                "change_pct": values.get("涨幅"),
+                "turnover_rate": values.get("换手"),
+            }
+        ]
+    )
