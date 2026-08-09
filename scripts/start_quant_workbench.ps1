@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [int]$Port = 8765,
-    [switch]$Offline
+    [switch]$Offline,
+    [string]$AdvisoryInitialCash = '0',
+    [string]$AdvisoryLedger = ''
 )
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -10,6 +12,10 @@ $runtimeDir = Join-Path $repoRoot '.runtime'
 $pidPath = Join-Path $runtimeDir 'quant_workbench.pid'
 $stdoutPath = Join-Path $repoRoot 'logs\quant_workbench.stdout.log'
 $stderrPath = Join-Path $repoRoot 'logs\quant_workbench.stderr.log'
+
+if ([string]::IsNullOrWhiteSpace($AdvisoryLedger)) {
+    $AdvisoryLedger = Join-Path $runtimeDir 'advisory\account-ledger.jsonl'
+}
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python environment not found: $pythonPath"
@@ -31,9 +37,9 @@ if (Test-Path -LiteralPath $pidPath) {
 }
 
 $cliPath = Join-Path $repoRoot 'scripts\quant_cli.py'
-$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--network')
+$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--network')
 if ($Offline) {
-    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--offline')
+    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--offline')
 }
 $workbenchProcess = Start-Process -FilePath $pythonPath -ArgumentList $arguments -WorkingDirectory $repoRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 Set-Content -LiteralPath $pidPath -Value $workbenchProcess.Id -Encoding ascii

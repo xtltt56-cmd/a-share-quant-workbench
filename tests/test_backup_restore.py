@@ -93,6 +93,9 @@ def test_restore_needs_preflight_confirmation_and_audits_before_replacement(tmp_
 
     assert receipt.restored_files == ("account-ledger.jsonl", "model-notes.json")
     assert paths["account_ledger"].read_text(encoding="utf-8") == '{"kind":"fill"}\n'
-    audit_rows = [json.loads(line) for line in paths["audit"].read_text(encoding="utf-8").splitlines()]
+    audit_rows = [
+        json.loads(line)
+        for line in paths["audit"].read_text(encoding="utf-8").splitlines()
+    ]
     assert audit_rows[-1]["action"] == "restore"
     assert audit_rows[-1]["phase"] == "before_replacement"

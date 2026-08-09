@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from inspect import signature
-import json
-import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -13,8 +14,8 @@ import pytest
 from a_share_quant.advisory.contracts import ForecastRecord
 from a_share_quant.advisory.engine import AdvisoryContext
 from a_share_quant.advisory.risk import PortfolioRiskSnapshot
-from a_share_quant.workbench.app import create_server
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
+from a_share_quant.workbench.app import WorkbenchHTTPServer, create_server
 from a_share_quant.workbench.service import WorkbenchService
 from scripts.quant_cli import main as quant_cli_main
 
@@ -62,6 +63,40 @@ def _context() -> AdvisoryContext:
         liquidity_amount=Decimal("100000000"),
         event_risk=False,
     )
+
+
+def _post_advisory(
+    port: int,
+    path: str,
+    payload: dict[str, object],
+    *,
+    content_type: str = "application/json",
+) -> tuple[int, dict[str, object]]:
+    request = Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": content_type,
+            "X-Quant-Workbench-Request": "manual-advisory",
+        },
+    )
+    try:
+        with urlopen(request, timeout=3) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        return error.code, json.loads(error.read().decode("utf-8"))
+
+
+def test_workbench_http_server_rejects_direct_non_loopback_bind() -> None:
+    server: WorkbenchHTTPServer | None = None
+
+    try:
+        with pytest.raises(ValueError, match="127.0.0.1"):
+            server = WorkbenchHTTPServer(("0.0.0.0", 0), WorkbenchService(allow_network=False))
+    finally:
+        if server is not None:
+            server.server_close()
 
 
 def test_manual_buy_preview_accepts_only_four_fields_and_does_not_persist_until_confirmed(
@@ -178,6 +213,8 @@ def test_advisory_routes_are_local_header_guarded_and_leave_restore_manual(tmp_p
                 timeout=3,
             )
         assert missing_header.value.code == 403
+        missing_header_payload = json.loads(missing_header.value.read().decode("utf-8"))
+        assert missing_header_payload["manual_execution_required"] is True
 
         request = Request(
             f"http://127.0.0.1:{port}/api/advisory/buy-preview",
@@ -195,6 +232,17 @@ def test_advisory_routes_are_local_header_guarded_and_leave_restore_manual(tmp_p
         with pytest.raises(HTTPError) as absent_restore_route:
             urlopen(f"http://127.0.0.1:{port}/api/advisory/restore", timeout=3)
         assert absent_restore_route.value.code == 404
+        with pytest.raises(HTTPError) as absent_restore_post:
+            urlopen(
+                Request(
+                    f"http://127.0.0.1:{port}/api/advisory/restore",
+                    data=b"{}",
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=3,
+            )
+        assert absent_restore_post.value.code == 404
     finally:
         server.shutdown()
         server.server_close()
@@ -226,6 +274,95 @@ def test_advisory_routes_sanitize_internal_errors(tmp_path) -> None:
         thread.join(timeout=3)
 
 
+def test_advisory_posts_require_json_content_type(tmp_path) -> None:
+    service = _service(tmp_path)
+    server = create_server(
+        service=WorkbenchService(allow_network=False),
+        advisory_service=service,
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, payload = _post_advisory(
+            server.server_address[1],
+            "/api/advisory/buy-preview",
+            {"name": "平安银行", "code": "000001", "quantity": 100, "price": "10"},
+            content_type="text/plain",
+        )
+
+        assert status == 415
+        assert payload["manual_execution_required"] is True
+        assert not (tmp_path / "account-ledger.jsonl").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_advisory_http_preview_is_non_durable_and_confirmation_records_once(tmp_path) -> None:
+    service = _service(tmp_path)
+    server = create_server(
+        service=WorkbenchService(allow_network=False),
+        advisory_service=service,
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        preview_status, preview = _post_advisory(
+            port,
+            "/api/advisory/buy-preview",
+            {"name": "平安银行", "code": "000001", "quantity": 100, "price": "10"},
+        )
+
+        assert preview_status == 200
+        assert not (tmp_path / "account-ledger.jsonl").exists()
+
+        confirmed_status, confirmed = _post_advisory(
+            port,
+            "/api/advisory/buy-confirm",
+            {"confirmation_token": preview["confirmation_token"]},
+        )
+        duplicate_status, _ = _post_advisory(
+            port,
+            "/api/advisory/buy-confirm",
+            {"confirmation_token": preview["confirmation_token"]},
+        )
+
+        assert confirmed_status == 200
+        assert confirmed["recorded"] is True
+        assert duplicate_status == 400
+        assert _service(tmp_path).holdings()["positions"][0]["total_quantity"] == 100
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_concurrent_confirmation_consumes_one_token_and_preserves_durable_ledger(tmp_path) -> None:
+    service = _service(tmp_path)
+    preview = service.preview_manual_buy(name="平安银行", code="000001", quantity=100, price=10)
+    start = threading.Barrier(8)
+
+    def confirm() -> tuple[str, object]:
+        start.wait(timeout=3)
+        try:
+            return "recorded", service.confirm_manual_buy(preview["confirmation_token"])
+        except Exception as exc:
+            return "rejected", exc
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _: confirm(), range(8)))
+
+    recorded = [result for kind, result in results if kind == "recorded"]
+    rejected = [result for kind, result in results if kind == "rejected"]
+    assert len(recorded) == 1
+    assert all(isinstance(result, ValueError) for result in rejected)
+    assert _service(tmp_path).holdings()["positions"][0]["total_quantity"] == 100
+
+
 def test_advisory_status_cli_is_local_only(tmp_path, capsys) -> None:
     exit_code = quant_cli_main(
         [
@@ -241,3 +378,29 @@ def test_advisory_status_cli_is_local_only(tmp_path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["holdings"]["manual_execution_required"] is True
     assert payload["model_data_health"]["data_status"] == "NO_LIVE_MARKET_VALIDATION"
+
+
+def test_workbench_cli_wires_a_local_advisory_service(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_server(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("scripts.quant_cli.run_server", fake_run_server)
+
+    assert (
+        quant_cli_main(
+            [
+                "workbench",
+                "--offline",
+                "--advisory-ledger",
+                str(tmp_path / "account-ledger.jsonl"),
+                "--advisory-initial-cash",
+                "100000",
+            ]
+        )
+        == 0
+    )
+    assert captured["allow_network"] is False
+    assert isinstance(captured["advisory_service"], AdvisoryWorkbenchService)
+    assert captured["advisory_service"].holdings()["manual_execution_required"] is True

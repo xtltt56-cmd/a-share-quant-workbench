@@ -25,6 +25,8 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         service: WorkbenchService,
         advisory_service: AdvisoryWorkbenchService | None = None,
     ) -> None:
+        if server_address[0] != "127.0.0.1":
+            raise ValueError("the workbench must bind to 127.0.0.1")
         self.service = service
         self.advisory_service = advisory_service
         super().__init__(server_address, WorkbenchRequestHandler)
@@ -110,9 +112,16 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
     def _manual_request_payload(self) -> dict[str, Any] | None:
         if self.headers.get("X-Quant-Workbench-Request") != "manual-advisory":
             self._write_json(
-                {"error": "local manual advisory request header required"},
+                {
+                    "error": "local manual advisory request header required",
+                    "manual_execution_required": True,
+                },
                 status=HTTPStatus.FORBIDDEN,
             )
+            return None
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";", maxsplit=1)[0].strip().casefold() != "application/json":
+            self._write_advisory_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             return None
         try:
             content_length = int(self.headers.get("Content-Length", "0"))

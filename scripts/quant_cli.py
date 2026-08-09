@@ -21,6 +21,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     workbench = subcommands.add_parser("workbench", help="start the local dashboard")
     workbench.add_argument("--port", type=int, default=8765)
+    workbench.add_argument(
+        "--advisory-ledger",
+        type=Path,
+        required=True,
+        help="local JSONL path for explicitly recorded manual fills",
+    )
+    workbench.add_argument(
+        "--advisory-initial-cash",
+        required=True,
+        help="explicit initial cash used when replaying the local ledger",
+    )
     mode = workbench.add_mutually_exclusive_group()
     mode.add_argument("--network", action="store_true", help="allow provider requests")
     mode.add_argument("--offline", action="store_true", help="never call providers")
@@ -65,7 +76,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "workbench":
-        run_server(port=args.port, allow_network=bool(args.network and not args.offline))
+        advisory_service = AdvisoryWorkbenchService(
+            initial_cash=args.advisory_initial_cash,
+            ledger_path=args.advisory_ledger,
+        )
+        run_server(
+            port=args.port,
+            allow_network=bool(args.network and not args.offline),
+            advisory_service=advisory_service,
+        )
         return 0
     if args.command == "status":
         payload = WorkbenchService(allow_network=False).health()

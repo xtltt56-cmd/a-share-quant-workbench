@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from threading import RLock
 from uuid import uuid4
 
 from a_share_quant.account.ledger import AccountLedger, LedgerReceipt
@@ -51,6 +52,7 @@ class AdvisoryWorkbenchService:
         self._prediction_store = prediction_store or PredictionLedgerStore()
         self._today = today or date.today
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
+        self._manual_buy_lock = RLock()
 
     def preview_manual_buy(
         self,
@@ -62,26 +64,27 @@ class AdvisoryWorkbenchService:
     ) -> dict[str, object]:
         """Validate the four manual fields without writing the durable ledger."""
 
-        prospective = self._copy_ledger()
-        receipt = prospective.record_buy(
-            name=name,
-            symbol=code,
-            quantity=quantity,
-            price=price,
-            trade_date=self._today(),
-            event_id=f"advisory-manual-buy-{uuid4().hex}",
-            source="manual_workbench",
-        )
-        confirmation_token = f"manual-buy-{uuid4().hex}"
-        self._manual_buy_previews[confirmation_token] = _ManualBuyPreview(
-            confirmation_token=confirmation_token,
-            receipt=receipt,
-        )
-        estimated_total_cost = receipt.event.notional + prospective.fee_schedule.calculate(
-            side=receipt.event.side,
-            symbol=receipt.event.symbol,
-            notional=receipt.event.notional,
-        ).total
+        with self._manual_buy_lock:
+            prospective = self._copy_ledger()
+            receipt = prospective.record_buy(
+                name=name,
+                symbol=code,
+                quantity=quantity,
+                price=price,
+                trade_date=self._today(),
+                event_id=f"advisory-manual-buy-{uuid4().hex}",
+                source="manual_workbench",
+            )
+            confirmation_token = f"manual-buy-{uuid4().hex}"
+            self._manual_buy_previews[confirmation_token] = _ManualBuyPreview(
+                confirmation_token=confirmation_token,
+                receipt=receipt,
+            )
+            estimated_total_cost = receipt.event.notional + prospective.fee_schedule.calculate(
+                side=receipt.event.side,
+                symbol=receipt.event.symbol,
+                notional=receipt.event.notional,
+            ).total
         return {
             "confirmation_token": confirmation_token,
             "name": receipt.event.name,
@@ -97,30 +100,31 @@ class AdvisoryWorkbenchService:
     def confirm_manual_buy(self, confirmation_token: str) -> dict[str, object]:
         """Durably record one previously previewed, manually executed fill."""
 
-        preview = self._manual_buy_previews.get(str(confirmation_token))
-        if preview is None:
-            raise ValueError("unknown or expired manual buy confirmation")
-        prospective = self._copy_ledger()
-        prospective_receipt = prospective.record_fill(preview.receipt.event)
-        if not prospective_receipt.idempotent:
-            self._ledger_store.append_fill(preview.receipt.event)
-        receipt = self._ledger.record_fill(preview.receipt.event)
-        if receipt.idempotent != prospective_receipt.idempotent:
-            raise RuntimeError("manual ledger state changed during confirmation")
-        del self._manual_buy_previews[preview.confirmation_token]
-        return {
-            "recorded": not receipt.idempotent,
-            "code": receipt.event.symbol,
-            "quantity": receipt.event.quantity,
-            "cash_after": f"{receipt.cash_after:.2f}",
-            "manual_execution_required": True,
-            "notice_zh": "已记录人工成交，不包含任何委托或自动执行。",
-        }
+        with self._manual_buy_lock:
+            preview = self._manual_buy_previews.pop(str(confirmation_token), None)
+            if preview is None:
+                raise ValueError("unknown or expired manual buy confirmation")
+            prospective = self._copy_ledger()
+            prospective_receipt = prospective.record_fill(preview.receipt.event)
+            if not prospective_receipt.idempotent:
+                self._ledger_store.append_fill(preview.receipt.event)
+            receipt = self._ledger.record_fill(preview.receipt.event)
+            if receipt.idempotent != prospective_receipt.idempotent:
+                raise RuntimeError("manual ledger state changed during confirmation")
+            return {
+                "recorded": not receipt.idempotent,
+                "code": receipt.event.symbol,
+                "quantity": receipt.event.quantity,
+                "cash_after": f"{receipt.cash_after:.2f}",
+                "manual_execution_required": True,
+                "notice_zh": "已记录人工成交，不包含任何委托或自动执行。",
+            }
 
     def holdings(self) -> dict[str, object]:
         """Return replayed local positions and make the manual boundary explicit."""
 
-        snapshot = self._ledger.snapshot(as_of=self._today())
+        with self._manual_buy_lock:
+            snapshot = self._ledger.snapshot(as_of=self._today())
         return {
             "as_of": snapshot.as_of.isoformat(),
             "cash": f"{snapshot.cash:.2f}",
