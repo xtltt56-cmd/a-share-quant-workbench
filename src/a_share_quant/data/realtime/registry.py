@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -25,6 +26,10 @@ class ProviderRegistry:
         self._capabilities: list[ProviderCapability] = []
         self.active_provider_name: str | None = None
 
+    @property
+    def provider_names(self) -> tuple[str, ...]:
+        return tuple(name for name, _ in self._factories)
+
     def discover(self) -> list[ProviderCapability]:
         self._providers.clear()
         self._health.clear()
@@ -35,8 +40,9 @@ class ProviderRegistry:
                 provider = factory()
                 health = provider.health_check()
                 metadata = provider.metadata()
-                self._providers[name] = provider
                 self._health[name] = health
+                if health.connected:
+                    self._providers[name] = provider
                 capability = ProviderCapability(
                     provider=name,
                     authenticated=metadata.authenticated,
@@ -74,6 +80,32 @@ class ProviderRegistry:
 
     def build_failover(self) -> FailoverRealTimeProvider:
         return FailoverRealTimeProvider(self.providers)
+
+
+def build_default_registry(
+    *,
+    provider_priority: Sequence[str] = ("rqdata", "tushare", "akshare"),
+) -> ProviderRegistry:
+    """Build the configured priority chain without importing optional SDKs."""
+
+    from a_share_quant.data.realtime.akshare import AKShareRealTimeProvider
+    from a_share_quant.data.realtime.rqdata import RQDataRealTimeProvider
+    from a_share_quant.data.realtime.tushare import TushareRealTimeProvider
+
+    factories: dict[str, ProviderFactory] = {
+        "rqdata": lambda: RQDataRealTimeProvider(
+            username=os.getenv("RQDATA_USERNAME"),
+            password=os.getenv("RQDATA_PASSWORD"),
+            config_path=os.getenv("RQDATA_CONFIG_PATH") or None,
+        ),
+        "tushare": lambda: TushareRealTimeProvider(token=os.getenv("TUSHARE_TOKEN")),
+        "akshare": lambda: AKShareRealTimeProvider(),
+    }
+    ordered_names = tuple(dict.fromkeys(provider_priority))
+    unknown = sorted(set(ordered_names).difference(factories))
+    if unknown:
+        raise ValueError(f"unknown real-time providers: {', '.join(unknown)}")
+    return ProviderRegistry([(name, factories[name]) for name in ordered_names])
 
 
 class FailoverRealTimeProvider:

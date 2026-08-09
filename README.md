@@ -91,6 +91,26 @@ The Stage 3RT-A design is recorded in
 and the execution plan is in
 [`docs/superpowers/plans/2026-08-09-stage3rt-realtime-workbench.md`](docs/superpowers/plans/2026-08-09-stage3rt-realtime-workbench.md).
 
+### Stage 3RT-B evidence
+
+- [x] Added lazy AKShare, Tushare, RQData, and deterministic Replay adapters;
+      optional SDKs are never imported by the core contracts.
+- [x] Capability discovery reports authentication, permissions, frequency,
+      and status; permission-denied providers are retained for reporting but
+      are excluded from the failover chain.
+- [x] Ran the explicit real-market smoke command. AKShare was the only
+      configured-capable provider, but the current proxy blocked its request;
+      the sanitized result is in
+      [`reports/realtime_data_smoke_test.md`](reports/realtime_data_smoke_test.md).
+- [x] Used the formal AKShare daily provider to write production-symbol bars
+      for `000006`–`000009` into local Parquet. No fixture symbols were mapped
+      into production signals.
+- [x] Added CSI300 mapping fallback `000300 -> csi000300`; the current proxy
+      also blocked that endpoint, so the benchmark remains missing.
+- [x] Added a historical readiness report that remains `NOT_READY` because
+      the benchmark and historical model artifacts are unavailable; fixture
+      models are never presented as historical evidence.
+
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 
 Stage 2 operator commands:

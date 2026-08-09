@@ -35,7 +35,15 @@ def main() -> int:
     )
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     store = MarketDataStore(root=settings.data_dir, database_path=settings.database_path)
-    bars = provider.get_index_daily_bars(args.symbol, args.start_date, args.end_date)
+    try:
+        bars = provider.get_index_daily_bars(args.symbol, args.start_date, args.end_date)
+    except Exception as exc:
+        logging.getLogger(__name__).error(
+            "benchmark update failed symbol=%s error_type=%s",
+            args.symbol,
+            type(exc).__name__,
+        )
+        return 1
     store.write_daily_bars(bars)
     logging.getLogger(__name__).info(
         "benchmark update completed symbol=%s rows=%s",

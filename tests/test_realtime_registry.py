@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from a_share_quant.contracts.realtime import (
     MarketSnapshot,
     ProviderHealth,
@@ -10,6 +12,7 @@ from a_share_quant.data.realtime.base import ProviderRequestError
 from a_share_quant.data.realtime.registry import (
     FailoverRealTimeProvider,
     ProviderRegistry,
+    build_default_registry,
 )
 
 
@@ -114,6 +117,31 @@ def test_provider_registry_skips_unavailable_provider_without_exposing_error_pay
     assert "unavailable" not in capabilities[0].message.lower()
 
 
+def test_provider_registry_does_not_failover_into_permission_denied_provider() -> None:
+    class DeniedProvider(FakeProvider):
+        def health_check(self) -> ProviderHealth:
+            return ProviderHealth(
+                provider=self.name,
+                connected=False,
+                authenticated=True,
+                permissions=(),
+                status="PERMISSION_DENIED",
+                message="permission unavailable",
+            )
+
+    registry = ProviderRegistry(
+        [
+            ("denied", lambda: DeniedProvider("denied")),
+            ("good", lambda: FakeProvider("good")),
+        ]
+    )
+
+    capabilities = registry.discover()
+
+    assert capabilities[0].status == "PERMISSION_DENIED"
+    assert [provider.name for provider in registry.providers] == ["good"]
+
+
 def test_provider_failover_records_explicit_switch_event() -> None:
     primary = FakeProvider("primary", fail=True)
     secondary = FakeProvider("secondary")
@@ -129,6 +157,15 @@ def test_provider_failover_records_explicit_switch_event() -> None:
     assert provider.switch_events[0].reason == "ProviderRequestError"
 
 
+def test_provider_failover_raises_sanitized_error_when_all_providers_fail() -> None:
+    provider = FailoverRealTimeProvider(
+        [FakeProvider("primary", fail=True), FakeProvider("secondary", fail=True)]
+    )
+
+    with pytest.raises(Exception, match="all real-time providers failed"):
+        provider.get_market_snapshot()
+
+
 def test_provider_health_is_available_without_logging_credentials() -> None:
     provider = FakeProvider("tushare")
     registry = ProviderRegistry([("tushare", lambda: provider)])
@@ -140,3 +177,15 @@ def test_provider_health_is_available_without_logging_credentials() -> None:
     assert health[0].connected is True
     assert "token" not in str(health).lower()
 
+
+def test_default_registry_keeps_configured_priority_and_skips_missing_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.delenv("RQDATA_USERNAME", raising=False)
+    monkeypatch.delenv("RQDATA_PASSWORD", raising=False)
+    monkeypatch.delenv("RQDATA_CONFIG_PATH", raising=False)
+
+    registry = build_default_registry()
+
+    assert registry.provider_names == ("rqdata", "tushare", "akshare")

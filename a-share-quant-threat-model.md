@@ -233,3 +233,32 @@ Stage 3RT-A conclusion: the new code adds validation and source-switching
 controls without adding external inbound exposure or real-money execution. The
 remaining risks are provider-specific schema/permission handling and the
 dashboard/launcher boundary, which must be reviewed before Stage 3RT-D.
+
+## Stage 3RT-B security addendum (2026-08-09)
+
+Stage 3RT-B adds lazy external adapters, explicit network smoke scripts, a
+ReplayRealTimeProvider, and a historical-input readiness check. No SDK token,
+broker account, inbound listener, or live execution path was added. The real
+smoke attempt was blocked by the configured proxy; the report stores only
+provider status, sanitized error type, timestamps, and sample metadata.
+
+| Boundary | Evidence | Control |
+|---|---|---|
+| Internet/provider response -> adapter | `src/a_share_quant/data/realtime/akshare.py`, `tushare.py`, `rqdata.py`, `normalization.py` | Lazy imports, bounded retry/rate delay/timeout, endpoint capability checks, canonical schema validation, invalid rows skipped rather than fabricated |
+| Credentials -> optional adapter | `.env.example`, `build_default_registry`, Tushare/RQData adapters | Credentials are accepted only in memory; capability and health objects contain booleans/statuses, never token/password values; permission failures are cached and excluded from failover |
+| Smoke command -> reports | `scripts/run_realtime_smoke_test.py` | `--network` acknowledgement, repository-contained output path, sanitized error type and no raw exception payload; failure is not converted to a success |
+| Production historical input -> Stage 2 research | `scripts/run_historical_dry_run.py`, `scripts/update_benchmark.py`, `src/a_share_quant/data/providers/akshare.py` | Fixture symbols are excluded, CSI300 uses explicit `csi000300` mapping, missing benchmark/model artifacts keep status `NOT_READY`, provider failures are logged by type only |
+
+### Stage 3RT-B abuse paths and residual risk
+
+| ID | Abuse path | Priority | Mitigation/status |
+|---|---|---|---|
+| TM-017 | A provider returns malformed/zero-price rows -> a fake quote enters the real-time monitor | high | Shared normalizer rejects invalid symbols/prices and retains optional fields as null; valid-row count and data-quality status are reported |
+| TM-018 | Tushare/RQData permission error is retried continuously -> account/service or provider availability is exhausted | medium | Health probe is cached, permission-denied providers are excluded from failover, retry remains bounded |
+| TM-019 | Smoke or benchmark failure traceback leaks URL/payload/token | high | Smoke report records only sanitized error type; benchmark CLI catches and logs symbol plus exception class; raw provider payloads are not written |
+| TM-020 | Fixture prediction artifacts are paired with newly downloaded production bars -> false historical evidence | critical for research integrity | Readiness check excludes fixture symbols and blocks while manifest is fixture-only; no historical signal/backtest is emitted |
+
+Stage 3RT-B conclusion: the provider boundary is fail-closed for unavailable
+permissions, malformed data, and missing historical evidence. The remaining
+risks are external-provider availability and the not-yet-built dashboard,
+scheduler, and launcher surfaces; review them before Stage 3RT-D.

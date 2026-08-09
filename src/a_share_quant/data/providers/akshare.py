@@ -119,13 +119,22 @@ class AKShareDataProvider:
         """Fetch an index benchmark through AKShare's index endpoint."""
 
         primary_symbol = normalize_symbol(symbol)
-        raw = self._call(
-            "index_zh_a_hist",
-            symbol=primary_symbol,
-            period="daily",
-            start_date=_format_akshare_date(start_date),
-            end_date=_format_akshare_date(end_date),
-        )
+        try:
+            raw = self._call(
+                "index_zh_a_hist",
+                symbol=primary_symbol,
+                period="daily",
+                start_date=_format_akshare_date(start_date),
+                end_date=_format_akshare_date(end_date),
+            )
+        except ProviderRequestError:
+            # Eastmoney's index endpoint expects the CSI namespace for CSI300.
+            raw = self._call(
+                "stock_zh_index_daily_em",
+                symbol=_format_index_symbol(primary_symbol),
+                start_date=_format_akshare_date(start_date),
+                end_date=_format_akshare_date(end_date),
+            )
         return normalize_daily_bars(raw, symbol=primary_symbol, source=self.name)
 
 
@@ -139,3 +148,10 @@ def _format_tencent_symbol(symbol: str) -> str:
     normalized = normalize_symbol(symbol)
     exchange = "sh" if normalized.startswith("6") else "sz"
     return f"{exchange}{normalized}"
+
+
+def _format_index_symbol(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    if normalized == "000300":
+        return "csi000300"
+    return normalized

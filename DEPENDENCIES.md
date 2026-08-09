@@ -49,6 +49,15 @@ The core package does not import VectorBT directly. Any future installation
 must be followed by `pip check`, the full test suite, and a Windows smoke test;
 the Commons Clause license boundary remains recorded above.
 
+### Stage 3RT verification note
+
+Stage 3RT uses lazy adapters for AKShare, Tushare, and optional RQData. RQData
+is intentionally not added as a mandatory Python dependency: installation,
+credentials, real-time permission, and service terms are provider/account
+specific. Capability discovery skips missing or permission-denied providers;
+the current smoke run used the explicitly labelled AKShare public fallback and
+recorded a proxy failure without credentials or raw provider payloads.
+
 ## 依赖管理规则
 
 1. 核心安装必须可在无 Token、无券商、无 RQData、无外网历史数据的环境中完成，并能运行离线测试。

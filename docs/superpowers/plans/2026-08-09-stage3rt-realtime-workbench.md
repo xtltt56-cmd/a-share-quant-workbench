@@ -36,6 +36,11 @@ Commit: `feat: add realtime provider and store contracts`.
 
 ## Stage 3RT-B: Providers, Replay, Smoke Test, and Historical Dry Run
 
+Status: implementation and explicit network attempts completed. The smoke
+report is `reports/realtime_data_smoke_test.md`; historical readiness is
+`reports/historical_dry_run_readiness.md`. The benchmark and historical model
+artifact gate remains blocked by the local proxy and fixture-only baseline.
+
 Files to create or modify:
 
 - `src/a_share_quant/data/realtime/akshare.py`

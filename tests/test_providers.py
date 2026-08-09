@@ -144,6 +144,53 @@ def test_akshare_provider_normalizes_index_daily_bars(
     assert calls[0]["symbol"] == "000300"
 
 
+def test_akshare_provider_uses_csi_index_mapping_when_primary_index_endpoint_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def index_zh_a_hist(**kwargs: str) -> pd.DataFrame:
+        calls.append(("legacy", kwargs))
+        raise ConnectionError("index endpoint unavailable")
+
+    def stock_zh_index_daily_em(**kwargs: str) -> pd.DataFrame:
+        calls.append(("eastmoney", kwargs))
+        return pd.DataFrame(
+            [
+                {
+                    "date": "2026-08-08",
+                    "open": 4000,
+                    "close": 4010,
+                    "high": 4020,
+                    "low": 3990,
+                    "volume": 100,
+                    "amount": 400000,
+                }
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            index_zh_a_hist=index_zh_a_hist,
+            stock_zh_index_daily_em=stock_zh_index_daily_em,
+        ),
+    )
+
+    result = AKShareDataProvider(retry_count=0, delay_seconds=0).get_index_daily_bars(
+        "000300",
+        start_date="2026-08-08",
+        end_date="2026-08-08",
+    )
+
+    assert result.loc[0, "symbol"] == "000300"
+    assert calls[1] == (
+        "eastmoney",
+        {"symbol": "csi000300", "start_date": "20260808", "end_date": "20260808"},
+    )
+
+
 def test_akshare_provider_uses_bounded_retry_without_leaking_exception_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

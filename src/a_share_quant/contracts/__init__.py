@@ -10,16 +10,6 @@ from .data import (
     ProviderRequestError,
 )
 from .modes import DATA_MODES, validate_data_mode
-from .realtime import (
-    DataQualityStatus,
-    MarketSnapshot,
-    MinuteBar,
-    ProviderCapability,
-    ProviderHealth,
-    ProviderMetadata,
-    ProviderSwitchEvent,
-    RealTimeQuote,
-)
 
 __all__ = [
     "CANONICAL_DAILY_COLUMNS",
@@ -66,5 +56,36 @@ def __getattr__(name: str):
             "TimeSemantics": TimeSemantics,
             "next_trading_date": next_trading_date,
             "validate_execution_date": validate_execution_date,
+        }[name]
+    if name in {
+        "DataQualityStatus",
+        "MarketSnapshot",
+        "MinuteBar",
+        "ProviderCapability",
+        "ProviderHealth",
+        "ProviderMetadata",
+        "ProviderSwitchEvent",
+        "RealTimeQuote",
+    }:
+        from .realtime import (
+            DataQualityStatus,
+            MarketSnapshot,
+            MinuteBar,
+            ProviderCapability,
+            ProviderHealth,
+            ProviderMetadata,
+            ProviderSwitchEvent,
+            RealTimeQuote,
+        )
+
+        return {
+            "DataQualityStatus": DataQualityStatus,
+            "MarketSnapshot": MarketSnapshot,
+            "MinuteBar": MinuteBar,
+            "ProviderCapability": ProviderCapability,
+            "ProviderHealth": ProviderHealth,
+            "ProviderMetadata": ProviderMetadata,
+            "ProviderSwitchEvent": ProviderSwitchEvent,
+            "RealTimeQuote": RealTimeQuote,
         }[name]
     raise AttributeError(name)
