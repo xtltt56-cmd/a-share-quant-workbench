@@ -18,6 +18,7 @@ build/
 .mypy_cache/
 .coverage
 coverage.xml
+.worktrees/
 
 # Local runtime state, data, experiments and generated artifacts
 data/**/*.parquet
