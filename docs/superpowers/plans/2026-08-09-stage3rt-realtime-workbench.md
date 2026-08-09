@@ -59,6 +59,9 @@ Commit: `feat: add realtime providers and replay path`.
 
 ## Stage 3RT-C: Intraday Analysis, Runtime, and EOD Boundaries
 
+Status: completed in the working tree; the full regression and repository
+quality checks below are the commit gate.
+
 Files to create or modify:
 
 - `src/a_share_quant/features/intraday.py`

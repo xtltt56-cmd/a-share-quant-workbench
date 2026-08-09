@@ -259,6 +259,33 @@ provider status, sanitized error type, timestamps, and sample metadata.
 | TM-020 | Fixture prediction artifacts are paired with newly downloaded production bars -> false historical evidence | critical for research integrity | Readiness check excludes fixture symbols and blocks while manifest is fixture-only; no historical signal/backtest is emitted |
 
 Stage 3RT-B conclusion: the provider boundary is fail-closed for unavailable
-permissions, malformed data, and missing historical evidence. The remaining
-risks are external-provider availability and the not-yet-built dashboard,
-scheduler, and launcher surfaces; review them before Stage 3RT-D.
+permissions, malformed data, and missing historical evidence. Stage 3RT-C
+must additionally keep the runtime and EOD boundaries fail-closed; the
+dashboard and launcher surfaces remain for Stage 3RT-D review.
+
+## Stage 3RT-C security addendum (2026-08-09)
+
+Stage 3RT-C adds descriptive intraday analysis, a calendar-aware scheduler,
+and an EOD orchestration boundary. It still has no listener, broker client,
+account credential, or live execution state.
+
+| Boundary | Evidence | Control |
+|---|---|---|
+| Minute bars -> intraday features | `src/a_share_quant/features/intraday.py` | Canonical columns are required; optional inputs remain null; group calculations are point-in-time and regression-tested against appended future rows |
+| Quote freshness -> monitor trigger | `src/a_share_quant/runtime/scheduler.py`, `src/a_share_quant/signals/realtime.py` | Future/backwards timestamps and stale/failed quality open the circuit boundary; `STALE_DATA` cannot produce `READY`; monitor state is not an order or official signal |
+| Clock -> provider polling | `src/a_share_quant/runtime/scheduler.py` | Injectable trading calendar/session resolver blocks lunch, closed, and non-trading requests; retry attempts and backoff are bounded |
+| Provisional bars -> official daily signal | `src/a_share_quant/runtime/eod.py`, `src/a_share_quant/storage/realtime_store.py` | Reconciliation and PIT update precede signal generation; any EOD failure returns an empty official-signal result |
+
+### Stage 3RT-C abuse paths and residual risk
+
+| ID | Abuse path | Priority | Mitigation/status |
+|---|---|---|---|
+| TM-021 | A future or backwards quote makes a stale snapshot look actionable | high | Runtime timestamp tracker and circuit breaker reject the batch; trigger tests assert `STALE_DATA` and no `READY` |
+| TM-022 | Scheduler polls an unavailable market session or retries without bound | medium | Session resolver covers lunch/closed/non-trading states; retry policy caps attempts and delay; no background daemon is created by the core runtime |
+| TM-023 | EOD signal is generated from provisional/unreconciled data | critical for research integrity | RealTimeStore remains separate; EOD pipeline orders final load, reconcile, PIT update, signal, and report and emits no official signal on failure |
+
+Stage 3RT-C conclusion: monitoring is descriptive and paper-only. The new
+runtime rejects unsafe timestamps and unavailable sessions, and the EOD
+boundary prevents provisional data from being presented as an official daily
+signal. Local dashboard binding, launcher process ownership, and secret/log
+scans remain Stage 3RT-D acceptance items.

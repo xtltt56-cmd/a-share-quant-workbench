@@ -487,6 +487,16 @@ Provisional minute bars remain outside the historical store until explicit EOD
 validation and reconciliation. The dashboard is local-only by default and
 must bind to `127.0.0.1`. `READY` is a monitoring state, never a broker order.
 
+Stage 3RT-C adds the runtime safety boundary around that flow. `IntradayFeatureEngine`
+uses only current and prior minute rows; `MarketBreadth` excludes stale or
+missing changes; `ModelFrequency` makes the existing daily rule model reject
+intraday invocation; and `TriggerEngine` returns a separate monitor object.
+`SessionResolver` prevents provider polling during lunch, closed, or
+non-trading sessions. A `TimestampTracker`, freshness circuit breaker, and
+bounded retry policy fail closed on future/backwards/stale data. EOD callbacks
+are ordered so an official daily signal is observable only after final daily
+data, reconciliation, PIT update, and report generation succeed.
+
 ## 20. Stage 3A acceptance criteria
 
 Stage 3A is accepted only when all of the following are true:

@@ -83,8 +83,18 @@ provider is present.
       from historical/PIT state until explicit EOD finalization.
 - [x] Added `config/realtime.yaml` and RQData/Tushare credential placeholders
       to `.env.example`; no credential value is stored in Git.
-- [ ] Stage 3RT provider adapters, replay/smoke test, dashboard, scheduler,
-      launchers, and historical dry-run remain in progress.
+- [x] Stage 3RT provider adapters, deterministic replay, explicit smoke test,
+      production-symbol historical dry-run gate, and the local RealTimeStore
+      boundary are implemented. The current network smoke remains a sanitized
+      failure because the configured proxy blocked AKShare; this is not treated
+      as market evidence.
+- [x] Stage 3RT-C adds point-in-time intraday features, market breadth,
+      WAIT/WATCH/READY/OVERHEATED/RISK/STALE_DATA monitor states, model
+      frequency guards, trading-session-aware polling, bounded retries, gap
+      tracking, and an ordered EOD finalization/PIT boundary.
+- [ ] Stage 3RT-D dashboard, CLI, Windows launchers, and final acceptance
+      report remain in progress. No broker, account, or live order interface
+      exists.
 
 The Stage 3RT-A design is recorded in
 [`docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md`](docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md)
@@ -110,6 +120,29 @@ and the execution plan is in
 - [x] Added a historical readiness report that remains `NOT_READY` because
       the benchmark and historical model artifacts are unavailable; fixture
       models are never presented as historical evidence.
+
+### Stage 3RT-C evidence
+
+- [x] Intraday features use canonical minute bars and only current/prior rows;
+      appending a future bar cannot alter earlier feature values. Missing
+      optional benchmark, industry, previous-close, and baseline-volume fields
+      remain missing rather than being fabricated.
+- [x] Market breadth reports up/down/flat, limit-up/limit-down, amount,
+      breadth score, and a descriptive market temperature while excluding stale
+      or incomplete observations.
+- [x] The daily rule baseline is explicitly `DAILY` and rejects an intraday
+      data-frequency invocation. Intraday states are monitor outputs only and
+      never official model signals or orders.
+- [x] The scheduler distinguishes pre-market, open, lunch break, closed, and
+      non-trading sessions; polls only when open; retries with bounded
+      backoff; and rejects future/backwards quote timestamps at the runtime
+      boundary.
+- [x] EOD finalization runs close confirmation, final daily load, reconciliation,
+      PIT update, official daily signal generation, and report writing in order;
+      any failure returns no official signals.
+- [x] Stage 3RT-C regression: 167 tests passed, including the original suite
+      and new intraday/runtime/frequency/EOD coverage. Full coverage and the
+      final commit gate are recorded after the repository checks below.
 
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 

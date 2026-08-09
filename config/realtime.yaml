@@ -23,6 +23,21 @@ realtime:
     - "399006"
   candidate_count: 20
   dashboard_refresh_seconds: 15
+  market_hours:
+    timezone: Asia/Shanghai
+    pre_market_start: "09:00"
+    open_start: "09:30"
+    morning_end: "11:30"
+    afternoon_start: "13:00"
+    close_end: "15:00"
+  trigger:
+    ready_score_min: 70
+    watch_score_min: 55
+    overheated_return_pct: 8
+    overheated_volume_ratio: 3
+    max_data_age_seconds: 60
+    min_volume_ratio: 0.8
+    max_single_position: 0.15
   fallback:
     enabled: true
     label: "AKShare Public Market Source"

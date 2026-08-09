@@ -9,11 +9,13 @@ import pandas as pd
 from a_share_quant.features.rule_factors import RuleFactorEngine
 
 from .adapter import prediction_frame_to_records
+from .frequency import ModelFrequency, ensure_model_frequency
 from .schema import SignalRecord
 
 
 class RuleBasedSignalProvider:
     strategy_id = "rule_multifactor"
+    frequency = ModelFrequency.DAILY
 
     def __init__(
         self,
@@ -32,7 +34,9 @@ class RuleBasedSignalProvider:
         *,
         signal_date: date,
         experiment_id: str,
+        data_frequency: str = "daily",
     ) -> list[SignalRecord]:
+        ensure_model_frequency(self.frequency, data_frequency)
         scored = self.engine.score(feature_frame)
         predictions = scored.loc[:, ["symbol", "rule_score"]].rename(
             columns={"rule_score": "raw_score"}
