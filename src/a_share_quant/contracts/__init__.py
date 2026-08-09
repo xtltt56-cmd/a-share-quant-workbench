@@ -40,6 +40,7 @@ __all__ = [
     "Vendor",
     "VendorSecurityIdentifier",
     "VendorSymbolAdapter",
+    "RealtimeOverlay",
 ]
 
 
@@ -93,6 +94,10 @@ def __getattr__(name: str):
             "ProviderSwitchEvent": ProviderSwitchEvent,
             "RealTimeQuote": RealTimeQuote,
         }[name]
+    if name == "RealtimeOverlay":
+        from .realtime_overlay import RealtimeOverlay
+
+        return RealtimeOverlay
     if name in {
         "AssetType",
         "SecurityIdentifier",

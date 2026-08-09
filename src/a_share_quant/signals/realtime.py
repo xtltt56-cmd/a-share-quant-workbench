@@ -194,6 +194,7 @@ class TriggerEngine:
             risks=tuple(risks),
             evaluated_at=reference,
             can_generate_ready=state is RealtimeSignalState.READY and not is_stale,
+            official_model_signal=bool(get("official_model_signal", False)),
         )
 
     @staticmethod

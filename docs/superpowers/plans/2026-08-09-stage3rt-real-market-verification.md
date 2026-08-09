@@ -163,7 +163,7 @@ Expected: a single E1 commit with no generated runtime data, credentials, or pro
 - Modify: \`src/a_share_quant/workbench/service.py\`
 - Modify: \`config/realtime.yaml\`
 
-- [ ] **Step 1: Write failing tests for telemetry and continuous-update gates**
+- [x] **Step 1: Write failing tests for telemetry and continuous-update gates**
 
 Use injected clock and synthetic, valid \`RealTimeQuote\` objects.  Assert:
 
@@ -175,17 +175,17 @@ stale/invalid/breaker-open -> not GOOD
 
 Assert telemetry exposes provider, connect time, first/last quote time, quote/error/fallback/stale counts, average latency, p95 latency, and never contains a credential or raw exception.
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 Run: \`.\.venv\Scripts\python.exe -m pytest tests/test_realtime_telemetry.py -q\`
 
 Expected: import/test failure before the tracker is implemented.
 
-- [ ] **Step 3: Implement bounded telemetry and continuous evidence**
+- [x] **Step 3: Implement bounded telemetry and continuous evidence**
 
 Track a bounded latency window and only define real-time GOOD as provider connected + schema-valid quote + freshness + two nondecreasing, distinct retrievals + no open circuit breaker.  Preserve replay as REPLAY evidence; never let it claim real-market continuous updates.  Expose sanitized telemetry through \`WorkbenchState\`.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run:
 
@@ -207,21 +207,21 @@ Expected: passing tests demonstrate that a single successful HTTP response canno
 - Modify: \`src/a_share_quant/workbench/app.py\`
 - Modify: \`tests/test_workbench_app.py\`
 
-- [ ] **Step 1: Write failing isolation and UI-state tests**
+- [x] **Step 1: Write failing isolation and UI-state tests**
 
 Create an \`OfficialSignal\` with a daily score, then add a \`RealtimeOverlay\` for the same symbol.  Assert the overlay includes last, vwap, volume ratio, intraday return, market relative strength, trigger state, risk state, and quality, but cannot mutate the official score.  Assert \`READY\` remains a monitoring state and no payload contains BUY, order, broker, or execution fields.  Assert the dashboard response and HTML display active source, PUBLIC/PROFESSIONAL source type, backend quote timestamp, data age, latency, quality, and fallback count with \`Cache-Control: no-store\`.
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 Run: \`.\.venv\Scripts\python.exe -m pytest tests/test_realtime_overlay.py tests/test_workbench_app.py -q\`
 
 Expected: missing overlay-store/service/dashboard fields.
 
-- [ ] **Step 3: Implement the two-store boundary and dashboard fields**
+- [x] **Step 3: Implement the two-store boundary and dashboard fields**
 
 Use separate in-memory store objects for official daily candidates and intraday overlays.  Populate overlays only from quote/feature facts.  The dashboard merges copies for display; its JS must render the backend timestamp, not a browser-generated quote time, and fetches with \`cache: "no-store"\`.
 
-- [ ] **Step 4: Run tests and commit E2**
+- [x] **Step 4: Run tests and commit E2**
 
 Run:
 

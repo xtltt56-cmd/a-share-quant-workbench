@@ -44,6 +44,9 @@ realtime:
   transport:
     use_system_proxy: true
     isolated_transport_authorized: false
+  live_validation:
+    minimum_distinct_updates: 2
+    telemetry_latency_samples: 256
   eod:
     wait_seconds: 30
     confirmation_timeout_seconds: 300

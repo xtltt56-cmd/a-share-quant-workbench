@@ -1,5 +1,6 @@
 import json
 import threading
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
@@ -15,6 +16,8 @@ class FakeService:
         return {
             "status": "OK",
             "active_provider": "replay",
+            "active_source": "Replay / Test Data",
+            "source_class": "REPLAY / NON-MARKET",
             "paper_only": True,
             "live_trading_enabled": False,
         }
@@ -22,8 +25,15 @@ class FakeService:
     def snapshot(self):
         return {
             "session": "OPEN",
-            "data_quality": "GOOD",
+            "data_quality": "REPLAY",
             "active_provider": "replay",
+            "active_source": "Replay / Test Data",
+            "source_class": "REPLAY / NON-MARKET",
+            "last_update": "2026-08-10T02:00:00+00:00",
+            "data_age_seconds": 0.0,
+            "latency_ms": 10.0,
+            "fallback_count": 0,
+            "continuous_updates": False,
             "intraday_monitor": [],
             "official_daily_candidates": [],
         }
@@ -32,7 +42,7 @@ class FakeService:
         self.refreshed = True
 
 
-def test_dashboard_binds_only_to_loopback() -> None:
+def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> None:
     service = FakeService()
     server = create_server(service=service, port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -41,17 +51,25 @@ def test_dashboard_binds_only_to_loopback() -> None:
         port = server.server_address[1]
         with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
+            assert response.headers["Cache-Control"] == "no-store"
         assert payload["paper_only"] is True
         with urlopen(f"http://127.0.0.1:{port}/api/state", timeout=3) as response:
             state = json.loads(response.read().decode("utf-8"))
+            assert response.headers["Cache-Control"] == "no-store"
         assert state["session"] == "OPEN"
         with urlopen(f"http://127.0.0.1:{port}/", timeout=3) as response:
             html = response.read().decode("utf-8")
-        assert "不提供实盘下单" in html
+            assert response.headers["Cache-Control"] == "no-store"
+        assert "Paper-only monitoring" in html
+        assert "ACTIVE SOURCE" in html
+        assert "PUBLIC DATA SOURCE" in html
+        assert "Backend Quote Timestamp" in html
+        assert "cache:'no-store'" in html
+        assert "BUY" not in html
         with urlopen(f"http://127.0.0.1:{port}/api/refresh", timeout=3) as response:
             json.loads(response.read().decode("utf-8"))
         assert service.refreshed is True
-        with pytest.raises(Exception):
+        with pytest.raises(HTTPError):
             urlopen(f"http://127.0.0.1:{port}/api/not-found", timeout=3)
     finally:
         server.shutdown()

@@ -1,9 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from a_share_quant.contracts.realtime import MarketSnapshot, RealTimeQuote
 from a_share_quant.data.realtime.registry import ProviderRegistry
 from a_share_quant.runtime.scheduler import MarketHours, SessionResolver, StaticTradingCalendar
+from a_share_quant.signals.realtime import OfficialModelSignal
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.workbench.service import WorkbenchService
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -51,14 +53,54 @@ def _provider(now: datetime) -> FakeProvider:
     )
 
 
+def _live_provider(now: datetime) -> FakeProvider:
+    quote = RealTimeQuote(
+        symbol="000001",
+        market="A",
+        timestamp_exchange=now,
+        timestamp_received=now,
+        last=10.2,
+        previous_close=10.0,
+        open=10.1,
+        high=10.3,
+        low=10.0,
+        volume=100,
+        amount=1020,
+        change_pct=2.0,
+        source="akshare",
+    )
+    provider = FakeProvider(
+        MarketSnapshot(
+            timestamp_exchange=now,
+            timestamp_received=now,
+            quotes=(quote,),
+            source="akshare",
+        )
+    )
+    provider.name = "akshare"
+    return provider
+
+
 def test_workbench_service_exposes_paper_only_state_and_sanitized_snapshot() -> None:
     now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
     resolver = SessionResolver(
         hours=MarketHours(),
         calendar=StaticTradingCalendar({now.date()}),
     )
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=82.5,
+                strategy_version="stage2-v1",
+            )
+        ]
+    )
     service = WorkbenchService(
         provider=_provider(now),
+        official_signal_store=official_store,
         allow_network=True,
         resolver=resolver,
         clock=lambda: now,
@@ -67,12 +109,71 @@ def test_workbench_service_exposes_paper_only_state_and_sanitized_snapshot() -> 
     state = service.refresh().to_dict()
 
     assert state["active_provider"] == "replay"
-    assert state["data_quality"] == "GOOD"
+    assert state["active_source"] == "Replay / Test Data"
+    assert state["source_class"] == "REPLAY / NON-MARKET"
+    assert state["evidence_mode"] == "REPLAY"
+    assert state["data_quality"] == "REPLAY"
+    assert state["continuous_updates"] is False
     assert state["paper_only"] is True
     assert state["live_trading_enabled"] is False
-    assert state["official_daily_candidates"] == []
-    assert state["intraday_monitor"][0]["state"] == "WAIT"
+    assert state["official_daily_candidates"][0]["normalized_score"] == 82.5
+    assert state["intraday_monitor"][0]["state"] == "READY"
+    assert state["intraday_monitor"][0]["official_model_signal"] is True
+    assert state["intraday_monitor"][0]["quote_timestamp"] == now.isoformat()
+    assert "BUY" not in str(state["intraday_monitor"][0])
     assert state["intraday_monitor"][0]["data_age_seconds"] == 0.0
+
+
+def test_workbench_requires_two_live_updates_before_exposing_good_quality() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    current = [now]
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    provider = _live_provider(now)
+    service = WorkbenchService(
+        provider=provider,
+        allow_network=True,
+        resolver=resolver,
+        clock=lambda: current[0],
+        monotonic_clock=lambda: 1.0,
+    )
+
+    first = service.refresh().to_dict()
+    later = now + timedelta(seconds=15)
+    current[0] = later
+    provider.snapshot = _live_provider(later).snapshot
+    second = service.refresh().to_dict()
+
+    assert first["active_source"] == "AKShare / Eastmoney"
+    assert first["source_class"] == "PUBLIC DATA SOURCE"
+    assert first["evidence_mode"] == "REAL_MARKET"
+    assert first["data_quality"] == "DEGRADED"
+    assert first["continuous_updates"] is False
+    assert second["data_quality"] == "GOOD"
+    assert second["continuous_updates"] is True
+    assert second["provider_telemetry"]["quote_count"] == 2
+    assert second["intraday_monitor"][0]["official_model_signal"] is False
+
+
+def test_workbench_never_labels_a_non_requested_session_as_real_market() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar(()),
+    )
+    service = WorkbenchService(
+        provider=_live_provider(now),
+        allow_network=True,
+        resolver=resolver,
+        clock=lambda: now,
+    )
+
+    state = service.refresh().to_dict()
+
+    assert state["evidence_mode"] == "OFFLINE"
+    assert state["data_quality"] == "FAILED"
 
 
 def test_workbench_offline_mode_does_not_call_provider() -> None:

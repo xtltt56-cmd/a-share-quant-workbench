@@ -197,6 +197,26 @@ and the execution plan is in
       real EOD finalization, and the remaining final-gate evidence. No broker,
       order, or execution interface is added.
 
+### Stage 3RT-E E2 live-validation boundary
+
+- [x] The workbench now requires a connected provider, schema-valid and fresh
+      quotes, nondecreasing exchange timestamps, two distinct updates, and a
+      closed circuit breaker before a non-replay source may display
+      DataQuality=GOOD. A single successful request remains DEGRADED.
+- [x] Provider telemetry is bounded and payload-free: it records connection
+      and quote times, quote/error/fallback/stale counts, plus average and P95
+      latency, but never exception text, credentials, URLs, or raw payloads.
+- [x] Official daily candidates and RealtimeOverlay observations are stored
+      separately. The overlay contains market facts and a monitor state only;
+      it cannot change a Stage 2 score. READY remains monitoring-only.
+- [x] The loopback dashboard now shows active source, public/professional or
+      replay source class, backend quote timestamp, last update, data age,
+      latency, quality, fallback count, and continuous-update status. API and
+      browser requests use Cache-Control: no-store.
+- [x] E2 regression: 197 tests passed with 89% coverage in the full suite.
+      The live status remains STAGE_3RT_OFFLINE_VALIDATED; no broker,
+      account, order, or execution interface has been added.
+
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 
 Stage 2 operator commands:
