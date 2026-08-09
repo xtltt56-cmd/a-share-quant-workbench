@@ -267,8 +267,28 @@ class LocalBackupManager:
     @contextmanager
     def _coordinated_restore_lock(self) -> Iterator[None]:
         with self._restore_lock:
+            self._validate_operation_paths()
             with _durable_restore_lock(self._restore_lock_path):
                 yield
+
+    def _validate_operation_paths(self) -> None:
+        for path in self._managed_files.values():
+            _validate_no_linked_ancestors(
+                path,
+                description="managed backup file",
+            )
+        _validate_no_linked_ancestors(
+            self._audit_path,
+            description="restore audit file",
+        )
+        _validate_no_linked_ancestors(
+            self._journal_path,
+            description="restore journal file",
+        )
+        _validate_no_linked_ancestors(
+            self._restore_lock_path,
+            description="restore lock file",
+        )
 
     def _restore_locked(
         self,
@@ -1100,7 +1120,7 @@ def _resolve_non_linked_path(path: Path, *, description: str) -> Path:
 
 
 def _validate_no_linked_ancestors(path: Path, *, description: str) -> None:
-    current = Path(path).absolute()
+    current = _lexically_normalized_absolute_path(path)
     while True:
         if _is_symbolic_link_or_junction(current):
             raise ValueError(f"{description} cannot contain a symbolic link or junction")
@@ -1108,6 +1128,10 @@ def _validate_no_linked_ancestors(path: Path, *, description: str) -> None:
         if parent == current:
             return
         current = parent
+
+
+def _lexically_normalized_absolute_path(path: Path) -> Path:
+    return Path(os.path.normpath(os.path.abspath(os.fspath(path))))
 
 
 def _is_symbolic_link_or_junction(path: Path) -> bool:

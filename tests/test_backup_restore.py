@@ -718,6 +718,113 @@ def test_backup_manager_rejects_managed_path_below_directory_junction(tmp_path) 
     assert external_ledger.read_text(encoding="utf-8") == '{"kind":"external"}\n'
 
 
+def test_backup_manager_accepts_managed_path_with_elided_junction_segment(tmp_path) -> None:
+    safe_directory = tmp_path / "safe-state"
+    external_directory = tmp_path / "outside" / "external-state"
+    junction_directory = tmp_path / "linked-state"
+    safe_ledger = safe_directory / "account-ledger.jsonl"
+    safe_directory.mkdir()
+    external_directory.mkdir(parents=True)
+    safe_ledger.write_bytes(b'{"kind":"safe"}\n')
+    try:
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction_directory),
+                str(external_directory),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as exc:
+        pytest.skip(f"creating a directory junction is unavailable: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        pytest.skip(f"creating a directory junction is unavailable: {detail}")
+
+    archive = tmp_path / "safe-backup.zip"
+    managed_ledger = junction_directory / ".." / "safe-state" / "account-ledger.jsonl"
+    try:
+        manager = LocalBackupManager(
+            managed_files={"account-ledger.jsonl": managed_ledger},
+            audit_path=tmp_path / "restore-audit.jsonl",
+        )
+        manager.create_backup(archive)
+    finally:
+        junction_directory.rmdir()
+
+    with zipfile.ZipFile(archive) as bundle:
+        assert bundle.read("managed/account-ledger.jsonl") == b'{"kind":"safe"}\n'
+
+
+def test_backup_rejects_directory_junction_swap_before_external_access(tmp_path) -> None:
+    safe_root = tmp_path / "safe-root"
+    safe_state_directory = safe_root / "state"
+    safe_audit_directory = safe_root / "audit"
+    safe_ledger = safe_state_directory / "account-ledger.jsonl"
+    safe_audit_path = safe_audit_directory / "restore-audit.jsonl"
+    safe_state_directory.mkdir(parents=True)
+    safe_audit_directory.mkdir(parents=True)
+    safe_ledger.write_text('{"kind":"safe"}\n', encoding="utf-8")
+    manager = LocalBackupManager(
+        managed_files={"account-ledger.jsonl": safe_ledger},
+        audit_path=safe_audit_path,
+    )
+
+    external_root = tmp_path / "external-root"
+    external_ledger = external_root / "state" / "account-ledger.jsonl"
+    external_audit_path = external_root / "audit" / "restore-audit.jsonl"
+    external_ledger.parent.mkdir(parents=True)
+    external_audit_path.parent.mkdir(parents=True)
+    external_ledger.write_text('{"kind":"external"}\n', encoding="utf-8")
+    safe_ledger.unlink()
+    for path in safe_audit_directory.iterdir():
+        path.unlink()
+    safe_state_directory.rmdir()
+    safe_audit_directory.rmdir()
+    safe_root.rmdir()
+    try:
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(safe_root),
+                str(external_root),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as exc:
+        pytest.skip(f"creating a directory junction is unavailable: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        pytest.skip(f"creating a directory junction is unavailable: {detail}")
+
+    archive = tmp_path / "backup.zip"
+    external_journal_path = _restore_journal_path(external_audit_path)
+    external_lock_path = external_journal_path.with_name(f"{external_journal_path.name}.lock")
+    try:
+        with pytest.raises(ValueError, match="symbolic link or junction"):
+            manager.create_backup(archive)
+    finally:
+        safe_root.rmdir()
+
+    assert external_ledger.read_text(encoding="utf-8") == '{"kind":"external"}\n'
+    assert not archive.exists()
+    assert not external_audit_path.exists()
+    assert not external_journal_path.exists()
+    assert not external_lock_path.exists()
+
+
 def test_backup_manager_checks_declared_path_for_symlink_before_resolution(
     tmp_path, monkeypatch
 ) -> None:
