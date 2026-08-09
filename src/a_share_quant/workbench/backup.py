@@ -166,7 +166,7 @@ class LocalBackupManager:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pending_restores: dict[str, _PendingRestore] = {}
         self._journal_path = _restore_journal_path(self._audit_path)
-        self._restore_lock_path = _restore_lock_path(self._journal_path)
+        self._restore_lock_path = _resource_restore_lock_path(self._managed_files)
         _validate_no_linked_ancestors(
             self._journal_path,
             description="restore journal file",
@@ -185,7 +185,7 @@ class LocalBackupManager:
             raise ValueError("restore lock file cannot be the audit file")
         if _same_path(self._restore_lock_path, self._journal_path):
             raise ValueError("restore lock file cannot be the restore journal file")
-        self._restore_lock = _shared_restore_lock(self._journal_path)
+        self._restore_lock = _shared_restore_lock(self._restore_lock_path)
         with self._coordinated_restore_lock():
             self._recover_pending_restore()
 
@@ -198,8 +198,14 @@ class LocalBackupManager:
 
     def _create_backup_locked(self, archive_path: Path) -> BackupManifest:
         archive = _resolve_local_path(archive_path)
-        if any(_same_path(archive, path) for path in self._managed_files.values()):
-            raise ValueError("backup archive cannot replace a managed local file")
+        protected_paths = (
+            *self._managed_files.values(),
+            self._audit_path,
+            self._journal_path,
+            self._restore_lock_path,
+        )
+        if any(_same_path(archive, path) for path in protected_paths):
+            raise ValueError("backup archive cannot replace a protected file")
         contents: dict[str, bytes] = {}
         files: list[BackupFile] = []
         for logical_path, local_path in sorted(self._managed_files.items()):
@@ -269,6 +275,7 @@ class LocalBackupManager:
         with self._restore_lock:
             self._validate_operation_paths()
             with _durable_restore_lock(self._restore_lock_path):
+                self._validate_operation_paths()
                 yield
 
     def _validate_operation_paths(self) -> None:
@@ -861,22 +868,29 @@ def _restore_journal_path(audit_path: Path) -> Path:
     return audit_path.with_name(f".{audit_path.name}.restore-journal.json")
 
 
-def _restore_lock_path(journal_path: Path) -> Path:
-    return journal_path.with_name(f"{journal_path.name}.lock")
+def _resource_restore_lock_path(managed_files: Mapping[str, Path]) -> Path:
+    configuration_digest = _managed_destination_configuration_digest(managed_files)
+    return _resolve_non_linked_path(
+        Path(tempfile.gettempdir())
+        / "a-share-quant-backup-locks"
+        / f"{configuration_digest}.restore.lock",
+        description="restore lock file",
+    )
 
 
-def _shared_restore_lock(journal_path: Path) -> RLock:
-    journal_key = _canonical_path(journal_path)
+def _shared_restore_lock(lock_path: Path) -> RLock:
+    lock_key = _canonical_path(lock_path)
     with _SHARED_RESTORE_LOCKS_GUARD:
-        lock = _SHARED_RESTORE_LOCKS.get(journal_key)
+        lock = _SHARED_RESTORE_LOCKS.get(lock_key)
         if lock is None:
             lock = RLock()
-            _SHARED_RESTORE_LOCKS[journal_key] = lock
+            _SHARED_RESTORE_LOCKS[lock_key] = lock
         return lock
 
 
 @contextmanager
 def _durable_restore_lock(lock_path: Path) -> Iterator[None]:
+    _validate_no_linked_ancestors(lock_path, description="restore lock file")
     if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
         raise ValueError("restore lock file is invalid")
     try:
@@ -1111,6 +1125,11 @@ def _managed_configuration_digest(managed_files: Mapping[str, Path]) -> str:
         for logical_path, destination in sorted(managed_files.items())
     ]
     return _sha256(_canonical_json(configuration).encode("utf-8"))
+
+
+def _managed_destination_configuration_digest(managed_files: Mapping[str, Path]) -> str:
+    destinations = sorted(_canonical_path(destination) for destination in managed_files.values())
+    return _sha256(_canonical_json(destinations).encode("utf-8"))
 
 
 def _resolve_non_linked_path(path: Path, *, description: str) -> Path:

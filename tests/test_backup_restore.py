@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import subprocess
 import threading
@@ -14,7 +15,13 @@ from pathlib import Path
 import pytest
 
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
-from a_share_quant.workbench.backup import LocalBackupManager
+from a_share_quant.workbench.backup import LocalBackupManager, _durable_restore_lock
+
+
+def _hold_durable_restore_lock(lock_path: str, acquired, release) -> None:
+    with _durable_restore_lock(Path(lock_path)):
+        acquired.set()
+        release.wait(timeout=5)
 
 
 def _manager(tmp_path) -> tuple[LocalBackupManager, dict[str, object]]:
@@ -571,6 +578,99 @@ def test_separate_managers_wait_for_an_active_restore_journal(tmp_path, monkeypa
         ) == archived_state
 
 
+def test_managers_with_different_audits_share_destination_restore_lock(
+    tmp_path, monkeypatch
+) -> None:
+    ledger = tmp_path / "account-ledger.jsonl"
+    initialization = tmp_path / "account-ledger.jsonl.initialization.json"
+    managed_files = {
+        "account-ledger.jsonl": ledger,
+        "account-ledger.jsonl.initialization.json": initialization,
+    }
+    consistency_groups = {
+        "account-state": (
+            "account-ledger.jsonl",
+            "account-ledger.jsonl.initialization.json",
+        )
+    }
+    manager_a = LocalBackupManager(
+        managed_files=managed_files,
+        consistency_groups=consistency_groups,
+        audit_path=tmp_path / "restore-audit-a.jsonl",
+    )
+    manager_b = LocalBackupManager(
+        managed_files=managed_files,
+        consistency_groups=consistency_groups,
+        audit_path=tmp_path / "restore-audit-b.jsonl",
+    )
+    archived_state = (b"archived-ledger", b"archived-initialization")
+    original_state = (b"original-ledger", b"original-initialization")
+    ledger.write_bytes(archived_state[0])
+    initialization.write_bytes(archived_state[1])
+    restore_archive = tmp_path / "restore-source.zip"
+    manager_a.create_backup(restore_archive)
+    ledger.write_bytes(original_state[0])
+    initialization.write_bytes(original_state[1])
+    preflight = manager_a.preflight_restore(restore_archive)
+
+    real_replace = os.replace
+    first_replacement = threading.Event()
+    release_restore = threading.Event()
+    paused = False
+
+    def pause_after_ledger_replacement(source, destination) -> None:
+        nonlocal paused
+        if not paused and destination == ledger and source.read_bytes() == archived_state[0]:
+            paused = True
+            real_replace(source, destination)
+            first_replacement.set()
+            if not release_restore.wait(timeout=3):
+                raise RuntimeError("test did not release the first restore")
+            return
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "a_share_quant.workbench.backup.os.replace",
+        pause_after_ledger_replacement,
+    )
+    backup_archive = tmp_path / "manager-b-backup.zip"
+    backup_started = threading.Event()
+    backup_finished = threading.Event()
+
+    def create_manager_b_backup() -> None:
+        backup_started.set()
+        try:
+            manager_b.create_backup(backup_archive)
+        finally:
+            backup_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        restore_future = executor.submit(
+            manager_a.restore,
+            restore_archive,
+            confirmation_token=preflight.confirmation_token,
+        )
+        assert first_replacement.wait(timeout=3)
+        backup_future = executor.submit(create_manager_b_backup)
+        assert backup_started.wait(timeout=3)
+        try:
+            assert not backup_finished.wait(timeout=0.2)
+            assert (ledger.read_bytes(), initialization.read_bytes()) == (
+                archived_state[0],
+                original_state[1],
+            )
+        finally:
+            release_restore.set()
+        restore_future.result(timeout=3)
+        backup_future.result(timeout=3)
+
+    with zipfile.ZipFile(backup_archive) as bundle:
+        assert (
+            bundle.read("managed/account-ledger.jsonl"),
+            bundle.read("managed/account-ledger.jsonl.initialization.json"),
+        ) == archived_state
+
+
 def test_restore_uses_constructor_resolved_paths_after_working_directory_changes(
     tmp_path, monkeypatch
 ) -> None:
@@ -823,6 +923,115 @@ def test_backup_rejects_directory_junction_swap_before_external_access(tmp_path)
     assert not external_audit_path.exists()
     assert not external_journal_path.exists()
     assert not external_lock_path.exists()
+
+
+def test_backup_revalidates_paths_after_waiting_for_durable_lock(tmp_path) -> None:
+    safe_state_directory = tmp_path / "safe-state"
+    safe_ledger = safe_state_directory / "account-ledger.jsonl"
+    audit_path = tmp_path / "audit" / "restore-audit.jsonl"
+    safe_state_directory.mkdir()
+    audit_path.parent.mkdir()
+    safe_ledger.write_text('{"kind":"safe"}\n', encoding="utf-8")
+    manager = LocalBackupManager(
+        managed_files={"account-ledger.jsonl": safe_ledger},
+        audit_path=audit_path,
+    )
+
+    external_state_directory = tmp_path / "external-state"
+    external_ledger = external_state_directory / "account-ledger.jsonl"
+    external_state_directory.mkdir()
+    external_ledger.write_text('{"kind":"external"}\n', encoding="utf-8")
+    archive = safe_state_directory / "backup.zip"
+    external_archive = external_state_directory / "backup.zip"
+
+    context = multiprocessing.get_context("spawn")
+    lock_acquired = context.Event()
+    release_lock = context.Event()
+    lock_holder = context.Process(
+        target=_hold_durable_restore_lock,
+        args=(str(manager._restore_lock_path), lock_acquired, release_lock),
+    )
+    backup_started = threading.Event()
+    backup_finished = threading.Event()
+
+    def create_backup() -> None:
+        backup_started.set()
+        try:
+            manager.create_backup(archive)
+        finally:
+            backup_finished.set()
+
+    lock_holder.start()
+    try:
+        assert lock_acquired.wait(timeout=3)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            backup_future = executor.submit(create_backup)
+            assert backup_started.wait(timeout=3)
+            assert not backup_finished.wait(timeout=0.2)
+            safe_ledger.unlink()
+            safe_state_directory.rmdir()
+            try:
+                result = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(safe_state_directory),
+                        str(external_state_directory),
+                    ],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+            except OSError as exc:
+                pytest.skip(f"creating a directory junction is unavailable: {exc}")
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                pytest.skip(f"creating a directory junction is unavailable: {detail}")
+            release_lock.set()
+            with pytest.raises(ValueError, match="symbolic link or junction"):
+                backup_future.result(timeout=3)
+    finally:
+        release_lock.set()
+        lock_holder.join(timeout=3)
+        if lock_holder.is_alive():
+            lock_holder.terminate()
+            lock_holder.join(timeout=3)
+        if safe_state_directory.exists() and safe_state_directory.is_dir():
+            safe_state_directory.rmdir()
+
+    assert external_ledger.read_text(encoding="utf-8") == '{"kind":"external"}\n'
+    assert not external_archive.exists()
+    assert not audit_path.exists()
+
+
+@pytest.mark.parametrize("artifact", ("audit", "journal", "resource lock"))
+def test_backup_rejects_archive_alias_to_protected_restore_artifact(tmp_path, artifact) -> None:
+    ledger = tmp_path / "account-ledger.jsonl"
+    audit_path = tmp_path / "restore-audit.jsonl"
+    ledger.write_text('{"kind":"safe"}\n', encoding="utf-8")
+    if artifact == "audit":
+        audit_path.write_bytes(b"original audit")
+    manager = LocalBackupManager(
+        managed_files={"account-ledger.jsonl": ledger},
+        audit_path=audit_path,
+    )
+    protected_path = {
+        "audit": audit_path,
+        "journal": _restore_journal_path(audit_path),
+        "resource lock": manager._restore_lock_path,
+    }[artifact]
+    original_content = protected_path.read_bytes() if protected_path.exists() else None
+    archive_alias = protected_path.parent / "archive-alias" / ".." / protected_path.name
+
+    with pytest.raises(ValueError, match="backup archive cannot replace a protected file"):
+        manager.create_backup(archive_alias)
+
+    assert protected_path.exists() is (original_content is not None)
+    if original_content is not None:
+        assert protected_path.read_bytes() == original_content
 
 
 def test_backup_manager_checks_declared_path_for_symlink_before_resolution(
