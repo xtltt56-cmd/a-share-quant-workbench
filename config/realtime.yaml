@@ -1,0 +1,32 @@
+realtime:
+  provider_priority:
+    - rqdata
+    - tushare
+    - akshare
+  poll_interval_seconds: 15
+  minute_frequency: 1m
+  stale_threshold:
+    professional_feed_seconds: 10
+    public_fallback_seconds: 60
+  retry:
+    max_attempts: 3
+  backoff:
+    initial_seconds: 0.5
+    multiplier: 2.0
+    max_seconds: 8.0
+  market_indices:
+    - "000001"
+    - "000300"
+    - "000905"
+    - "000852"
+    - "399001"
+    - "399006"
+  candidate_count: 20
+  dashboard_refresh_seconds: 15
+  fallback:
+    enabled: true
+    label: "AKShare Public Market Source"
+  eod:
+    wait_seconds: 30
+    confirmation_timeout_seconds: 300
+    finalization_enabled: true

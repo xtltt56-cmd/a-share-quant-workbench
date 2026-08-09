@@ -10,6 +10,16 @@ from .data import (
     ProviderRequestError,
 )
 from .modes import DATA_MODES, validate_data_mode
+from .realtime import (
+    DataQualityStatus,
+    MarketSnapshot,
+    MinuteBar,
+    ProviderCapability,
+    ProviderHealth,
+    ProviderMetadata,
+    ProviderSwitchEvent,
+    RealTimeQuote,
+)
 
 __all__ = [
     "CANONICAL_DAILY_COLUMNS",
@@ -21,6 +31,14 @@ __all__ = [
     "ProviderRequestError",
     "DATA_MODES",
     "validate_data_mode",
+    "DataQualityStatus",
+    "MarketSnapshot",
+    "MinuteBar",
+    "ProviderCapability",
+    "ProviderHealth",
+    "ProviderMetadata",
+    "ProviderSwitchEvent",
+    "RealTimeQuote",
     "ExecutionSpec",
     "PortfolioTarget",
     "SignalFrame",

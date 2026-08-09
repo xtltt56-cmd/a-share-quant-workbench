@@ -204,3 +204,32 @@ Stage 3B review conclusion: no new credential, network listener, or real-money
 execution capability was introduced. The remaining high-priority controls are
 historical data/benchmark completeness, independent event-engine validation,
 and a future static import guard before any broker or paper-monitor stage.
+
+## Stage 3RT-A security addendum (2026-08-09)
+
+Stage 3RT-A introduces a provider-neutral real-time boundary and an in-memory
+provisional store. It does not introduce a listener, broker client, account
+credential, or live execution state. The user-confirmed deployment remains a
+single Windows desktop with outbound provider calls and a future dashboard
+bound to localhost only.
+
+| Boundary | Evidence | Control |
+|---|---|---|
+| Provider response -> real-time contract | `src/a_share_quant/contracts/realtime.py`, `src/a_share_quant/data/realtime/validation.py` | Normalize symbols, require timezone-aware timestamps, reject invalid prices/volume/OHLC, mark stale data, reject future/backwards timestamps |
+| Provider factory -> active source | `src/a_share_quant/data/realtime/registry.py` | Capability discovery skips unavailable providers, failover records source/from/to/reason/time, errors omit provider payloads |
+| Provisional bars -> historical/PIT data | `src/a_share_quant/storage/realtime_store.py` | Separate in-memory layers; only explicit `finalize_eod` with a reconciler can move final bars |
+| `.env` -> runtime configuration | `.env.example`, existing `Settings` paper guard | Credential names only are documented; values remain outside Git and are not present in capability/report objects |
+
+### Stage 3RT-A abuse paths and residual risk
+
+| ID | Abuse path | Priority | Mitigation/status |
+|---|---|---|---|
+| TM-013 | Stale or future provider timestamps pass into monitoring -> a stale quote is classified as actionable | high | `assess_quote_quality` and `RealtimeCircuitBreaker` mark stale/failed input unusable and block `can_generate_ready`; downstream trigger tests remain required |
+| TM-014 | Provider failure silently changes the active source -> operator misreads source quality | medium | `ProviderSwitchEvent` records source transition, exception class and UTC timestamp; dashboard must display the active source and event |
+| TM-015 | Provisional intraday bars contaminate historical PIT data -> future research sees unfinalized data | high | `RealTimeStore` has separate provisional/historical maps and explicit idempotent EOD finalization; durable archival/reconciliation is a later sub-stage |
+| TM-016 | RQData/Tushare credentials enter logs or reports during capability discovery | high | Provider boundary exposes only booleans, permissions and sanitized messages; no secret value is included in contracts; final launcher/report scan remains required |
+
+Stage 3RT-A conclusion: the new code adds validation and source-switching
+controls without adding external inbound exposure or real-money execution. The
+remaining risks are provider-specific schema/permission handling and the
+dashboard/launcher boundary, which must be reviewed before Stage 3RT-D.

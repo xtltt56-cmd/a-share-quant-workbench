@@ -465,6 +465,28 @@ Each sub-stage has its own tests, report, README/progress update, and Git
 commit. A failed quality gate stops that sub-stage; it does not get hidden by
 fixture results or a later adapter.
 
+## 22. Stage 3RT real-time workbench boundary
+
+Stage 3RT is an independent operational-monitoring stage inserted before Stage
+3C. It may consume real market data and compute intraday monitoring features,
+but it does not change the Stage 2/3 historical PIT store, invoke a daily model
+with intraday data, or expose any broker/live execution route. The approved
+design and implementation plan are recorded in:
+
+- `docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md`
+- `docs/superpowers/plans/2026-08-09-stage3rt-realtime-workbench.md`
+
+The runtime flow is:
+
+```text
+Provider -> normalize/validate -> RealTimeStore -> freshness circuit breaker
+         -> transparent intraday analysis -> local dashboard / paper signal monitor
+```
+
+Provisional minute bars remain outside the historical store until explicit EOD
+validation and reconciliation. The dashboard is local-only by default and
+must bind to `127.0.0.1`. `READY` is a monitoring state, never a broker order.
+
 ## 20. Stage 3A acceptance criteria
 
 Stage 3A is accepted only when all of the following are true:

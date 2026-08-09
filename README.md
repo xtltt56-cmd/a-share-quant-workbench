@@ -68,6 +68,29 @@ pipeline validation only; they are not real-market investment evidence. VectorBT
 and RQAlpha remain optional Stage 3B/3D adapters and no broker or live execution
 provider is present.
 
+## Stage 3RT progress (2026-08-09)
+
+- [x] Approved and documented the independent Real-Time Quant Workbench
+      design. It is intentionally separate from Stage 3C and remains
+      monitoring/paper-signal only.
+- [x] Added provider-neutral `RealTimeQuote`, `MinuteBar`, `MarketSnapshot`,
+      capability, health, quality, and provider-switch contracts.
+- [x] Added `RealTimeDataProvider`, capability discovery, ordered failover, and
+      sanitized provider errors. The core layer has no provider SDK imports.
+- [x] Added freshness assessment, timestamp-backwards/future checks, and a
+      stale-data circuit breaker that blocks `READY` state inputs.
+- [x] Added an in-memory `RealTimeStore` whose provisional bars are isolated
+      from historical/PIT state until explicit EOD finalization.
+- [x] Added `config/realtime.yaml` and RQData/Tushare credential placeholders
+      to `.env.example`; no credential value is stored in Git.
+- [ ] Stage 3RT provider adapters, replay/smoke test, dashboard, scheduler,
+      launchers, and historical dry-run remain in progress.
+
+The Stage 3RT-A design is recorded in
+[`docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md`](docs/superpowers/specs/2026-08-09-stage3rt-realtime-workbench-design.md)
+and the execution plan is in
+[`docs/superpowers/plans/2026-08-09-stage3rt-realtime-workbench.md`](docs/superpowers/plans/2026-08-09-stage3rt-realtime-workbench.md).
+
 The Qlib adapter writes a project-owned local provider under the experiment/data path and keeps Qlib-specific imports inside `src/a_share_quant/integrations/qlib/`. It uses `kernels=1` by default on Windows to keep dataset construction deterministic and avoid uncontrolled worker spawning. Every comparison bundle records the fixed split, Walk-Forward windows, Git revision, dataset hash, configuration hash, library versions, feature/data/model versions, and seed under `experiments/<experiment_id>/`.
 
 Stage 2 operator commands:
