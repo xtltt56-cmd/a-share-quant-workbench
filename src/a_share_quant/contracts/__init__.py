@@ -9,6 +9,7 @@ from .data import (
     ProviderError,
     ProviderRequestError,
 )
+from .modes import DATA_MODES, validate_data_mode
 
 __all__ = [
     "CANONICAL_DAILY_COLUMNS",
@@ -18,6 +19,8 @@ __all__ = [
     "ProviderConfigurationError",
     "ProviderError",
     "ProviderRequestError",
+    "DATA_MODES",
+    "validate_data_mode",
     "ExecutionSpec",
     "PortfolioTarget",
     "SignalFrame",

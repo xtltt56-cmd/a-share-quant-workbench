@@ -39,6 +39,29 @@ Stage 3A commands:
 \.venv\Scripts\python.exe -m pytest -q
 ```
 
+## Stage 3B progress (2026-08-09)
+
+- [x] Added explicit `fixture` / `historical` / `paper` data-mode separation;
+      fixture evidence can reach only `SIGNAL_VALIDATED_FIXTURE`.
+- [x] Added the formal `PortfolioStrategy` boundary and four candidates:
+      TopK equal-weight, score-weight, rank-weighted, and TopK dropout.
+- [x] Added shared `RebalancePolicy`, unified raw/normalized turnover, and a
+      versioned `BacktestResult` contract.
+- [x] Added the optional VectorBT adapter with a non-blocking reference
+      fallback. VectorBT is not installed in the current Windows environment.
+- [x] Generated [Stage 3B fast-research report](reports/stage3_fast_research_report.md).
+      It is explicitly marked `TEST / FIXTURE DATA - NOT INVESTMENT EVIDENCE`.
+- [x] Historical dry run remains `NOT_RUN`: local candidate bars for
+      `000002`/`000003`/`000004` and the `000300` benchmark are missing.
+- [ ] Stage 3C is intentionally not started; RQAlpha, paper trading, brokers,
+      and live order interfaces remain out of scope.
+
+Stage 3B command:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_stage3b_fast_research.py
+```
+
 The three frozen bundles are synthetic fixture artifacts from the accepted
 Stage 2 smoke run. Their metrics are useful for deterministic contract and
 pipeline validation only; they are not real-market investment evidence. VectorBT

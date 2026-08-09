@@ -40,6 +40,15 @@
 | [PyPortfolioOpt](https://github.com/PyPortfolio/PyPortfolioOpt) | HRP/最小方差/CVaR 对照 | MIT | V1.1 组合层实验 |
 | [vn.py](https://github.com/vnpy/vnpy) | 未来执行适配参考 | MIT；真实券商与账户权限另行审查 | V1 不安装、不连接、不启动 |
 
+### Stage 3B verification note
+
+VectorBT remains an optional `fast-research` dependency (`vectorbt>=0.28,<1`).
+It was not installed during the Stage 3B run on Windows/Python 3.12; the
+adapter reported the absence and used the project-owned reference fallback.
+The core package does not import VectorBT directly. Any future installation
+must be followed by `pip check`, the full test suite, and a Windows smoke test;
+the Commons Clause license boundary remains recorded above.
+
 ## 依赖管理规则
 
 1. 核心安装必须可在无 Token、无券商、无 RQData、无外网历史数据的环境中完成，并能运行离线测试。

@@ -184,3 +184,23 @@ route was introduced. The highest current risks are local artifact integrity,
 future leakage, and fixture-result misinterpretation. Before Stage 3F paper
 monitoring, rerun this review against the ledger/monitor paths and add a static
 guard against broker imports.
+
+## Stage 3B security addendum (2026-08-09)
+
+Stage 3B adds only local research boundaries: signal-to-portfolio strategy
+translation, an optional VectorBT import boundary, a reference fast-research
+engine, and generated fixture reports. It does not add a broker client,
+listener, account token, paper ledger, or live execution route.
+
+| Boundary | Risk | Control and evidence |
+|---|---|---|
+| SignalFrame -> PortfolioStrategy | A malformed or future-dated signal becomes a target weight | `SignalFrame` validates provenance, data mode, timestamps, duplicate keys, and T+1; strategies consume only the public contract |
+| PortfolioTarget -> fast research | Approximate fills are mistaken for executable A-share orders | `BacktestResult` records engine, assumptions, limitations, and warnings; the report states that VectorBT/reference results require later event-engine validation |
+| Optional VectorBT package -> process | Dependency import or license scope expands the trusted computing base | VectorBT is isolated under `integrations/vectorbt`, optional, unavailable in this run, and not imported by core strategy modules; `DEPENDENCIES.md` records the Commons Clause boundary |
+| Fixture artifacts -> operator report | Synthetic returns are mistaken for investment evidence | `data_mode=fixture`, visible `TEST / FIXTURE DATA - NOT INVESTMENT EVIDENCE`, and `SIGNAL_VALIDATED_FIXTURE` promotion state block production interpretation |
+| Report payload -> Markdown | Untrusted model/strategy strings could inject misleading report text | Current report fields come from validated local artifacts; future HTML/report rendering must escape source strings and scan for secrets/markup |
+
+Stage 3B review conclusion: no new credential, network listener, or real-money
+execution capability was introduced. The remaining high-priority controls are
+historical data/benchmark completeness, independent event-engine validation,
+and a future static import guard before any broker or paper-monitor stage.

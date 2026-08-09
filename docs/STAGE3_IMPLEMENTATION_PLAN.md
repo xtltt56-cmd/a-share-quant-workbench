@@ -198,9 +198,14 @@ Files:
 
 - `src/a_share_quant/strategies/registry.py`
 - `src/a_share_quant/strategies/candidates.py`
+- `src/a_share_quant/strategies/contracts.py`
+- `src/a_share_quant/strategies/ensemble.py`
 - `src/a_share_quant/integrations/vectorbt/adapter.py`
 - `src/a_share_quant/integrations/vectorbt/__init__.py`
 - `src/a_share_quant/backtest/contracts.py`
+- `src/a_share_quant/backtest/fast.py`
+- `src/a_share_quant/backtest/reference.py`
+- `src/a_share_quant/backtest/turnover.py`
 - `tests/test_candidate_strategies.py`
 - `tests/test_vectorbt_adapter.py`
 
@@ -218,6 +223,20 @@ Steps:
 - [ ] Verify the adapter applies the shared execution spec rather than
       duplicating rules.
 - [ ] Run a deterministic fast-research smoke and commit the stage.
+
+Stage 3B implementation notes:
+
+- [x] Preserve `fixture`, `historical`, and `paper` as explicit data modes and
+      block fixture promotion above `SIGNAL_VALIDATED_FIXTURE`.
+- [x] Keep RuleBasedMultiFactor in the matrix but mark it
+      `ENSEMBLE_INELIGIBLE` for the current weak fixture experiment only.
+- [x] Use a small manual TopK/rebalance grid; do not run Optuna or weighted
+      ensemble optimization in this stage.
+- [x] Generate `reports/stage3_fast_research_report.md` with a visible fixture
+      warning and a historical dry-run status.
+- [x] Record VectorBT availability/version and the reference fallback warning.
+- [ ] Commit only after the full regression suite, lint, dependency checks,
+      coverage, report review, and security boundary review pass.
 
 ## Stage 3C - Ensemble, correlation, Optuna, and nested walk-forward
 
@@ -338,4 +357,3 @@ Every stage is complete only after its tests, report, README progress, and Git
 commit are present. A framework that is not installed is reported as an
 optional adapter limitation; it is never silently replaced by an untested
 local implementation.
-

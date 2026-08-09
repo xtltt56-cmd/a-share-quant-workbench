@@ -25,5 +25,8 @@ def test_signal_quality_report_writes_json_and_markdown_with_data_mode(tmp_path:
     )
 
     assert "fixture" in markdown.read_text(encoding="utf-8")
+    assert "TEST / FIXTURE DATA - NOT INVESTMENT EVIDENCE" in markdown.read_text(
+        encoding="utf-8"
+    )
     assert "WEAK_SIGNAL_MONOTONICITY" in markdown.read_text(encoding="utf-8")
     assert json.loads(payload.read_text(encoding="utf-8"))["metadata"]["data_mode"] == "fixture"

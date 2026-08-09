@@ -3,6 +3,9 @@
 - Data mode: `fixture`
 - Source commit: `a293a13`
 - Label: `forward_return`
+
+> TEST / FIXTURE DATA - NOT INVESTMENT EVIDENCE
+
 - This report is diagnostic evidence; Stage 3A uses structural gates and does not invent return thresholds.
 
 ## Model summary

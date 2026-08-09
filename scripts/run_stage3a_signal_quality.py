@@ -39,6 +39,7 @@ def _load_signals(
             current,
             experiment_id=entry.experiment_id,
             trading_dates=sessions,
+            data_mode=entry.data_mode,
         )
         frames.append(signal_frame.to_frame())
         sources.append(entry.prediction_artifact_path)
@@ -54,7 +55,7 @@ def _repo_path(repo_root: Path, path: Path) -> Path:
     return resolved
 
 
-def _promotion_summary(result: dict[str, object]) -> dict[str, object]:
+def _promotion_summary(result: dict[str, object], *, data_mode: str) -> dict[str, object]:
     summaries: dict[str, object] = {}
     for strategy_id, model in result["models"].items():
         overall = model["overall"]
@@ -69,7 +70,7 @@ def _promotion_summary(result: dict[str, object]) -> dict[str, object]:
             "minimum_sample_count_valid": int(overall.get("sample_count", 0)) > 0,
         }
         machine = PromotionStateMachine()
-        decision = machine.transition("SIGNAL_VALIDATED", checks)
+        decision = machine.transition("SIGNAL_VALIDATED", checks, data_mode=data_mode)
         summaries[str(strategy_id)] = decision.to_dict()
     return summaries
 
@@ -98,8 +99,10 @@ def main() -> None:
     result = SignalQualityAnalyzer(top_k=20, quantiles=5, min_group_count=3).analyze(
         predictions, benchmark=benchmark
     )
-    result["promotion"] = _promotion_summary(result)
     data_modes = sorted({entry.data_mode for entry in manifest.entries})
+    if len(data_modes) != 1:
+        raise ValueError("Stage 3A report requires one data_mode across the manifest")
+    result["promotion"] = _promotion_summary(result, data_mode=data_modes[0])
     markdown = _repo_path(repo_root, args.output)
     json_output = _repo_path(repo_root, args.json_output)
     write_signal_quality_report(

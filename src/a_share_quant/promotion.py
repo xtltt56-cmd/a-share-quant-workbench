@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from a_share_quant.contracts.modes import validate_data_mode
+
 
 class PromotionState(str, Enum):
     RESEARCH = "RESEARCH"
     SIGNAL_VALIDATED = "SIGNAL_VALIDATED"
+    SIGNAL_VALIDATED_FIXTURE = "SIGNAL_VALIDATED_FIXTURE"
     FAST_BACKTEST_PASS = "FAST_BACKTEST_PASS"
     ROBUSTNESS_PASS = "ROBUSTNESS_PASS"
     RQALPHA_PASS = "RQALPHA_PASS"
@@ -98,8 +101,38 @@ class PromotionStateMachine:
         self,
         target: PromotionState | str,
         checks: Mapping[str, bool],
+        *,
+        data_mode: str = "historical",
     ) -> GateDecision:
+        mode = validate_data_mode(data_mode)
         target_state = PromotionState.parse(target)
+        if mode == "fixture":
+            if target_state is PromotionState.SIGNAL_VALIDATED:
+                target_state = PromotionState.SIGNAL_VALIDATED_FIXTURE
+            if self._state is not PromotionState.RESEARCH:
+                raise ValueError("fixture data cannot promote from the current state")
+            if target_state is not PromotionState.SIGNAL_VALIDATED_FIXTURE:
+                raise ValueError("fixture data cannot promote to a production state")
+            passed, normalized = PromotionGate.evaluate(checks)
+            decision = GateDecision(
+                accepted=passed,
+                from_state=self._state,
+                to_state=target_state,
+                checks=normalized,
+                reason=(
+                    "fixture structural checks passed; production promotion is forbidden"
+                    if passed
+                    else "one or more structural checks failed"
+                ),
+            )
+            self.history.append(decision)
+            if passed:
+                self._state = target_state
+            return decision
+        if target_state is PromotionState.SIGNAL_VALIDATED_FIXTURE:
+            raise ValueError("SIGNAL_VALIDATED_FIXTURE requires fixture data")
+        if self._state is PromotionState.SIGNAL_VALIDATED_FIXTURE:
+            raise ValueError("fixture data cannot promote to a production state")
         current_index = self._ORDER.index(self._state)
         target_index = self._ORDER.index(target_state)
         if target_index != current_index + 1:

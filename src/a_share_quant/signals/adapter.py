@@ -81,6 +81,7 @@ def prediction_frame_to_signal_frame(
     top_k: int | None = None,
     trading_dates: list[date] | None = None,
     signal_available_at: datetime | pd.Timestamp | None = None,
+    data_mode: str = "historical",
 ) -> SignalFrame:
     """Build the Stage 3 contract without changing the source predictions."""
 
@@ -102,6 +103,7 @@ def prediction_frame_to_signal_frame(
         experiment_id=experiment_id,
         trading_dates=trading_dates,
         signal_available_at=signal_available_at,
+        data_mode=data_mode,
     )
 
 

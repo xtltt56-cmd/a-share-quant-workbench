@@ -255,6 +255,59 @@ suspension, cost, cash, and position rules, and maps its output to the shared
 `BacktestResult`. If VectorBT is not installed, the adapter reports an
 actionable optional-dependency error and the core remains importable.
 
+## 10A. Stage 3B data-mode boundary
+
+Every Stage 3B `SignalFrame`, experiment, `BacktestResult`, and report carries
+one of `fixture`, `historical`, or `paper` as `data_mode`. A fixture report
+must display `TEST / FIXTURE DATA - NOT INVESTMENT EVIDENCE`. Fixture evidence
+may reach `SIGNAL_VALIDATED_FIXTURE` only; it cannot reach
+`FAST_BACKTEST_PASS`, `ROBUSTNESS_PASS`, `RQALPHA_PASS`, `PAPER_TRADING`, or
+any future production state. Historical and paper data are separate modes and
+are never silently substituted by fixture rows.
+
+## 10B. Candidate portfolio strategy contract
+
+Stage 3B portfolio strategies implement one protocol:
+
+```text
+SignalFrame + PortfolioSpec + ExecutionSpec -> list[PortfolioTarget]
+```
+
+The first candidates are `TopKEqualWeight`, `TopKScoreWeight`, `RankWeighted`,
+and `TopKDropout`. They only consume the public signal contract; model objects,
+training labels, and feature internals cannot cross this boundary. Position
+caps, maximum position count, target gross exposure, and cash buffer are
+applied without renormalizing above a cap. If caps leave residual cash, the
+residual is preserved explicitly.
+
+`RebalancePolicy` is shared by all candidates and adapters. Stage 3B supports
+daily, weekly, and `EveryNDays` schedules. The shared turnover definition is:
+
+```text
+raw_turnover_t = sum_i(abs(target_weight_t_i - previous_weight_t_i))
+normalized_turnover_t = raw_turnover_t / max(sum_i(abs(previous_weight_t_i)), 1.0)
+```
+
+The initial portfolio uses 1.0 initial capital as its denominator. Reports may
+show both raw and normalized turnover, but neither engine may substitute an
+engine-specific turnover meaning.
+
+## 10C. Stage 3B fast-research result contract
+
+`BacktestResult` contains NAV, returns, benchmark returns, positions, orders,
+trades, turnover, estimated transaction costs, metrics, warnings, data mode,
+engine/version, assumptions, and limitations. The fast engine reports CAGR,
+total return, Sharpe, Sortino, maximum drawdown, Calmar, volatility, turnover,
+estimated transaction cost, rebalances, average holding period,
+concentration, and benchmark excess return.
+
+VectorBT is a research accelerator, not the final A-share execution authority.
+The adapter records an approximation warning: exact T+1 sellability, limit-up
+and limit-down queues, suspensions, lot sizes, order rejection, and fills must
+be validated later by the event engine. When the optional package is absent,
+the reference fast-research fallback can run without changing the core
+strategy contract.
+
 ## 11. RQAlpha event-validation adapter
 
 The RQAlpha integration is optional and isolated under
@@ -434,3 +487,15 @@ Stage 3A is accepted only when all of the following are true:
   mode, source artifacts, commit, and all limitations;
 - the README and implementation plan identify the exact completed commit.
 
+## 21. Stage 3B acceptance criteria
+
+Stage 3B is accepted only when the candidate strategy protocol, four baseline
+strategies, shared rebalance policy, and shared turnover formula have contract
+tests; the optional VectorBT adapter is import-isolated and non-blocking; signal
+execution tests prove no same-bar execution; and `BacktestResult` preserves
+data mode, costs, limitations, and provenance. The report must compare TopK,
+rebalance frequency, turnover, costs, drawdown, a small parameter surface,
+model-by-strategy results, and the fixture-only EqualRank pipeline. A missing
+historical benchmark or universe snapshot is reported as `NOT_RUN` rather than
+filled with synthetic data. Stage 3B stops here; ensemble robustness, Optuna,
+nested walk-forward, RQAlpha, and paper trading remain later stages.

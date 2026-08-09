@@ -47,15 +47,22 @@ def write_signal_quality_report(
         f"- Data mode: `{(metadata or {}).get('data_mode', 'unknown')}`",
         f"- Source commit: `{(metadata or {}).get('source_commit', 'unknown')}`",
         f"- Label: `{result.get('label_column', 'unknown')}`",
-        "- This report is diagnostic evidence; Stage 3A uses structural gates and "
-        "does not invent return thresholds.",
         "",
-        "## Model summary",
-        "",
-        "| Strategy | Sample count | IC mean | Rank IC mean | ICIR | "
-        "Positive IC ratio | Diagnostics |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
+    if (metadata or {}).get("data_mode") == "fixture":
+        lines.extend(["> TEST / FIXTURE DATA - NOT INVESTMENT EVIDENCE", ""])
+    lines.extend(
+        [
+            "- This report is diagnostic evidence; Stage 3A uses structural gates and "
+            "does not invent return thresholds.",
+            "",
+            "## Model summary",
+            "",
+            "| Strategy | Sample count | IC mean | Rank IC mean | ICIR | "
+            "Positive IC ratio | Diagnostics |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
     for strategy_id, model in result.get("models", {}).items():
         overall = model.get("overall", {})
         diagnostics = ", ".join(model.get("diagnostics", [])) or "none"

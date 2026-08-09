@@ -12,6 +12,7 @@ import pandas as pd
 
 from a_share_quant.data.normalization import normalize_symbol
 
+from .modes import validate_data_mode
 from .timing import next_trading_date, validate_execution_date
 
 SIGNAL_FRAME_COLUMNS = (
@@ -70,14 +71,37 @@ class SignalFrame:
 
     frame: pd.DataFrame
     t_plus_one: bool = True
+    data_mode: str | None = None
 
     def __post_init__(self) -> None:
         validated = self._validate(self.frame, t_plus_one=self.t_plus_one)
+        embedded_modes = validated.get("data_mode")
+        embedded_mode = None
+        if embedded_modes is not None:
+            if embedded_modes.isna().any():
+                raise ValueError("data_mode cannot be null")
+            normalized_modes = embedded_modes.map(validate_data_mode)
+            if normalized_modes.nunique() != 1:
+                raise ValueError("SignalFrame must contain exactly one data_mode")
+            validated["data_mode"] = normalized_modes
+            embedded_mode = str(normalized_modes.iloc[0])
+        mode = validate_data_mode(self.data_mode or embedded_mode or "historical")
+        if embedded_mode is not None and embedded_mode != mode:
+            raise ValueError("SignalFrame data_mode conflicts with the explicit data_mode")
+        if self.data_mode is not None and embedded_mode is None:
+            validated["data_mode"] = mode
         object.__setattr__(self, "frame", validated)
+        object.__setattr__(self, "data_mode", mode)
 
     @classmethod
-    def from_frame(cls, frame: pd.DataFrame, *, t_plus_one: bool = True) -> SignalFrame:
-        return cls(frame=frame, t_plus_one=t_plus_one)
+    def from_frame(
+        cls,
+        frame: pd.DataFrame,
+        *,
+        t_plus_one: bool = True,
+        data_mode: str | None = None,
+    ) -> SignalFrame:
+        return cls(frame=frame, t_plus_one=t_plus_one, data_mode=data_mode)
 
     @classmethod
     def from_predictions(
@@ -88,6 +112,7 @@ class SignalFrame:
         trading_dates: list[date] | None = None,
         signal_available_at: datetime | pd.Timestamp | None = None,
         t_plus_one: bool = True,
+        data_mode: str = "historical",
     ) -> SignalFrame:
         """Convert a Stage 2 prediction frame while making timing explicit."""
 
@@ -100,6 +125,7 @@ class SignalFrame:
             current["experiment_id"] = experiment_id
         if "experiment_id" not in current.columns:
             raise ValueError("predictions require experiment_id")
+        current["data_mode"] = current.get("data_mode", data_mode)
 
         current["date"] = current["date"].map(lambda value: _as_date(value, name="date"))
         if "raw_score" not in current.columns:
@@ -177,6 +203,8 @@ class SignalFrame:
             raise ValueError("rank must be a positive integer")
         if not current["confidence"].between(0, 1).all():
             raise ValueError("confidence must be between 0 and 1")
+        if "data_mode" in current.columns:
+            current["data_mode"] = current["data_mode"].map(validate_data_mode)
         duplicate_key = ["date", "symbol", "strategy_id", "experiment_id"]
         if current.duplicated(duplicate_key).any():
             raise ValueError("SignalFrame contains duplicate signal keys")
@@ -204,7 +232,11 @@ def _add_score_fields(frame: pd.DataFrame) -> pd.DataFrame:
         group = current.loc[index].sort_values(["raw_score", "symbol"], ascending=[False, True])
         scores = group["raw_score"]
         minimum, maximum = float(scores.min()), float(scores.max())
-        normalized = 50.0 if minimum == maximum else (scores - minimum) / (maximum - minimum) * 100
+        normalized = (
+            pd.Series(50.0, index=group.index)
+            if minimum == maximum
+            else (scores - minimum) / (maximum - minimum) * 100
+        )
         current.loc[group.index, "rank"] = range(1, len(group) + 1)
         current.loc[group.index, "normalized_score"] = normalized.to_numpy()
     return current
