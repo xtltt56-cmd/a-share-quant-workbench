@@ -42,6 +42,9 @@ portfolio = [
 data-extra = [
     "tushare>=1.4,<2",
 ]
+data-free = [
+    "baostock>=0.9,<1",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

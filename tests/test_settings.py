@@ -24,6 +24,15 @@ def test_settings_load_from_env_file_without_exposing_token(tmp_path: Path) -> N
     assert "test-placeholder" not in repr(settings)
 
 
+def test_settings_accepts_baostock_free_provider(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("A_SHARE_QUANT_PROVIDER=baostock\n", encoding="utf-8")
+
+    settings = Settings.load(env_file=env_file)
+
+    assert settings.provider == "baostock"
+
+
 def test_settings_rejects_live_execution_even_if_env_requests_it(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(

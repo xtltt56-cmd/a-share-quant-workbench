@@ -14,6 +14,7 @@
 | PyArrow | `pyarrow` | `>=16,<24` | Apache-2.0 | Parquet I/O | Windows wheel；写入前做 schema 检查 |
 | DuckDB | `duckdb` | `>=1.0,<2` | MIT | 本地查询、manifest、质量索引 | 只允许项目内数据目录；不暴露网络服务 |
 | AKShare | `akshare` | `>=1.18,<2` | MIT | 免费 A 股数据适配器 | endpoint 不稳定；通过 lazy import 和 adapter 处理 |
+| BaoStock | `baostock` | `>=0.9,<1`（`data-free` profile） | BSD License（以发布包为准） | 无注册历史行情/股票基础资料备用适配器 | 只读登录；通过 lazy import 和 adapter 处理 |
 | Qlib | `pyqlib` | 锁定稳定版本；首版验证 `0.9.x` | MIT | Alpha158/Alpha360、模型、Workflow、研究回测 | Python 3.12/Windows 需要单独 smoke test；不使用官方 Yahoo 数据作为生产数据 |
 | Optuna | `optuna` | 稳定 4.x；不锁 v5 RC | MIT | OOS 参数优化和 pruning | study 存储不含密钥/原始敏感数据 |
 | QuantStats | `quantstats` | `>=0.0.8,<1` | Apache-2.0 | 指标、基准对比、tear sheet | 报告输出到被忽略目录 |
@@ -34,6 +35,7 @@
 | 依赖/服务 | 作用 | 许可证/商业边界 | 启用条件 |
 |---|---|---|---|
 | Tushare | 付费/Token 数据源备用适配器 | 以其服务条款和账号权限为准；Token 只能来自 `.env` 或安全存储 | `provider=tushare` 且显式配置 Token |
+| BaoStock | 免费、无需注册的历史数据备用适配器 | BSD License（以发布包为准）；以其服务条款和公开服务限制为准 | `pip install -e ".[data-free]"`，然后 `provider=baostock` |
 | RQData / `rqdata` CLI | RiceQuant 高质量数据和 RiceQuant Skills 的数据入口 | 账号/许可证与服务条款约束；不作为免费 V1 依赖 | 用户显式配置并通过 provider adapter 启用 |
 | [RQAlpha](https://github.com/ricequant/rqalpha) | 事件驱动回测/模拟 | 项目 README 标注仅限非商业使用 | 个人研究 profile；商业路径保持关闭 |
 | [VectorBT](https://github.com/polakowo/vectorbt) | 向量化研究/参数扫描 | Apache-2.0 + Commons Clause | `research-fast` profile；最终结果需独立事件引擎复核 |
@@ -51,7 +53,9 @@ the Commons Clause license boundary remains recorded above.
 
 ### Stage 3RT verification note
 
-Stage 3RT uses lazy adapters for AKShare, Tushare, and optional RQData. RQData
+Stage 3RT uses lazy adapters for AKShare, Tushare, and optional RQData. BaoStock
+is intentionally a daily/history-only provider and is not used for real-time
+failover. RQData
 is intentionally not added as a mandatory Python dependency: installation,
 credentials, real-time permission, and service terms are provider/account
 specific. Capability discovery skips missing or permission-denied providers;

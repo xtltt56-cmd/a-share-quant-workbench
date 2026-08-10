@@ -5,6 +5,7 @@
 主要来源：
 
 - [AKShare](https://github.com/akfamily/akshare)
+- [BaoStock](https://www.baostock.com/)
 - [Qlib](https://github.com/microsoft/qlib)
 - [DuckDB](https://duckdb.org/)
 - [Optuna](https://github.com/optuna/optuna)

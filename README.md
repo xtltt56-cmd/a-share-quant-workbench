@@ -294,9 +294,10 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python.exe -m pip install -e ".[event-backtest]" # RQAlpha，个人研究
 .\.venv\Scripts\python.exe -m pip install -e ".[portfolio]"      # PyPortfolioOpt
 .\.venv\Scripts\python.exe -m pip install -e ".[data-extra]"     # Tushare adapter
+.\.venv\Scripts\python.exe -m pip install -e ".[data-free]"      # BaoStock free adapter
 ```
 
-`.env` 只保存本机配置和可选 Token，绝不提交 Git。AKShare 默认不需要 Token；Tushare/RQData 必须显式启用。密钥不会写入源码、测试夹具、日志、模型 artifact 或报告。
+`.env` 只保存本机配置和可选 Token，绝不提交 Git。AKShare/BaoStock 默认不需要 Token；Tushare/RQData 必须显式启用。密钥不会写入源码、测试夹具、日志、模型 artifact 或报告。
 
 ## 第一阶段命令
 
@@ -311,6 +312,7 @@ Copy-Item .env.example .env
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/update_data.py --provider akshare --limit 1 --start-date 2026-01-01 --end-date 2026-01-05 --network-smoke
+.\.venv\Scripts\python.exe scripts/update_data.py --provider baostock --limit 1 --start-date 2026-01-01 --end-date 2026-01-05 --network-smoke
 ```
 
 网络失败、接口限流或字段变化都只应被记录为数据源失败，不得被当作交易信号或回测成功。

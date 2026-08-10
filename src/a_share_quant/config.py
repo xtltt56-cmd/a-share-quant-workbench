@@ -35,8 +35,8 @@ class Settings(BaseSettings):
     def enforce_paper_only(self) -> Settings:
         if self.execution_mode.lower() != "paper" or self.allow_live:
             raise ValueError("V1 execution mode must remain paper and allow_live must be false")
-        if self.provider.lower() not in {"akshare", "tushare"}:
-            raise ValueError("provider must be akshare or tushare")
+        if self.provider.lower() not in {"akshare", "baostock", "tushare"}:
+            raise ValueError("provider must be akshare, baostock, or tushare")
         return self
 
     @classmethod
