@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import stat
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path, PureWindowsPath
 from typing import Any
+from uuid import uuid4
 
 from a_share_quant.account.contracts import price
 from a_share_quant.data.normalization import normalize_symbol
@@ -27,8 +29,10 @@ _CSV_FIELDS = (
     "maximum_acceptable_price",
     "reason_codes",
 )
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+_TEMP_FILE_ATTEMPTS = 16
 _WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
-    ("CON", "PRN", "AUX", "NUL")
+    ("CON", "PRN", "AUX", "NUL", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³")
     + tuple(f"COM{number}" for number in range(1, 10))
     + tuple(f"LPT{number}" for number in range(1, 10))
 )
@@ -66,11 +70,12 @@ class ManualBasketExporter:
 
         items = _normalize_recommendations(recommendations)
         target = _prepare_output_path(output_path, suffix=".csv")
-        with target.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
-            writer.writeheader()
-            for item in items:
-                writer.writerow(_csv_row(item))
+        buffer = io.StringIO(newline="")
+        writer = csv.DictWriter(buffer, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        for item in items:
+            writer.writerow(_csv_row(item))
+        _atomic_write(target, buffer.getvalue().encode("utf-8"))
         return target
 
     def export_json(self, recommendations: Iterable[object], output_path: str | Path) -> Path:
@@ -85,10 +90,10 @@ class ManualBasketExporter:
             "notice": "This local artifact is for user review only and cannot submit anything.",
             "items": [item.to_dict() for item in items],
         }
-        target.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        serialized_payload = (
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         )
+        _atomic_write(target, serialized_payload.encode("utf-8"))
         return target
 
 
@@ -220,12 +225,111 @@ def _csv_row(item: ManualBasketItem) -> dict[str, object]:
         "review_status": _REVIEW_STATUS,
         "manual_execution_required": "true",
         "symbol": item.symbol,
-        "name": item.name,
-        "recommendation": item.recommendation,
+        "name": _escape_csv_text(item.name),
+        "recommendation": _escape_csv_text(item.recommendation),
         "quantity": item.quantity,
         "maximum_acceptable_price": f"{item.maximum_acceptable_price:.4f}",
-        "reason_codes": ";".join(item.reason_codes),
+        "reason_codes": _escape_csv_text(";".join(item.reason_codes)),
     }
+
+
+def _escape_csv_text(value: str) -> str:
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+def _atomic_write(target: Path, contents: bytes) -> None:
+    """Best-effort atomic replacement of a revalidated local artifact.
+
+    Path-only platforms cannot fully eliminate an adversarial path-swap race, so
+    this helper revalidates before each filesystem transition and rejects any
+    detected link or junction rather than claiming a handle-bound guarantee.
+    """
+
+    temporary_path: Path | None = None
+    file_descriptor: int | None = None
+    try:
+        _assert_ready_local_output_target(target)
+        temporary_path, file_descriptor = _create_temporary_output_file(target)
+        _assert_safe_temporary_output_file(target, temporary_path)
+        with os.fdopen(file_descriptor, "wb") as handle:
+            file_descriptor = None
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _assert_safe_temporary_output_file(target, temporary_path)
+        os.replace(temporary_path, target)
+        temporary_path = None
+        _assert_ready_local_output_target(target)
+    except BaseException:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            _cleanup_temporary_output_file(temporary_path)
+        raise
+
+
+def _create_temporary_output_file(target: Path) -> tuple[Path, int]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(_TEMP_FILE_ATTEMPTS):
+        temporary_path = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+        _assert_ready_local_output_target(target)
+        _assert_local_output_target(temporary_path)
+        try:
+            file_descriptor = os.open(temporary_path, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            _assert_safe_temporary_output_file(target, temporary_path)
+        except BaseException:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+            _cleanup_temporary_output_file(temporary_path)
+            raise
+        return temporary_path, file_descriptor
+    raise OSError("unable to create a unique temporary basket output file")
+
+
+def _assert_ready_local_output_target(target: Path) -> None:
+    _assert_local_output_target(target)
+    try:
+        target_status = os.lstat(target)
+    except FileNotFoundError:
+        target_status = None
+    except OSError as exc:
+        raise ValueError("output path must be a regular local file") from exc
+    if target_status is not None and not stat.S_ISREG(target_status.st_mode):
+        raise ValueError("output path must be a regular local file")
+    if not target.parent.is_dir():
+        raise ValueError("output path parent is not a directory")
+
+
+def _assert_safe_temporary_output_file(target: Path, temporary_path: Path) -> None:
+    if temporary_path.parent != target.parent:
+        raise ValueError("temporary basket output must use the target parent directory")
+    _assert_ready_local_output_target(target)
+    _assert_local_output_target(temporary_path)
+    try:
+        temporary_status = os.lstat(temporary_path)
+    except OSError as exc:
+        raise ValueError("temporary basket output file is unavailable") from exc
+    if not stat.S_ISREG(temporary_status.st_mode):
+        raise ValueError("temporary basket output must be a regular local file")
+
+
+def _cleanup_temporary_output_file(temporary_path: Path) -> None:
+    try:
+        _assert_local_output_target(temporary_path.parent)
+        os.unlink(temporary_path)
+    except (OSError, ValueError):
+        pass
 
 
 def _prepare_output_path(output_path: str | Path, *, suffix: str) -> Path:
@@ -244,12 +348,8 @@ def _prepare_output_path(output_path: str | Path, *, suffix: str) -> Path:
     _assert_local_output_target(lexical_target)
     target = lexical_target.resolve(strict=False)
     _assert_local_output_target(target)
-    if target.exists() and (target.is_symlink() or target.is_dir()):
-        raise ValueError("output path must be a regular local file")
     target.parent.mkdir(parents=True, exist_ok=True)
-    _assert_local_output_target(target)
-    if not target.parent.is_dir():
-        raise ValueError("output path parent is not a directory")
+    _assert_ready_local_output_target(target)
     return target
 
 

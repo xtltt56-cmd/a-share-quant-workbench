@@ -338,6 +338,42 @@ def test_manual_basket_exports_only_review_fields_for_mapping_and_object_recomme
     assert "order_id" not in json_payload["items"][0]
 
 
+@pytest.mark.parametrize("formula_text", ("=FORMULA()", "@SUM(1,1)", "+1+1", "-1+1"))
+def test_manual_basket_csv_escapes_formula_cells_but_json_preserves_text(
+    tmp_path: Path,
+    formula_text: str,
+) -> None:
+    recommendation = {
+        "symbol": "000001",
+        "name": formula_text,
+        "recommendation": formula_text,
+        "quantity": 100,
+        "price": "10",
+        "reason_codes": [formula_text],
+    }
+    exporter = ManualBasketExporter()
+
+    csv_path = exporter.export_csv([recommendation], tmp_path / "manual-basket.csv")
+    json_path = exporter.export_json([recommendation], tmp_path / "manual-basket.json")
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        csv_row = next(csv.DictReader(handle))
+    json_item = json.loads(json_path.read_text(encoding="utf-8"))["items"][0]
+
+    assert csv_row["name"] == f"'{formula_text}"
+    assert csv_row["recommendation"] == f"'{formula_text}"
+    assert csv_row["reason_codes"] == f"'{formula_text}"
+    assert csv_row["symbol"] == "000001"
+    assert csv_row["quantity"] == "100"
+    assert csv_row["maximum_acceptable_price"] == "10.0000"
+    assert json_item["name"] == formula_text
+    assert json_item["recommendation"] == formula_text
+    assert json_item["reason_codes"] == [formula_text]
+    assert json_item["symbol"] == "000001"
+    assert json_item["quantity"] == 100
+    assert json_item["maximum_acceptable_price"] == "10.0000"
+
+
 @pytest.mark.parametrize(
     ("recommendation", "message"),
     [
@@ -452,6 +488,12 @@ def _create_directory_link_or_skip(link: Path, target: Path) -> None:
         "AUX.csv",
         "COM1.csv",
         "LPT9.csv",
+        "COM¹.csv",
+        "COM².csv",
+        "COM³.csv",
+        "LPT¹.csv",
+        "LPT².csv",
+        "LPT³.csv",
         "NUL.csv. ",
         "COM1 .txt",
     ],
@@ -504,6 +546,34 @@ def test_manual_basket_allows_nonreserved_dos_like_file_name(
 
     assert output_path == (tmp_path / filename).resolve()
     assert output_path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "suffix"),
+    (("export_csv", ".csv"), ("export_json", ".json")),
+)
+def test_manual_basket_atomic_export_preserves_existing_output_when_fsync_fails(
+    tmp_path: Path,
+    method_name: str,
+    suffix: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / f"manual-basket{suffix}"
+    old_contents = b"previously reviewed artifact\n"
+    target.write_bytes(old_contents)
+
+    def fail_fsync(_: int) -> None:
+        raise OSError("simulated persistence failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="simulated persistence failure"):
+        getattr(ManualBasketExporter(), method_name)(
+            [{"symbol": "000001", "quantity": 100, "price": "10"}], target
+        )
+
+    assert target.read_bytes() == old_contents
+    assert {entry.name for entry in tmp_path.iterdir()} == {target.name}
 
 
 def _forbid_output_filesystem_access(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
