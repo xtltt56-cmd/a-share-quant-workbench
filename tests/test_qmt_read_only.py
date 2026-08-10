@@ -440,3 +440,81 @@ def _create_directory_link_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"directory link capability unavailable: {exc}")
+
+
+@pytest.mark.parametrize("method_name", ("export_csv", "export_json"))
+@pytest.mark.parametrize(
+    "device_filename",
+    [
+        "NUL.csv",
+        "CON.csv",
+        "PRN.csv",
+        "AUX.csv",
+        "COM1.csv",
+        "LPT9.csv",
+        "NUL.csv. ",
+        "COM1 .txt",
+    ],
+)
+def test_manual_basket_rejects_reserved_dos_device_names_before_filesystem_access(
+    method_name: str,
+    device_filename: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filesystem_calls = _forbid_output_filesystem_access(monkeypatch)
+
+    with pytest.raises(ValueError, match="reserved DOS device"):
+        getattr(ManualBasketExporter(), method_name)(
+            [{"symbol": "000001", "quantity": 100, "price": "10"}],
+            device_filename,
+        )
+
+    assert filesystem_calls == []
+
+
+@pytest.mark.parametrize("method_name", ("export_csv", "export_json"))
+def test_manual_basket_rejects_ads_file_component_before_filesystem_access(
+    method_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filesystem_calls = _forbid_output_filesystem_access(monkeypatch)
+
+    with pytest.raises(ValueError, match="ADS|colon"):
+        getattr(ManualBasketExporter(), method_name)(
+            [{"symbol": "000001", "quantity": 100, "price": "10"}],
+            "manual.csv:stream",
+        )
+
+    assert filesystem_calls == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "filename"),
+    [("export_csv", "COM10.csv"), ("export_json", "COM10.json")],
+)
+def test_manual_basket_allows_nonreserved_dos_like_file_name(
+    tmp_path: Path,
+    method_name: str,
+    filename: str,
+) -> None:
+    output_path = getattr(ManualBasketExporter(), method_name)(
+        [{"symbol": "000001", "quantity": 100, "price": "10"}],
+        tmp_path / filename,
+    )
+
+    assert output_path == (tmp_path / filename).resolve()
+    assert output_path.is_file()
+
+
+def _forbid_output_filesystem_access(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    filesystem_calls: list[Path] = []
+
+    def forbid_filesystem_access(path: Path, *_: object, **__: object) -> object:
+        filesystem_calls.append(path)
+        raise AssertionError("unsafe basket output must be rejected before filesystem access")
+
+    monkeypatch.setattr(Path, "resolve", forbid_filesystem_access)
+    monkeypatch.setattr(Path, "mkdir", forbid_filesystem_access)
+    monkeypatch.setattr(Path, "open", forbid_filesystem_access)
+    monkeypatch.setattr(Path, "write_text", forbid_filesystem_access)
+    return filesystem_calls

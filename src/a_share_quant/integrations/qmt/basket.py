@@ -9,7 +9,7 @@ import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from a_share_quant.account.contracts import price
@@ -26,6 +26,11 @@ _CSV_FIELDS = (
     "quantity",
     "maximum_acceptable_price",
     "reason_codes",
+)
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    ("CON", "PRN", "AUX", "NUL")
+    + tuple(f"COM{number}" for number in range(1, 10))
+    + tuple(f"LPT{number}" for number in range(1, 10))
 )
 
 
@@ -232,6 +237,7 @@ def _prepare_output_path(output_path: str | Path, *, suffix: str) -> Path:
     candidate = Path(raw_path)
     if not candidate.name or candidate.name in {".", ".."}:
         raise ValueError("output path must name a file")
+    _validate_windows_path_components(raw_path)
     if candidate.suffix.casefold() != suffix:
         raise ValueError(f"output path must end in {suffix}")
     lexical_target = candidate if candidate.is_absolute() else Path.cwd() / candidate
@@ -245,6 +251,23 @@ def _prepare_output_path(output_path: str | Path, *, suffix: str) -> Path:
     if not target.parent.is_dir():
         raise ValueError("output path parent is not a directory")
     return target
+
+
+def _validate_windows_path_components(raw_path: str) -> None:
+    windows_path = PureWindowsPath(raw_path)
+    anchor_components = {
+        component
+        for component in (windows_path.anchor, windows_path.drive, windows_path.root)
+        if component
+    }
+    for component in windows_path.parts:
+        if component in anchor_components:
+            continue
+        if ":" in component:
+            raise ValueError("output path must not contain ADS colon components")
+        normalized_base = component.rstrip(" .").split(".", maxsplit=1)[0].rstrip(" .")
+        if normalized_base.upper() in _WINDOWS_RESERVED_DEVICE_NAMES:
+            raise ValueError("output path contains a reserved DOS device name")
 
 
 def _is_non_local_path_text(value: str) -> bool:
