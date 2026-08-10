@@ -60,10 +60,15 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         with urlopen(f"http://127.0.0.1:{port}/", timeout=3) as response:
             html = response.read().decode("utf-8")
             assert response.headers["Cache-Control"] == "no-store"
-        assert "Paper-only monitoring" in html
-        assert "ACTIVE SOURCE" in html
-        assert "PUBLIC DATA SOURCE" in html
-        assert "Backend Quote Timestamp" in html
+        assert '<html lang="zh-CN">' in html
+        assert "A股量化交易工作台" in html
+        assert "仅供纸面监控" in html
+        assert "当前数据源" in html
+        assert "数据源类别" in html
+        assert "后端行情时间戳" in html
+        assert '<div class="label">ACTIVE SOURCE</div>' not in html
+        assert '<div class="label">PUBLIC DATA SOURCE</div>' not in html
+        assert "<th>Backend Quote Timestamp</th>" not in html
         assert "cache:'no-store'" in html
         assert "BUY" not in html
         with pytest.raises(HTTPError) as get_refresh:

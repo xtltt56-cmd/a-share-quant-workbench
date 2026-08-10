@@ -208,7 +208,7 @@ def run_server(
     service.start_background()
     server = create_server(service=service, advisory_service=advisory_service, port=port)
     try:
-        print(f"A-share Quant Workbench: http://127.0.0.1:{server.server_address[1]}/")
+        print(f"A股量化交易工作台：http://127.0.0.1:{server.server_address[1]}/")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -232,10 +232,10 @@ def main() -> int:
 
 
 _DASHBOARD_HTML = """<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>A-Share Quant Workbench</title>
+<title>A股量化交易工作台</title>
 <style>
 body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#172033;margin:0}
 header{background:#12233f;color:white;padding:20px 28px}
@@ -250,35 +250,43 @@ table{width:100%;border-collapse:collapse;background:white;margin-top:14px}
 th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px;vertical-align:top}th{color:#667085}
 .muted{color:#667085}.safe{color:#147a46}.warn{color:#a15c00}.danger{color:#b42318}
 </style></head>
-<body><header><h1>A-Share Quant Workbench</h1>
-<div>Paper-only monitoring of daily candidates and intraday data. READY is a monitoring status.</div></header>
+<body><header><h1>A股量化交易工作台</h1>
+<div>仅供纸面监控日线候选和盘中数据；“就绪”仅表示监控状态。</div></header>
 <main>
 <div class="grid">
-<div class="card"><div class="label">ACTIVE SOURCE</div><div id="active-source" class="value">Loading</div></div>
-<div class="card"><div class="label">SOURCE CLASS</div><div id="source-class" class="value">PUBLIC DATA SOURCE / PROFESSIONAL DATA SOURCE</div></div>
-<div class="card"><div class="label">DATA QUALITY</div><div id="quality" class="value">Loading</div></div>
-<div class="card"><div class="label">LAST UPDATE</div><div id="last-update" class="value">Loading</div></div>
-<div class="card"><div class="label">DATA AGE</div><div id="data-age" class="value">Loading</div></div>
-<div class="card"><div class="label">LATENCY</div><div id="latency" class="value">Loading</div></div>
-<div class="card"><div class="label">FALLBACK COUNT</div><div id="fallback-count" class="value">Loading</div></div>
-<div class="card"><div class="label">CONTINUOUS UPDATES</div><div id="continuous" class="value">Loading</div></div>
+<div class="card"><div class="label">当前数据源</div><div id="active-source" class="value">加载中</div></div>
+<div class="card"><div class="label">数据源类别</div><div id="source-class" class="value">公开数据源 / 专业数据源</div></div>
+<div class="card"><div class="label">数据质量</div><div id="quality" class="value">加载中</div></div>
+<div class="card"><div class="label">最后更新时间</div><div id="last-update" class="value">加载中</div></div>
+<div class="card"><div class="label">数据年龄</div><div id="data-age" class="value">加载中</div></div>
+<div class="card"><div class="label">延迟</div><div id="latency" class="value">加载中</div></div>
+<div class="card"><div class="label">故障切换次数</div><div id="fallback-count" class="value">加载中</div></div>
+<div class="card"><div class="label">连续更新</div><div id="continuous" class="value">加载中</div></div>
 </div>
-<div class="card" style="margin-top:14px"><button onclick="refresh()">Refresh backend data</button>
-<span class="muted">The browser requests uncached local state. Quote times shown below are supplied by the backend.</span>
+<div class="card" style="margin-top:14px"><button onclick="refresh()">刷新后台数据</button>
+<span class="muted">浏览器只请求未缓存的本地状态；下方行情时间由后台提供。</span>
 <p id="error" class="warn"></p></div>
-<div class="card"><h2>Official Daily Candidates</h2>
-<p class="muted">Daily model scores remain separate from intraday overlays.</p>
-<table><thead><tr><th>Symbol</th><th>Score</th><th>Strategy Version</th><th>Signal Date</th><th>Mode</th></tr></thead>
+<div class="card"><h2>官方日线候选</h2>
+<p class="muted">日线模型分数与盘中观察分开显示。</p>
+<table><thead><tr><th>证券代码</th><th>分数</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
 <tbody id="daily"></tbody></table></div>
-<div class="card"><h2>Intraday Monitor</h2><table><thead><tr>
-<th>Symbol</th><th>Last</th><th>Change %</th><th>State</th><th>Backend Quote Timestamp</th><th>Data Age</th><th>Quality</th>
+<div class="card"><h2>盘中监控</h2><table><thead><tr>
+<th>证券代码</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
 </tr></thead><tbody id="monitor"></tbody></table></div>
 </main>
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
-function display(v,fallback){return v===null||v===undefined||v===''?(fallback===undefined?'Unavailable':fallback):v}
-function seconds(v){return v===null||v===undefined?'Unavailable':String(v)+' s'}
-function millis(v){return v===null||v===undefined?'Unavailable':String(v)+' ms'}
+const labels={
+  'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','Tushare':'Tushare数据','tushare':'Tushare数据',
+  'BaoStock':'BaoStock数据','baostock':'BaoStock数据','Replay / Test Data':'回放/测试数据',
+  'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',
+  'GOOD':'良好','DEGRADED':'降级','STALE':'过期','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
+  'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'非交易时段'
+}
+function zh(v){return labels[String(v)]??v}
+function display(v,fallback){return v===null||v===undefined||v===''?(fallback===undefined?'暂不可用':fallback):zh(v)}
+function seconds(v){return v===null||v===undefined?'暂不可用':String(v)+' 秒'}
+function millis(v){return v===null||v===undefined?'暂不可用':String(v)+' 毫秒'}
 function rows(items,render,empty,colspan){
   return items.length?items.map(render).join(''):'<tr><td colspan="'+esc(colspan)+'" class="muted">'+esc(empty)+'</td></tr>'}
 async function load(){
@@ -292,14 +300,14 @@ async function load(){
     document.getElementById('data-age').textContent=seconds(d.data_age_seconds);
     document.getElementById('latency').textContent=millis(d.latency_ms);
     document.getElementById('fallback-count').textContent=display(d.fallback_count,0);
-    document.getElementById('continuous').textContent=d.continuous_updates?'Yes':'No';
-    document.getElementById('error').textContent=d.last_error?('Status: '+d.last_error):'';
+    document.getElementById('continuous').textContent=d.continuous_updates?'是':'否';
+    document.getElementById('error').textContent=d.last_error?('状态：'+d.last_error):'';
     const daily=(d.official_daily_candidates||[]).slice(0,20);
-    document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.normalized_score)+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>Monitoring only</td></tr>'},'No official daily candidates',5);
+    document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.normalized_score)+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>仅监控</td></tr>'},'暂无官方日线候选',5);
     const monitor=(d.intraday_monitor||[]).slice(0,100);
-    document.getElementById('monitor').innerHTML=rows(monitor,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(x.state)+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(x.data_quality)+'</td></tr>'},'No intraday observations',7);
+    document.getElementById('monitor').innerHTML=rows(monitor,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',7);
   }catch(error){
-    document.getElementById('error').textContent='Status: local dashboard response unavailable';
+    document.getElementById('error').textContent='状态：本地工作台暂不可用';
   }
 }
 async function refresh(){await fetch('/api/refresh',{method:'POST',headers:{'X-Quant-Workbench-Request':'refresh'},cache:'no-store'});await load()}
