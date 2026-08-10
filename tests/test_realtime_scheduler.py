@@ -145,6 +145,53 @@ def test_scheduler_rejects_future_quote_and_opens_stale_boundary() -> None:
     assert scheduler.circuit_breaker.state == "OPEN"
 
 
+def test_scheduler_stores_only_fresh_quotes_from_partially_stale_full_market() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    fresh = _snapshot(now).quotes[0]
+    stale = RealTimeQuote(
+        symbol="000002",
+        market="A",
+        timestamp_exchange=now.replace(hour=9, minute=58),
+        timestamp_received=now,
+        last=9.5,
+        open=9.4,
+        high=9.6,
+        low=9.3,
+        previous_close=9.4,
+        volume=100,
+        amount=950,
+        source="replay",
+    )
+    provider = FakeProvider(
+        MarketSnapshot(
+            timestamp_exchange=now,
+            timestamp_received=now,
+            quotes=(fresh, stale),
+            source="replay",
+        )
+    )
+    store = RealTimeStore()
+    scheduler = RealTimeScheduler(
+        provider=provider,
+        store=store,
+        resolver=resolver,
+        clock=lambda: now,
+        stale_after_seconds=60,
+    )
+
+    tick = scheduler.run_once()
+
+    assert tick.updated is True
+    assert tick.quality_status.value == "DEGRADED"
+    assert tick.quote_count == 1
+    assert [quote.symbol for quote in store.quotes()] == ["000001"]
+    assert scheduler.circuit_breaker.state == "CLOSED"
+
+
 def test_scheduler_retries_provider_with_bounded_backoff() -> None:
     now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
     resolver = SessionResolver(

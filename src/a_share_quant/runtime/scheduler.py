@@ -239,12 +239,13 @@ class RealTimeScheduler:
                     quality_status=DataQualityStatus.STALE,
                     error="DATA_STALE",
                 )
-            self.store.put_quotes(quotes)
             report = self.circuit_breaker.evaluate(
                 quotes,
                 expected_symbols=self.symbols,
                 now=now,
             )
+            usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
+            self.store.put_quotes(usable_quotes)
             bars = (
                 tuple(
                     self._retry(
@@ -260,7 +261,7 @@ class RealTimeScheduler:
                 session=session,
                 requested=True,
                 updated=True,
-                quote_count=len(quotes),
+                quote_count=len(usable_quotes),
                 bar_count=len(bars),
                 quality_status=report.status,
             )

@@ -106,6 +106,12 @@ def build_default_registry(
                 default=120.0,
                 maximum=300.0,
             ),
+            full_market_min_interval_seconds=_environment_positive_float(
+                "A_SHARE_QUANT_AKSHARE_FULL_MARKET_MIN_INTERVAL_SECONDS",
+                default=60.0,
+                minimum=60.0,
+                maximum=900.0,
+            ),
             use_system_proxy=_environment_flag("A_SHARE_QUANT_USE_SYSTEM_PROXY", default=True),
             isolated_transport_authorized=_environment_flag(
                 "A_SHARE_QUANT_ISOLATED_TRANSPORT_APPROVED",
@@ -136,6 +142,7 @@ def _environment_positive_float(
     name: str,
     *,
     default: float,
+    minimum: float = 0.0,
     maximum: float,
 ) -> float:
     """Read a bounded timeout without accepting an unbounded wait."""
@@ -147,8 +154,9 @@ def _environment_positive_float(
         parsed = float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a positive number") from exc
-    if not isfinite(parsed) or not 0 < parsed <= maximum:
-        raise ValueError(f"{name} must be greater than zero and at most {maximum:g}")
+    if not isfinite(parsed) or not minimum <= parsed <= maximum or parsed <= 0:
+        lower_bound = f"at least {minimum:g}" if minimum > 0 else "greater than zero"
+        raise ValueError(f"{name} must be {lower_bound} and at most {maximum:g}")
     return parsed
 
 

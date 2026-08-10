@@ -35,28 +35,28 @@ def assess_quote_quality(
         raise ValueError("stale_after_seconds must be positive")
     expected = tuple(dict.fromkeys(normalize_symbol(symbol) for symbol in expected_symbols))
     checked: list[RealTimeQuote] = []
-    stale = False
     quarantined: list[str] = []
     for quote in quotes:
         age = quote.data_age_seconds(now=reference)
         if age > stale_after_seconds or quote.is_stale:
-            stale = True
+            quarantined.append(quote.symbol)
             checked.append(
                 replace(quote, is_stale=True, quality_flag=DataQualityStatus.STALE)
             )
         else:
             checked.append(quote)
-    received_symbols = {quote.symbol for quote in checked if not quote.is_stale}
+    fresh_quotes = tuple(quote for quote in checked if not quote.is_stale)
+    received_symbols = {quote.symbol for quote in fresh_quotes}
     missing = tuple(symbol for symbol in expected if symbol not in received_symbols)
     if not checked:
         status = DataQualityStatus.FAILED
         reason = "no quotes received"
-    elif stale:
+    elif not fresh_quotes:
         status = DataQualityStatus.STALE
-        reason = "one or more quotes exceeded the configured freshness threshold"
+        reason = "all received quotes exceeded the configured freshness threshold"
     elif missing or quarantined:
         status = DataQualityStatus.DEGRADED
-        reason = "expected symbols or validated fields are missing"
+        reason = "expected symbols are missing or stale quotes were quarantined"
     else:
         status = DataQualityStatus.GOOD
         reason = "all received quotes passed freshness checks"

@@ -23,12 +23,20 @@ _QUOTE_ALIASES: dict[str, tuple[str, ...]] = {
     "previous_close": ("previous_close", "昨收", "pre_close", "prev_close"),
     "volume": ("volume", "成交量", "vol", "volume_total"),
     "amount": ("amount", "成交额", "amount_total"),
-    "bid1": ("bid1", "买一", "bid_price1"),
-    "ask1": ("ask1", "卖一", "ask_price1"),
+    "bid1": ("bid1", "买一", "买入", "bid_price1"),
+    "ask1": ("ask1", "卖一", "卖出", "ask_price1"),
     "change": ("change", "涨跌额", "change_amount"),
     "change_pct": ("change_pct", "涨跌幅", "pct_chg", "change_percent"),
     "turnover_rate": ("turnover_rate", "换手率", "turnover"),
-    "timestamp": ("timestamp", "时间", "trade_time", "datetime", "date"),
+    "timestamp": (
+        "timestamp",
+        "时间",
+        "时间戳",
+        "时点",
+        "trade_time",
+        "datetime",
+        "date",
+    ),
 }
 
 _BAR_ALIASES = {
@@ -75,6 +83,10 @@ def _number(
 def _timestamp(value: Any, *, received_at: datetime) -> tuple[datetime, bool]:
     if value is None or (isinstance(value, str) and not value.strip()):
         return received_at, False
+    text = str(value).strip()
+    if text.count(":") in {1, 2} and "-" not in text and "/" not in text:
+        local_date = received_at.astimezone(_LOCAL_TZ).date().isoformat()
+        value = f"{local_date} {text}"
     parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
         return received_at, False

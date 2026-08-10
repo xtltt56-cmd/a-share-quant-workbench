@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
@@ -36,8 +37,12 @@ class AKShareRealTimeProvider:
         market_snapshot_timeout_seconds: float = 120.0,
         retry_count: int = 3,
         delay_seconds: float = 0.5,
+        full_market_min_interval_seconds: float = 60.0,
+        endpoint_cooldown_seconds: float = 300.0,
         use_system_proxy: bool = True,
         isolated_transport_authorized: bool = False,
+        monotonic_clock: Callable[[], float] | None = None,
+        wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
         self.market_snapshot_timeout_seconds = max(
@@ -46,21 +51,28 @@ class AKShareRealTimeProvider:
         )
         self.retry_count = max(0, int(retry_count))
         self.delay_seconds = max(0.0, float(delay_seconds))
+        self.full_market_min_interval_seconds = float(full_market_min_interval_seconds)
+        if self.full_market_min_interval_seconds < 60:
+            raise ValueError("full_market_min_interval_seconds must be at least 60")
+        self.endpoint_cooldown_seconds = float(endpoint_cooldown_seconds)
+        if self.endpoint_cooldown_seconds < 60:
+            raise ValueError("endpoint_cooldown_seconds must be at least 60")
         self.transport_policy = TransportPolicy(
             use_system_proxy=use_system_proxy,
             isolated_transport_authorized=isolated_transport_authorized,
         )
         self._module: Any | None = None
         self._last_call_at: float | None = None
-        self.active_endpoint = "eastmoney"
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
+        self._last_snapshot_started_at: float | None = None
+        self._last_snapshot: MarketSnapshot | None = None
+        self._endpoint_retry_after: dict[str, float] = {}
+        self.active_endpoint: str | None = None
 
     @property
     def active_source_name(self) -> str:
-        return (
-            "AKShare / Tencent"
-            if self.active_endpoint == "tencent"
-            else "AKShare / Eastmoney"
-        )
+        return _SOURCE_NAMES.get(self.active_endpoint or "sina", "AKShare")
 
     def _client(self) -> Any:
         if self._module is None:
@@ -113,10 +125,12 @@ class AKShareRealTimeProvider:
 
     def _wait_for_rate_limit(self) -> None:
         if self._last_call_at is not None:
-            remaining = self.delay_seconds - (time.monotonic() - self._last_call_at)
+            remaining = self.delay_seconds - (
+                self._monotonic_clock() - self._last_call_at
+            )
             if remaining > 0:
                 time.sleep(remaining)
-        self._last_call_at = time.monotonic()
+        self._last_call_at = self._monotonic_clock()
 
     def metadata(self) -> ProviderMetadata:
         client = self._client()
@@ -135,7 +149,7 @@ class AKShareRealTimeProvider:
         client = self._client()
         if not any(
             getattr(client, endpoint, None) is not None
-            for endpoint in ("stock_zh_a_spot_em", "stock_zh_a_spot_tx")
+            for endpoint, _ in _SNAPSHOT_ENDPOINTS
         ):
             return ProviderHealth(
                 provider=self.name,
@@ -154,23 +168,29 @@ class AKShareRealTimeProvider:
         )
 
     def get_market_snapshot(self) -> MarketSnapshot:
-        received = datetime.now(timezone.utc)
-        quotes = ()
-        request_failed = False
-        for endpoint, endpoint_label in (
-            ("stock_zh_a_spot_em", "eastmoney"),
-            ("stock_zh_a_spot_tx", "tencent"),
+        started = self._monotonic_clock()
+        if (
+            self._last_snapshot is not None
+            and self._last_snapshot_started_at is not None
+            and started - self._last_snapshot_started_at
+            < self.full_market_min_interval_seconds
         ):
+            return self._last_snapshot
+
+        request_failed = False
+        for endpoint, endpoint_label in self._available_snapshot_endpoints(started):
             if getattr(self._client(), endpoint, None) is None:
                 continue
             try:
                 raw = self._call(
                     endpoint,
                     timeout_seconds=self.market_snapshot_timeout_seconds,
+                    retry_count=0,
                     retry_on_timeout=False,
                 )
                 if endpoint_label == "tencent":
                     raw = _tencent_quote_frame(raw)
+                received = self._wall_clock()
                 quotes = normalize_realtime_quotes(
                     raw,
                     source=self.name,
@@ -178,28 +198,52 @@ class AKShareRealTimeProvider:
                 )
             except ProviderRequestError:
                 request_failed = True
+                self._endpoint_retry_after[endpoint_label] = (
+                    started + self.endpoint_cooldown_seconds
+                )
                 continue
             if quotes:
                 self.active_endpoint = endpoint_label
-                break
-        if not quotes:
-            if request_failed:
-                raise ProviderRequestError(
-                    "AKShare real-time request failed: all snapshot endpoints"
+                self._endpoint_retry_after.pop(endpoint_label, None)
+                quality = (
+                    DataQualityStatus.GOOD
+                    if all(
+                        quote.quality_flag is DataQualityStatus.GOOD
+                        for quote in quotes
+                    )
+                    else DataQualityStatus.DEGRADED
                 )
-            raise ProviderRequestError("AKShare snapshot returned no valid quotes")
-        quality = (
-            DataQualityStatus.GOOD
-            if all(quote.quality_flag is DataQualityStatus.GOOD for quote in quotes)
-            else DataQualityStatus.DEGRADED
-        )
-        return MarketSnapshot(
-            timestamp_exchange=max(quote.timestamp_exchange for quote in quotes),
-            timestamp_received=received,
-            quotes=quotes,
-            source=self.name,
-            quality_flag=quality,
-            is_stale=False,
+                snapshot = MarketSnapshot(
+                    timestamp_exchange=max(
+                        quote.timestamp_exchange for quote in quotes
+                    ),
+                    timestamp_received=received,
+                    quotes=quotes,
+                    source=self.name,
+                    quality_flag=quality,
+                    is_stale=False,
+                )
+                self._last_snapshot_started_at = started
+                self._last_snapshot = snapshot
+                return snapshot
+            request_failed = True
+            self._endpoint_retry_after[endpoint_label] = (
+                started + self.endpoint_cooldown_seconds
+            )
+        if request_failed:
+            raise ProviderRequestError(
+                "AKShare real-time request failed: all snapshot endpoints"
+            )
+        raise ProviderRequestError("AKShare snapshot endpoints are cooling down")
+
+    def _available_snapshot_endpoints(
+        self,
+        now: float,
+    ) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (endpoint, label)
+            for endpoint, label in _SNAPSHOT_ENDPOINTS
+            if self._endpoint_retry_after.get(label, 0.0) <= now
         )
 
     def get_quotes(self, symbols: list[str] | tuple[str, ...]) -> tuple:
@@ -274,6 +318,16 @@ class AKShareRealTimeProvider:
 
 
 _MINUTE_ENDPOINTS = ("stock_zh_a_hist_min_em", "stock_zh_a_minute")
+_SNAPSHOT_ENDPOINTS = (
+    ("stock_zh_a_spot", "sina"),
+    ("stock_zh_a_spot_em", "eastmoney"),
+    ("stock_zh_a_spot_tx", "tencent"),
+)
+_SOURCE_NAMES = {
+    "sina": "AKShare / Sina",
+    "eastmoney": "AKShare / Eastmoney",
+    "tencent": "AKShare / Tencent",
+}
 
 
 def _single_stock_quote_frame(raw: Any, *, symbol: str) -> pd.DataFrame:
@@ -308,7 +362,7 @@ def _tencent_quote_frame(raw: Any) -> pd.DataFrame:
 
     if not isinstance(raw, pd.DataFrame):
         raise ProviderRequestError("AKShare Tencent snapshot schema unavailable")
-    return raw.rename(
+    frame = raw.rename(
         columns={
             "code": "symbol",
             "zxj": "last",
@@ -317,4 +371,7 @@ def _tencent_quote_frame(raw: Any) -> pd.DataFrame:
             "turnover": "amount",
             "hsl": "turnover_rate",
         }
-    )
+    ).copy()
+    frame["volume"] = pd.to_numeric(frame.get("volume"), errors="coerce") * 100
+    frame["amount"] = pd.to_numeric(frame.get("amount"), errors="coerce") * 10_000
+    return frame

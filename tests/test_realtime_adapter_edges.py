@@ -148,6 +148,7 @@ def test_akshare_full_market_snapshot_uses_a_dedicated_pagination_timeout(
         retry_count=0,
         delay_seconds=0,
     )
+    provider._module = types.SimpleNamespace(stock_zh_a_spot_em=lambda: pd.DataFrame())
     calls: list[dict[str, object]] = []
 
     def fake_call(function_name: str, **kwargs: object) -> pd.DataFrame:
@@ -178,6 +179,7 @@ def test_akshare_full_market_snapshot_uses_a_dedicated_pagination_timeout(
         {
             "function_name": "stock_zh_a_spot_em",
             "timeout_seconds": 90.0,
+            "retry_count": 0,
             "retry_on_timeout": False,
         }
     ]

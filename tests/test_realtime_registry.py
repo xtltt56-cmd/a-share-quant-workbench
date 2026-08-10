@@ -203,6 +203,28 @@ def test_default_registry_passes_bounded_full_market_timeout_from_environment(
     assert provider.market_snapshot_timeout_seconds == 90.0
 
 
+def test_default_registry_enforces_low_frequency_full_market_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("A_SHARE_QUANT_AKSHARE_FULL_MARKET_MIN_INTERVAL_SECONDS", "90")
+
+    registry = build_default_registry()
+    provider = dict(registry._factories)["akshare"]()
+
+    assert provider.full_market_min_interval_seconds == 90.0
+
+
+def test_default_registry_rejects_full_market_interval_below_one_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("A_SHARE_QUANT_AKSHARE_FULL_MARKET_MIN_INTERVAL_SECONDS", "59")
+
+    registry = build_default_registry()
+
+    with pytest.raises(ValueError, match="FULL_MARKET_MIN_INTERVAL"):
+        dict(registry._factories)["akshare"]()
+
+
 def test_default_registry_rejects_invalid_full_market_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
-from a_share_quant.contracts.data import ProviderConfigurationError
+from a_share_quant.contracts.data import ProviderConfigurationError, ProviderRequestError
 from a_share_quant.data.realtime.akshare import AKShareRealTimeProvider
 from a_share_quant.data.realtime.rqdata import RQDataRealTimeProvider
 from a_share_quant.data.realtime.tushare import TushareRealTimeProvider
@@ -118,7 +118,7 @@ def test_akshare_realtime_provider_detects_optional_index_and_minute_endpoints(
     assert bars[0].is_final is True
 
 
-def test_akshare_realtime_provider_retries_without_leaking_exception_payload(
+def test_akshare_full_market_endpoint_is_not_retried_inside_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attempts = 0
@@ -126,9 +126,7 @@ def test_akshare_realtime_provider_retries_without_leaking_exception_payload(
     def stock_zh_a_spot_em() -> pd.DataFrame:
         nonlocal attempts
         attempts += 1
-        if attempts < 3:
-            raise ConnectionError("secret=must-not-appear")
-        return _spot_frame().iloc[[0]]
+        raise ConnectionError("secret=must-not-appear")
 
     monkeypatch.setitem(
         sys.modules,
@@ -136,13 +134,134 @@ def test_akshare_realtime_provider_retries_without_leaking_exception_payload(
         types.SimpleNamespace(stock_zh_a_spot_em=stock_zh_a_spot_em),
     )
 
-    snapshot = AKShareRealTimeProvider(
+    provider = AKShareRealTimeProvider(
         retry_count=2,
         delay_seconds=0,
-    ).get_market_snapshot()
+    )
 
-    assert attempts == 3
-    assert snapshot.source == "akshare"
+    with pytest.raises(ProviderRequestError, match="all snapshot endpoints"):
+        provider.get_market_snapshot()
+
+    assert attempts == 1
+
+
+def test_akshare_prefers_sina_and_throttles_full_market_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monotonic = [100.0]
+
+    def stock_zh_a_spot() -> pd.DataFrame:
+        calls.append("sina")
+        return pd.DataFrame(
+            [
+                {
+                    "代码": "sz000001",
+                    "名称": "平安银行",
+                    "最新价": 10.5 + len(calls) / 10,
+                    "涨跌额": 0.3,
+                    "涨跌幅": 2.94,
+                    "买入": 10.49,
+                    "卖出": 10.51,
+                    "昨收": 10.2,
+                    "今开": 10.0,
+                    "最高": 10.8,
+                    "最低": 9.9,
+                    "成交量": 100_000,
+                    "成交额": 1_050_000,
+                    "时间戳": "10:00:00",
+                }
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(stock_zh_a_spot=stock_zh_a_spot),
+    )
+    provider = AKShareRealTimeProvider(
+        retry_count=0,
+        delay_seconds=0,
+        monotonic_clock=lambda: monotonic[0],
+        wall_clock=lambda: datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc),
+        full_market_min_interval_seconds=60,
+    )
+
+    first = provider.get_market_snapshot()
+    monotonic[0] = 159.9
+    throttled = provider.get_market_snapshot()
+    monotonic[0] = 160.0
+    refreshed = provider.get_market_snapshot()
+
+    assert calls == ["sina", "sina"]
+    assert throttled is first
+    assert refreshed is not first
+    assert first.quotes[0].quality_flag.value == "GOOD"
+    assert first.quotes[0].timestamp_exchange == datetime(
+        2026, 8, 10, 2, 0, tzinfo=timezone.utc
+    )
+    assert first.quotes[0].bid1 == pytest.approx(10.49)
+    assert first.quotes[0].ask1 == pytest.approx(10.51)
+    assert provider.active_endpoint == "sina"
+    assert provider.active_source_name == "AKShare / Sina"
+
+
+def test_akshare_endpoint_circuit_skips_failed_sources_until_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monotonic = [0.0]
+
+    def stock_zh_a_spot() -> pd.DataFrame:
+        calls.append("sina")
+        raise ConnectionError("sina unavailable")
+
+    def stock_zh_a_spot_em() -> pd.DataFrame:
+        calls.append("eastmoney")
+        raise ConnectionError("eastmoney unavailable")
+
+    def stock_zh_a_spot_tx() -> pd.DataFrame:
+        calls.append("tencent")
+        return pd.DataFrame(
+            [
+                {
+                    "code": "sz000001",
+                    "name": "平安银行",
+                    "zxj": "10.50",
+                    "zd": "0.30",
+                    "zdf": "2.94",
+                    "volume": "1000",
+                    "turnover": "105",
+                    "hsl": "1.2",
+                }
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zh_a_spot=stock_zh_a_spot,
+            stock_zh_a_spot_em=stock_zh_a_spot_em,
+            stock_zh_a_spot_tx=stock_zh_a_spot_tx,
+        ),
+    )
+    provider = AKShareRealTimeProvider(
+        retry_count=3,
+        delay_seconds=0,
+        monotonic_clock=lambda: monotonic[0],
+        full_market_min_interval_seconds=60,
+        endpoint_cooldown_seconds=300,
+    )
+
+    first = provider.get_market_snapshot()
+    monotonic[0] = 60.0
+    second = provider.get_market_snapshot()
+
+    assert calls == ["sina", "eastmoney", "tencent", "tencent"]
+    assert first.quality_flag.value == "DEGRADED"
+    assert second.quality_flag.value == "DEGRADED"
+    assert provider.active_source_name == "AKShare / Tencent"
 
 
 def test_akshare_realtime_provider_falls_back_to_tencent_full_market_snapshot(
@@ -165,7 +284,7 @@ def test_akshare_realtime_provider_falls_back_to_tencent_full_market_snapshot(
                     "zd": "0.30",
                     "zdf": "2.94",
                     "volume": "1000",
-                    "turnover": "10500",
+                    "turnover": "105",
                     "hsl": "1.2",
                 },
                 {
@@ -175,7 +294,7 @@ def test_akshare_realtime_provider_falls_back_to_tencent_full_market_snapshot(
                     "zd": "-0.10",
                     "zdf": "-1.08",
                     "volume": "900",
-                    "turnover": "8280",
+                    "turnover": "82.8",
                     "hsl": "0.8",
                 },
             ]
@@ -197,8 +316,13 @@ def test_akshare_realtime_provider_falls_back_to_tencent_full_market_snapshot(
     assert snapshot.quotes[0].symbol == "000001"
     assert snapshot.quotes[0].last == pytest.approx(10.5)
     assert snapshot.quotes[0].change_pct == pytest.approx(2.94)
+    assert snapshot.quotes[0].volume == pytest.approx(100_000)
+    assert snapshot.quotes[0].amount == pytest.approx(1_050_000)
+    assert snapshot.quotes[0].amount / snapshot.quotes[0].volume == pytest.approx(10.5)
+    assert snapshot.quotes[0].quality_flag.value == "DEGRADED"
     assert snapshot.quotes[1].change == pytest.approx(-0.1)
     assert snapshot.quotes[1].change_pct == pytest.approx(-1.08)
+    assert snapshot.quality_flag.value == "DEGRADED"
     assert provider.active_endpoint == "tencent"
 
 

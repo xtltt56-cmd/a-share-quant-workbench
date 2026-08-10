@@ -69,6 +69,20 @@ def test_quality_report_marks_missing_symbols_as_degraded() -> None:
     assert report.can_generate_ready is False
 
 
+def test_full_market_quality_quarantines_a_stale_subset_without_opening_breaker() -> None:
+    breaker = RealtimeCircuitBreaker(stale_after_seconds=60)
+
+    report = breaker.evaluate(
+        [_quote("000001"), _quote("000002", age_seconds=61)],
+        now=NOW,
+    )
+
+    assert report.status.value == "DEGRADED"
+    assert report.is_usable is True
+    assert report.quarantined_symbols == ("000002",)
+    assert breaker.state == "CLOSED"
+
+
 def test_stale_circuit_breaker_blocks_updates_until_good_data_returns() -> None:
     breaker = RealtimeCircuitBreaker(stale_after_seconds=60)
 
