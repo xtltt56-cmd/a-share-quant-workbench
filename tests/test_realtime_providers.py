@@ -145,6 +145,63 @@ def test_akshare_realtime_provider_retries_without_leaking_exception_payload(
     assert snapshot.source == "akshare"
 
 
+def test_akshare_realtime_provider_falls_back_to_tencent_full_market_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def stock_zh_a_spot_em() -> pd.DataFrame:
+        calls.append("eastmoney")
+        raise ConnectionError("proxy rejected endpoint")
+
+    def stock_zh_a_spot_tx() -> pd.DataFrame:
+        calls.append("tencent")
+        return pd.DataFrame(
+            [
+                {
+                    "code": "sz000001",
+                    "name": "平安银行",
+                    "zxj": "10.50",
+                    "zd": "0.30",
+                    "zdf": "2.94",
+                    "volume": "1000",
+                    "turnover": "10500",
+                    "hsl": "1.2",
+                },
+                {
+                    "code": "sh600000",
+                    "name": "浦发银行",
+                    "zxj": "9.20",
+                    "zd": "-0.10",
+                    "zdf": "-1.08",
+                    "volume": "900",
+                    "turnover": "8280",
+                    "hsl": "0.8",
+                },
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zh_a_spot_em=stock_zh_a_spot_em,
+            stock_zh_a_spot_tx=stock_zh_a_spot_tx,
+        ),
+    )
+
+    provider = AKShareRealTimeProvider(retry_count=0, delay_seconds=0)
+    snapshot = provider.get_market_snapshot()
+
+    assert calls == ["eastmoney", "tencent"]
+    assert snapshot.quotes[0].symbol == "000001"
+    assert snapshot.quotes[0].last == pytest.approx(10.5)
+    assert snapshot.quotes[0].change_pct == pytest.approx(2.94)
+    assert snapshot.quotes[1].change == pytest.approx(-0.1)
+    assert snapshot.quotes[1].change_pct == pytest.approx(-1.08)
+    assert provider.active_endpoint == "tencent"
+
+
 def test_akshare_realtime_provider_uses_official_single_stock_quote_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

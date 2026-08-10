@@ -157,6 +157,27 @@ def test_workbench_requires_two_live_updates_before_exposing_good_quality() -> N
     assert second["intraday_monitor"][0]["official_model_signal"] is False
 
 
+def test_workbench_reports_the_actual_akshare_snapshot_endpoint() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    provider = _live_provider(now)
+    provider.active_source_name = "AKShare / Tencent"
+    service = WorkbenchService(
+        provider=provider,
+        allow_network=True,
+        resolver=resolver,
+        clock=lambda: now,
+    )
+
+    state = service.refresh().to_dict()
+
+    assert state["active_provider"] == "akshare"
+    assert state["active_source"] == "AKShare / Tencent"
+
+
 def test_workbench_never_labels_a_non_requested_session_as_real_market() -> None:
     now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
     resolver = SessionResolver(

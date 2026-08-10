@@ -52,6 +52,15 @@ class AKShareRealTimeProvider:
         )
         self._module: Any | None = None
         self._last_call_at: float | None = None
+        self.active_endpoint = "eastmoney"
+
+    @property
+    def active_source_name(self) -> str:
+        return (
+            "AKShare / Tencent"
+            if self.active_endpoint == "tencent"
+            else "AKShare / Eastmoney"
+        )
 
     def _client(self) -> Any:
         if self._module is None:
@@ -124,7 +133,10 @@ class AKShareRealTimeProvider:
 
     def health_check(self) -> ProviderHealth:
         client = self._client()
-        if getattr(client, "stock_zh_a_spot_em", None) is None:
+        if not any(
+            getattr(client, endpoint, None) is not None
+            for endpoint in ("stock_zh_a_spot_em", "stock_zh_a_spot_tx")
+        ):
             return ProviderHealth(
                 provider=self.name,
                 connected=False,
@@ -143,13 +155,38 @@ class AKShareRealTimeProvider:
 
     def get_market_snapshot(self) -> MarketSnapshot:
         received = datetime.now(timezone.utc)
-        raw = self._call(
-            "stock_zh_a_spot_em",
-            timeout_seconds=self.market_snapshot_timeout_seconds,
-            retry_on_timeout=False,
-        )
-        quotes = normalize_realtime_quotes(raw, source=self.name, received_at=received)
+        quotes = ()
+        request_failed = False
+        for endpoint, endpoint_label in (
+            ("stock_zh_a_spot_em", "eastmoney"),
+            ("stock_zh_a_spot_tx", "tencent"),
+        ):
+            if getattr(self._client(), endpoint, None) is None:
+                continue
+            try:
+                raw = self._call(
+                    endpoint,
+                    timeout_seconds=self.market_snapshot_timeout_seconds,
+                    retry_on_timeout=False,
+                )
+                if endpoint_label == "tencent":
+                    raw = _tencent_quote_frame(raw)
+                quotes = normalize_realtime_quotes(
+                    raw,
+                    source=self.name,
+                    received_at=received,
+                )
+            except ProviderRequestError:
+                request_failed = True
+                continue
+            if quotes:
+                self.active_endpoint = endpoint_label
+                break
         if not quotes:
+            if request_failed:
+                raise ProviderRequestError(
+                    "AKShare real-time request failed: all snapshot endpoints"
+                )
             raise ProviderRequestError("AKShare snapshot returned no valid quotes")
         quality = (
             DataQualityStatus.GOOD
@@ -263,4 +300,21 @@ def _single_stock_quote_frame(raw: Any, *, symbol: str) -> pd.DataFrame:
                 "turnover_rate": values.get("换手"),
             }
         ]
+    )
+
+
+def _tencent_quote_frame(raw: Any) -> pd.DataFrame:
+    """Map AKShare's Tencent snapshot columns to the canonical quote aliases."""
+
+    if not isinstance(raw, pd.DataFrame):
+        raise ProviderRequestError("AKShare Tencent snapshot schema unavailable")
+    return raw.rename(
+        columns={
+            "code": "symbol",
+            "zxj": "last",
+            "zd": "change",
+            "zdf": "change_pct",
+            "turnover": "amount",
+            "hsl": "turnover_rate",
+        }
     )

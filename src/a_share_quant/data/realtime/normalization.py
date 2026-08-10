@@ -51,7 +51,12 @@ def _value(row: pd.Series, aliases: Iterable[str]) -> Any:
     return row[column] if column is not None else None
 
 
-def _number(value: Any, *, positive: bool = False) -> float | None:
+def _number(
+    value: Any,
+    *,
+    positive: bool = False,
+    allow_negative: bool = False,
+) -> float | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
@@ -62,7 +67,7 @@ def _number(value: Any, *, positive: bool = False) -> float | None:
         return None
     if positive and parsed <= 0:
         return None
-    if not positive and parsed < 0:
+    if not positive and not allow_negative and parsed < 0:
         return None
     return parsed
 
@@ -132,8 +137,12 @@ def normalize_realtime_quotes(
                 amount=_number(_value(row, _QUOTE_ALIASES["amount"])),
                 bid1=_number(_value(row, _QUOTE_ALIASES["bid1"]), positive=True),
                 ask1=_number(_value(row, _QUOTE_ALIASES["ask1"]), positive=True),
-                change=_number(_value(row, _QUOTE_ALIASES["change"])),
-                change_pct=_number(_value(row, _QUOTE_ALIASES["change_pct"])),
+                change=_number(
+                    _value(row, _QUOTE_ALIASES["change"]), allow_negative=True
+                ),
+                change_pct=_number(
+                    _value(row, _QUOTE_ALIASES["change_pct"]), allow_negative=True
+                ),
                 turnover_rate=_number(_value(row, _QUOTE_ALIASES["turnover_rate"])),
                 source=source,
                 quality_flag=quality,

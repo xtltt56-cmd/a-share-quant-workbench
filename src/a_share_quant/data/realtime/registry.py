@@ -165,6 +165,11 @@ class FailoverRealTimeProvider:
         return self._providers[self._active_index].name
 
     @property
+    def active_source_name(self) -> str:
+        provider = self._providers[self._active_index]
+        return str(getattr(provider, "active_source_name", provider.name))
+
+    @property
     def switch_events(self) -> tuple[ProviderSwitchEvent, ...]:
         return tuple(self._switch_events)
 

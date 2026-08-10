@@ -138,12 +138,13 @@ class WorkbenchService:
                     "message": "offline-testable provider boundary",
                 }
             ]
+        initial_provider = getattr(
+            self._provider,
+            "active_provider_name",
+            getattr(self._provider, "name", None),
+        )
         self._set_source_metadata(
-            getattr(
-                self._provider,
-                "active_provider_name",
-                getattr(self._provider, "name", None),
-            )
+            getattr(self._provider, "active_source_name", initial_provider)
         )
         self.scheduler = (
             RealTimeScheduler(
@@ -229,7 +230,9 @@ class WorkbenchService:
             getattr(self._provider, "name", None),
         )
         self.state.active_provider = active_provider
-        self._set_source_metadata(active_provider)
+        self._set_source_metadata(
+            getattr(self._provider, "active_source_name", active_provider)
+        )
         self.state.last_error = tick.error or (tick.skip_reason or None)
         self._record_new_fallbacks(observed_at=tick.timestamp)
 
@@ -456,6 +459,8 @@ def _source_metadata(provider_name: str | None) -> tuple[str, str]:
     normalized = (provider_name or "").casefold()
     if normalized == "akshare":
         return "AKShare / Eastmoney", "PUBLIC DATA SOURCE"
+    if normalized.startswith("akshare"):
+        return provider_name or "AKShare / Eastmoney", "PUBLIC DATA SOURCE"
     if normalized == "rqdata":
         return "RQData", "PROFESSIONAL DATA SOURCE"
     if normalized == "tushare":
