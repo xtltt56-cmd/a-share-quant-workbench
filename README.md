@@ -326,7 +326,7 @@ docs/                      选型、设计、计划和威胁模型
 scripts/                   操作入口，不承载策略逻辑
 src/a_share_quant/
   contracts/               DataProvider、Signal、Backtest、Execution 契约
-  data/providers/          AKShare/Tushare/RQData 适配器
+  data/providers/          AKShare/BaoStock/Tushare/RQData 适配器
   storage/                 DuckDB + Parquet Data Lake
   features/                未来规则因子和 Qlib bridge
   backtest/                VectorBT/RQAlpha adapters
@@ -352,3 +352,9 @@ reports/                   生成报告，默认被 Git 忽略
 不复制 Qlib、RQAlpha、VectorBT、QuantStats、vn.py 或 RiceQuant Skills 源码；只使用公开 API、配置、DataHandler、Mod 和 Adapter。许可证/用途/可替换出口维护在 [DEPENDENCIES.md](DEPENDENCIES.md) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 RiceQuant 的 `idea-generation` 和 `report-renderer` Skill 已安装到本机用户 Skill 目录；RQData/Bash 依赖的适配边界见 [docs/RICEQUANT_SKILLS_ADAPTER.md](docs/RICEQUANT_SKILLS_ADAPTER.md)。
+
+## V1 验收状态（2026-08-10）
+
+本地人工投顾链路、简体中文工作台、免费 BaoStock 历史数据适配器和 QMT 只读边界已完成。详细证据见 [A 股人工投顾 V1 验收报告](reports/a_share_advisory_v1_acceptance.md)。
+
+系统仍严格保持纸面/人工执行：Tushare 接口权限、财富证券官方 QMT 权限、真实市场 EOD/PIT 数据和 60–120 个交易日纸面验证属于外部闸门，未满足前不会宣称预测准确或开放自动交易。
