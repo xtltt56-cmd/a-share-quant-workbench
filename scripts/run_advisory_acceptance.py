@@ -42,6 +42,7 @@ def run_acceptance_fixture(root: Path) -> dict[str, Any]:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     ledger_path = root / "account-ledger.jsonl"
+    _reset_fixture_artifacts(ledger_path)
     prediction_store = PredictionLedgerStore()
     service = AdvisoryWorkbenchService(
         initial_cash=Decimal("100000"),
@@ -145,7 +146,33 @@ def main() -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(encoded + "\n", encoding="utf-8")
     print(encoded)
-    return 0
+    return 0 if _acceptance_passed(result) else 1
+
+
+def _acceptance_passed(result: dict[str, Any]) -> bool:
+    """Return whether every deterministic acceptance gate has passed."""
+
+    return (
+        result.get("data_quality_failure", {}).get("state") == "INSUFFICIENT_DATA"
+        and result.get("manual_execution_required") is True
+        and result.get("manual_buy_recorded") is True
+        and result.get("guidance_state") == "BUY_CANDIDATE"
+        and result.get("prediction_outcomes") == 1
+        and result.get("qmt_reconciliation") == "RECONCILED"
+        and result.get("qmt_order_submission") == "REJECTED"
+    )
+
+
+def _reset_fixture_artifacts(ledger_path: Path) -> None:
+    """Reset only the two managed fixture files, preserving the caller's folder."""
+
+    for path in (
+        ledger_path,
+        ledger_path.with_name(f"{ledger_path.name}.initialization.json"),
+    ):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError("acceptance fixture artifact is not a regular file")
+        path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

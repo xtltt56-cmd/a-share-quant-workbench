@@ -277,11 +277,12 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 const labels={
-  'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','Tushare':'Tushare数据','tushare':'Tushare数据',
+  'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','AKShare / Eastmoney':'AKShare / 东方财富','AKShare / Tencent':'AKShare / 腾讯','Tushare':'Tushare数据','tushare':'Tushare数据',
   'BaoStock':'BaoStock数据','baostock':'BaoStock数据','Replay / Test Data':'回放/测试数据',
   'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',
-  'GOOD':'良好','DEGRADED':'降级','STALE':'过期','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
+  'GOOD':'良好','DEGRADED':'降级','STALE':'过期','FAILED':'失败','UNKNOWN':'未知','OFFLINE':'离线','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
   'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'非交易时段'
+  ,'ProviderRequestError':'数据源请求失败','ProviderConfigurationError':'数据源未配置','ProviderError':'数据源错误'
 }
 function zh(v){return labels[String(v)]??v}
 function display(v,fallback){return v===null||v===undefined||v===''?(fallback===undefined?'暂不可用':fallback):zh(v)}
@@ -301,7 +302,7 @@ async function load(){
     document.getElementById('latency').textContent=millis(d.latency_ms);
     document.getElementById('fallback-count').textContent=display(d.fallback_count,0);
     document.getElementById('continuous').textContent=d.continuous_updates?'是':'否';
-    document.getElementById('error').textContent=d.last_error?('状态：'+d.last_error):'';
+    document.getElementById('error').textContent=d.last_error?('状态：'+zh(d.last_error)):'';
     const daily=(d.official_daily_candidates||[]).slice(0,20);
     document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.normalized_score)+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>仅监控</td></tr>'},'暂无官方日线候选',5);
     const monitor=(d.intraday_monitor||[]).slice(0,100);

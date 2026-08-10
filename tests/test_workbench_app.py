@@ -66,6 +66,8 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "当前数据源" in html
         assert "数据源类别" in html
         assert "后端行情时间戳" in html
+        assert "AKShare / 东方财富" in html
+        assert "数据源请求失败" in html
         assert '<div class="label">ACTIVE SOURCE</div>' not in html
         assert '<div class="label">PUBLIC DATA SOURCE</div>' not in html
         assert "<th>Backend Quote Timestamp</th>" not in html

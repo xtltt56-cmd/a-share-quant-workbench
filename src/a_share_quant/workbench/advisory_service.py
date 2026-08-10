@@ -45,6 +45,7 @@ class AdvisoryWorkbenchService:
         known_instruments: Mapping[str, str] | None = None,
         risk_policy: RiskPolicy | None = None,
         prediction_store: PredictionLedgerStore | None = None,
+        context_provider: Callable[[], AdvisoryContext | None] | None = None,
         today: Callable[[], date] | None = None,
     ) -> None:
         self._ledger_store = JsonlLedgerStore(ledger_path)
@@ -79,6 +80,7 @@ class AdvisoryWorkbenchService:
                 self._pending_initialization_cash = requested_initial_cash
         self._advisory_engine = AdvisoryEngine(risk_policy or RiskPolicy.conservative())
         self._prediction_store = prediction_store or PredictionLedgerStore()
+        self._context_provider = context_provider
         self._today = today or date.today
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
         self._manual_buy_lock = RLock()
@@ -196,6 +198,8 @@ class AdvisoryWorkbenchService:
     def today_guidance(self, context: AdvisoryContext | None = None) -> dict[str, object]:
         """Evaluate a supplied formal context without inventing market inputs."""
 
+        if context is None and self._context_provider is not None:
+            context = self._context_provider()
         if context is None:
             return {
                 "state": "INSUFFICIENT_DATA",

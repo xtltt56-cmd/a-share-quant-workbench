@@ -6,10 +6,13 @@ import argparse
 import json
 from pathlib import Path
 
+from a_share_quant.config import Settings
 from a_share_quant.data.realtime.diagnostics import (
     collect_network_diagnostics,
     write_network_diagnostics_report,
 )
+from a_share_quant.storage.market_store import MarketDataStore
+from a_share_quant.workbench.advisory_context import load_advisory_context, load_instrument_map
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.app import run_server
 from a_share_quant.workbench.service import WorkbenchService
@@ -31,6 +34,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--advisory-initial-cash",
         required=True,
         help="explicit initial cash used when replaying the local ledger",
+    )
+    workbench.add_argument(
+        "--advisory-context",
+        type=Path,
+        default=None,
+        help="optional local JSON context artifact used by the today-guidance route",
+    )
+    workbench.add_argument(
+        "--advisory-instrument-map",
+        type=Path,
+        default=None,
+        help="optional local JSON symbol-to-name map for manual ledger validation",
     )
     mode = workbench.add_mutually_exclusive_group()
     mode.add_argument("--network", action="store_true", help="allow provider requests")
@@ -76,9 +91,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "workbench":
+        known_instruments = _load_default_instrument_map()
+        if args.advisory_instrument_map is not None:
+            known_instruments = load_instrument_map(args.advisory_instrument_map)
+        context_provider = (
+            (lambda: load_advisory_context(args.advisory_context))
+            if args.advisory_context is not None
+            else None
+        )
         advisory_service = AdvisoryWorkbenchService(
             initial_cash=args.advisory_initial_cash,
             ledger_path=args.advisory_ledger,
+            known_instruments=known_instruments,
+            context_provider=context_provider,
         )
         run_server(
             port=args.port,
@@ -127,6 +152,29 @@ def main(argv: list[str] | None = None) -> int:
     service.refresh()
     print(json.dumps(service.snapshot(), ensure_ascii=False, indent=2, default=str))
     return 0
+
+
+def _load_default_instrument_map() -> dict[str, str]:
+    """Use the newest canonical local catalog when ingestion has produced one."""
+
+    settings = Settings.load()
+    instrument_dir = settings.data_dir / "lake" / "instruments"
+    if not any(instrument_dir.glob("*.parquet")):
+        return {}
+    try:
+        frame = MarketDataStore(
+            root=settings.data_dir,
+            database_path=settings.database_path,
+        ).read_instruments()
+    except Exception:
+        return {}
+    if frame.empty or not {"symbol", "name"}.issubset(frame.columns):
+        return {}
+    return {
+        str(row.symbol): str(row.name).strip()
+        for row in frame.itertuples(index=False)
+        if str(row.name).strip()
+    }
 
 
 if __name__ == "__main__":

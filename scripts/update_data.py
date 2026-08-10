@@ -10,6 +10,7 @@ from a_share_quant.config import Settings
 from a_share_quant.data.pipeline import IncrementalUpdater
 from a_share_quant.data.providers.akshare import AKShareDataProvider
 from a_share_quant.data.providers.baostock import BaoStockDataProvider
+from a_share_quant.data.providers.registry import ProviderRegistry
 from a_share_quant.data.providers.tushare import TushareDataProvider
 from a_share_quant.storage.market_store import MarketDataStore
 
@@ -21,6 +22,12 @@ def main() -> int:
     parser.add_argument("--end-date", required=True, type=date.fromisoformat)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
+        "--provider-evidence",
+        type=str,
+        default=None,
+        help="persisted provider provenance path; switching a formal source requires evidence",
+    )
+    parser.add_argument(
         "--network-smoke",
         action="store_true",
         help="acknowledge that this command will call an external data provider",
@@ -31,6 +38,15 @@ def main() -> int:
 
     settings = Settings.load()
     provider_name = args.provider or settings.provider
+    evidence_path = (
+        args.provider_evidence
+        if args.provider_evidence is not None
+        else str(settings.data_dir / "provider-evidence.json")
+    )
+    provider_registry = ProviderRegistry(
+        formal_provider=provider_name,
+        evidence_path=evidence_path,
+    )
     if provider_name == "akshare":
         provider = AKShareDataProvider(
             timeout_seconds=settings.request_timeout_seconds,
@@ -55,8 +71,10 @@ def main() -> int:
         if close is not None:
             close()
     logging.getLogger(__name__).info(
-        "data update completed provider=%s seen=%s updated=%s skipped=%s failed=%s rows=%s",
+        "data update completed provider=%s evidence=%s seen=%s updated=%s "
+        "skipped=%s failed=%s rows=%s",
         provider_name,
+        provider_registry.evidence_path,
         summary.symbols_seen,
         summary.symbols_updated,
         summary.symbols_skipped,

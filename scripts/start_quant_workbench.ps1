@@ -2,8 +2,10 @@
 param(
     [int]$Port = 8765,
     [switch]$Offline,
-    [string]$AdvisoryInitialCash = '0',
-    [string]$AdvisoryLedger = ''
+    [string]$AdvisoryInitialCash = '100000',
+    [string]$AdvisoryLedger = '',
+    [string]$AdvisoryContext = '',
+    [string]$AdvisoryInstrumentMap = ''
 )
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -29,7 +31,7 @@ if (Test-Path -LiteralPath $pidPath) {
         $oldProcess = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
         if ($null -ne $oldProcess) {
             Write-Output "Quant Workbench is already running (PID $oldPid)."
-            Start-Process "http://127.0.0.1:$Port/"
+            Start-Process "http://127.0.0.1:$Port/advisory"
             exit 0
         }
     }
@@ -37,9 +39,23 @@ if (Test-Path -LiteralPath $pidPath) {
 }
 
 $cliPath = Join-Path $repoRoot 'scripts\quant_cli.py'
-$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--network')
+$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash)
+if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
+    $arguments += @('--advisory-context', $AdvisoryContext)
+}
+if (-not [string]::IsNullOrWhiteSpace($AdvisoryInstrumentMap)) {
+    $arguments += @('--advisory-instrument-map', $AdvisoryInstrumentMap)
+}
+$arguments += '--network'
 if ($Offline) {
-    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--offline')
+    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash)
+    if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
+        $arguments += @('--advisory-context', $AdvisoryContext)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AdvisoryInstrumentMap)) {
+        $arguments += @('--advisory-instrument-map', $AdvisoryInstrumentMap)
+    }
+    $arguments += '--offline'
 }
 $workbenchProcess = Start-Process -FilePath $pythonPath -ArgumentList $arguments -WorkingDirectory $repoRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 Set-Content -LiteralPath $pidPath -Value $workbenchProcess.Id -Encoding ascii
@@ -62,4 +78,4 @@ if (-not $ready) {
     exit 1
 }
 Write-Output "Quant Workbench started at http://127.0.0.1:$Port/ (PID $($workbenchProcess.Id))."
-Start-Process "http://127.0.0.1:$Port/"
+Start-Process "http://127.0.0.1:$Port/advisory"

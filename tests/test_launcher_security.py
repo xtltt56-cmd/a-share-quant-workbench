@@ -17,3 +17,5 @@ def test_launcher_scripts_use_local_dashboard_and_no_broker_path() -> None:
     assert "broker" not in content.lower()
     assert "place_order" not in content.lower()
     assert "live_trading_enabled" in content
+    assert "[string]$AdvisoryInitialCash = '100000'" in content
+    assert 'Start-Process "http://127.0.0.1:$Port/advisory"' in content

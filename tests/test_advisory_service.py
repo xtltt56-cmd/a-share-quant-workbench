@@ -210,6 +210,38 @@ def test_today_guidance_uses_only_caller_provided_context_and_is_manual_only(tmp
     assert guidance["suggested_quantity"] == 400
 
 
+def test_today_guidance_route_uses_configured_context_provider(tmp_path) -> None:
+    service = AdvisoryWorkbenchService(
+        initial_cash=Decimal("100000"),
+        ledger_path=tmp_path / "account-ledger.jsonl",
+        known_instruments={"000001": "平安银行"},
+        context_provider=_context,
+        today=lambda: date(2026, 8, 10),
+    )
+
+    assert service.today_guidance()["state"] == "BUY_CANDIDATE"
+
+    server = create_server(
+        service=WorkbenchService(allow_network=False),
+        advisory_service=service,
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_address[1]}/api/advisory/guidance",
+            timeout=3,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["state"] == "BUY_CANDIDATE"
+        assert payload["manual_execution_required"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
 def test_model_and_data_health_does_not_claim_unavailable_live_validation(tmp_path) -> None:
     health = _service(tmp_path).model_data_health()
 
@@ -446,3 +478,44 @@ def test_workbench_cli_wires_a_local_advisory_service(tmp_path, monkeypatch) -> 
     assert captured["allow_network"] is False
     assert isinstance(captured["advisory_service"], AdvisoryWorkbenchService)
     assert captured["advisory_service"].holdings()["manual_execution_required"] is True
+
+
+def test_workbench_cli_wires_context_and_instrument_artifacts(tmp_path, monkeypatch) -> None:
+    from scripts import quant_cli
+
+    captured: dict[str, object] = {}
+
+    class DummyService:
+        pass
+
+    def fake_service(**kwargs):
+        captured.update(kwargs)
+        return DummyService()
+
+    def fake_run_server(**kwargs):
+        captured["run_server"] = kwargs
+
+    monkeypatch.setattr(quant_cli, "AdvisoryWorkbenchService", fake_service)
+    monkeypatch.setattr(quant_cli, "run_server", fake_run_server)
+    context_path = tmp_path / "context.json"
+    context_path.write_text("{}", encoding="utf-8")
+    instruments_path = tmp_path / "instruments.json"
+    instruments_path.write_text('{"000001":"平安银行"}', encoding="utf-8")
+
+    assert quant_cli.main(
+        [
+            "workbench",
+            "--advisory-ledger",
+            str(tmp_path / "account-ledger.jsonl"),
+            "--advisory-initial-cash",
+            "100000",
+            "--advisory-context",
+            str(context_path),
+            "--advisory-instrument-map",
+            str(instruments_path),
+            "--offline",
+        ]
+    ) == 0
+    assert captured["known_instruments"] == {"000001": "平安银行"}
+    assert callable(captured["context_provider"])
+    assert captured["run_server"]["advisory_service"] is not None
