@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import dotenv_values
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -41,8 +42,23 @@ class Settings(BaseSettings):
 
     @classmethod
     def load(cls, *, env_file: Path | None = None) -> Settings:
-        kwargs = {"_env_file": str(env_file)} if env_file is not None else {}
-        return cls(**kwargs)
+        if env_file is None:
+            return cls()
+
+        # An explicitly supplied file is a testable/operator-selected snapshot.
+        # Pass its values as constructor arguments so a process-wide secret (for
+        # example TUSHARE_TOKEN) cannot silently contaminate an isolated run.
+        values = dotenv_values(env_file)
+        prefix = str(cls.model_config.get("env_prefix", ""))
+        explicit: dict[str, str] = {}
+        for field_name, field_info in cls.model_fields.items():
+            alias = field_info.validation_alias
+            env_name = str(alias) if isinstance(alias, str) else f"{prefix}{field_name.upper()}"
+            value = values.get(env_name)
+            if value is not None:
+                explicit[field_name] = value
+        explicit["_env_file"] = str(env_file)
+        return cls(**explicit)
 
 
 @dataclass(frozen=True)

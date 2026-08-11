@@ -1,0 +1,57 @@
+# This file records the current release boundary. It is intentionally not a
+# claim that the system is investment-ready; NOT_OBSERVED/BLOCKED remain valid.
+checks:
+  - key: historical_data
+    name: 历史数据与证券池
+    category: data
+    status: PASS
+    evidence: reports/historical_dry_run_readiness.md
+    blocking: true
+  - key: realtime_data
+    name: 实时数据质量
+    category: data
+    status: BLOCKED
+    evidence: reports/realtime_data_smoke_test_current.md
+    blocking: true
+  - key: formal_model
+    name: 样本外正式模型
+    category: model
+    status: BLOCKED
+    evidence: reports/stage3_signal_quality_report.md
+    blocking: true
+  - key: advisory_engine
+    name: 指导引擎
+    category: advisory
+    status: BLOCKED
+    evidence: reports/a_share_advisory_v1_acceptance.md
+    blocking: true
+  - key: manual_account
+    name: 人工账户账本
+    category: account
+    status: PASS
+    evidence: tests/test_account_ledger.py
+    blocking: false
+  - key: backup_restore
+    name: 备份与恢复
+    category: backup
+    status: PASS
+    evidence: tests/test_backup_restore.py
+    blocking: true
+  - key: broker_read_only
+    name: 券商只读连接
+    category: broker
+    status: BLOCKED
+    evidence: tests/test_qmt_read_only.py
+    blocking: true
+  - key: chinese_workbench
+    name: 简体中文工作台
+    category: ui
+    status: PASS
+    evidence: tests/test_workbench_app.py
+    blocking: true
+  - key: paper_only_safety
+    name: 纸面模式与下单封禁
+    category: execution_safety
+    status: PASS
+    evidence: tests/test_launcher_security.py
+    blocking: true

@@ -358,3 +358,9 @@ RiceQuant 的 `idea-generation` 和 `report-renderer` Skill 已安装到本机�
 本地人工投顾链路、简体中文工作台、免费 BaoStock 历史数据适配器和 QMT 只读边界已完成。详细证据见 [A 股人工投顾 V1 验收报告](reports/a_share_advisory_v1_acceptance.md)。
 
 系统仍严格保持纸面/人工执行：Tushare 接口权限、财富证券官方 QMT 权限、真实市场 EOD/PIT 数据和 60–120 个交易日纸面验证属于外部闸门，未满足前不会宣称预测准确或开放自动交易。
+
+## 生产可用化执行计划
+
+后续工作按 [生产可用化实施计划](docs/superpowers/plans/2026-08-11-a-share-production-readiness.md)
+执行。当前验收矩阵位于 [config/production_readiness.yaml](config/production_readiness.yaml)，
+其中 `BLOCKED` 和 `NOT_OBSERVED` 不会被汇总为可发布状态；系统只有在数据、样本外模型、指导、券商边界、界面和纸面安全门全部通过后，才可提升发布级别。
