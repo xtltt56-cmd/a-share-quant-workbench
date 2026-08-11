@@ -14,8 +14,15 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $pythonPath = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $runtimeDir = Join-Path $repoRoot '.runtime'
 $pidPath = Join-Path $runtimeDir 'quant_workbench.pid'
+$launchMetadataPath = Join-Path $runtimeDir 'quant_workbench.launch.json'
+$launchHelpersPath = Join-Path $PSScriptRoot 'workbench_launch_helpers.ps1'
 $stdoutPath = Join-Path $repoRoot 'logs\quant_workbench.stdout.log'
 $stderrPath = Join-Path $repoRoot 'logs\quant_workbench.stderr.log'
+
+. $launchHelpersPath
+$requestedMode = if ($Offline) { 'offline' } else { 'network' }
+$requestedGitRevision = Get-QuantGitRevision -RepoRoot $repoRoot
+$requestedCodeFingerprint = Get-QuantCodeFingerprint -RepoRoot $repoRoot
 
 function Open-QuantWorkbenchPages {
     param([int]$Port)
@@ -47,14 +54,36 @@ if (Test-Path -LiteralPath $pidPath) {
     $oldPidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
     [int]$oldPid = 0
     if ([int]::TryParse($oldPidText, [ref]$oldPid)) {
-        $oldProcess = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+        $oldProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$oldPid" -ErrorAction SilentlyContinue
         if ($null -ne $oldProcess) {
-            Write-Output "Quant Workbench is already running (PID $oldPid)."
-            Open-QuantWorkbenchPages -Port $Port
-            exit 0
+            $owned = Test-QuantWorkbenchCommandLine `
+                -CommandLine $oldProcess.CommandLine `
+                -RepoRoot $repoRoot
+            if ($owned) {
+                $metadata = Read-QuantLaunchMetadata -Path $launchMetadataPath
+                $decisionArgs = @{
+                    Metadata = $metadata
+                    ActualPid = $oldPid
+                    RequestedMode = $requestedMode
+                    RequestedGitRevision = $requestedGitRevision
+                    RequestedCodeFingerprint = $requestedCodeFingerprint
+                }
+                $decision = Get-QuantLaunchDecision @decisionArgs
+                if ($decision -eq 'REUSE') {
+                    Write-Output "Quant Workbench is already running (PID $oldPid)."
+                    Open-QuantWorkbenchPages -Port $Port
+                    exit 0
+                }
+                Stop-Process -Id $oldPid -ErrorAction Stop
+                Wait-Process -Id $oldPid -Timeout 5 -ErrorAction SilentlyContinue
+                Write-Output "Restarting Quant Workbench: $decision."
+            } else {
+                Write-Warning "PID $oldPid is not this repository's Quant Workbench; it was not stopped."
+            }
         }
     }
     Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $launchMetadataPath -Force -ErrorAction SilentlyContinue
 }
 
 $cliPath = Join-Path $repoRoot 'scripts\quant_cli.py'
@@ -93,8 +122,19 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
     }
 }
 if (-not $ready) {
+    Stop-Process -Id $workbenchProcess.Id -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $launchMetadataPath -Force -ErrorAction SilentlyContinue
     Write-Error "Quant Workbench did not become ready. See $stderrPath"
     exit 1
 }
+$metadataArgs = @{
+    Path = $launchMetadataPath
+    ProcessId = $workbenchProcess.Id
+    Mode = $requestedMode
+    GitRevision = $requestedGitRevision
+    CodeFingerprint = $requestedCodeFingerprint
+}
+Write-QuantLaunchMetadata @metadataArgs
 Write-Output "Quant Workbench started at http://127.0.0.1:$Port/ (PID $($workbenchProcess.Id))."
 Open-QuantWorkbenchPages -Port $Port

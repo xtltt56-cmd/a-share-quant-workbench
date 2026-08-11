@@ -35,3 +35,47 @@ def test_start_launcher_opens_dashboard_and_advisory_for_both_success_paths() ->
     assert "Start-Process $advisoryUrl" in launcher
     assert launcher.count("Open-QuantWorkbenchPages -Port $Port") == 2
     assert ".runtime\\advisory\\import-inbox" in launcher
+
+
+def test_launcher_validates_runtime_before_reuse_or_stop() -> None:
+    launcher = (ROOT / "scripts" / "start_quant_workbench.ps1").read_text(
+        encoding="utf-8"
+    )
+    stopper = (ROOT / "scripts" / "stop_quant_workbench.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        "workbench_launch_helpers.ps1",
+        "quant_workbench.launch.json",
+        "Test-QuantWorkbenchCommandLine",
+        "Get-QuantLaunchDecision",
+        "Write-QuantLaunchMetadata",
+        "Get-CimInstance Win32_Process",
+        "REUSE",
+    ):
+        assert required in launcher
+
+    for required in (
+        "workbench_launch_helpers.ps1",
+        "quant_workbench.launch.json",
+        "Test-QuantWorkbenchCommandLine",
+        "Remove-Item -LiteralPath $launchMetadataPath",
+    ):
+        assert required in stopper
+
+
+def test_launch_metadata_code_has_no_account_or_secret_fields() -> None:
+    helper = (ROOT / "scripts" / "workbench_launch_helpers.ps1").read_text(
+        encoding="utf-8"
+    ).lower()
+    for forbidden in (
+        "password",
+        "token",
+        "account_id",
+        "shareholder",
+        ".env",
+        "import-inbox",
+        "account-ledger",
+    ):
+        assert forbidden not in helper
