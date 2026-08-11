@@ -6,7 +6,8 @@ param(
     [string]$AdvisoryLedger = '',
     [string]$AdvisoryContext = '',
     [string]$AdvisoryInstrumentMap = '',
-    [string]$OfficialSignalPath = ''
+    [string]$OfficialSignalPath = '',
+    [string]$AccountImportDirectory = ''
 )
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -31,11 +32,16 @@ if ([string]::IsNullOrWhiteSpace($AdvisoryLedger)) {
 if ([string]::IsNullOrWhiteSpace($OfficialSignalPath)) {
     $OfficialSignalPath = Join-Path $runtimeDir 'signals\official-daily.json'
 }
+if ([string]::IsNullOrWhiteSpace($AccountImportDirectory)) {
+    # 默认收件箱：.runtime\advisory\import-inbox
+    $AccountImportDirectory = Join-Path $runtimeDir 'advisory\import-inbox'
+}
+$AccountSnapshotPath = Join-Path $runtimeDir 'advisory\imported-account-snapshot.json'
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python environment not found: $pythonPath"
 }
-New-Item -ItemType Directory -Force -Path $runtimeDir, (Split-Path $stdoutPath) | Out-Null
+New-Item -ItemType Directory -Force -Path $runtimeDir, (Split-Path $stdoutPath), $AccountImportDirectory | Out-Null
 
 if (Test-Path -LiteralPath $pidPath) {
     $oldPidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
@@ -52,7 +58,7 @@ if (Test-Path -LiteralPath $pidPath) {
 }
 
 $cliPath = Join-Path $repoRoot 'scripts\quant_cli.py'
-$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath)
+$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath, '--account-import-dir', $AccountImportDirectory, '--account-snapshot-path', $AccountSnapshotPath)
 if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
     $arguments += @('--advisory-context', $AdvisoryContext)
 }
@@ -61,7 +67,7 @@ if (-not [string]::IsNullOrWhiteSpace($AdvisoryInstrumentMap)) {
 }
 $arguments += '--network'
 if ($Offline) {
-    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath)
+    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath, '--account-import-dir', $AccountImportDirectory, '--account-snapshot-path', $AccountSnapshotPath)
     if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
         $arguments += @('--advisory-context', $AdvisoryContext)
     }

@@ -19,6 +19,8 @@ def test_launcher_scripts_use_local_dashboard_and_no_broker_path() -> None:
     assert "live_trading_enabled" in content
     assert "[string]$AdvisoryInitialCash = '100000'" in content
     assert "Open-QuantWorkbenchPages -Port $Port" in content
+    assert "--account-import-dir" in content
+    assert "--account-snapshot-path" in content
 
 
 def test_start_launcher_opens_dashboard_and_advisory_for_both_success_paths() -> None:
@@ -32,3 +34,4 @@ def test_start_launcher_opens_dashboard_and_advisory_for_both_success_paths() ->
     assert "Start-Process $dashboardUrl" in launcher
     assert "Start-Process $advisoryUrl" in launcher
     assert launcher.count("Open-QuantWorkbenchPages -Port $Port") == 2
+    assert ".runtime\\advisory\\import-inbox" in launcher

@@ -6,6 +6,8 @@ import argparse
 import json
 from pathlib import Path
 
+from a_share_quant.account.import_inbox import AccountImportInbox
+from a_share_quant.account.snapshot_store import AccountSnapshotStore
 from a_share_quant.config import Settings
 from a_share_quant.data.realtime.diagnostics import (
     collect_network_diagnostics,
@@ -55,6 +57,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(".runtime/signals/official-daily.json"),
         help="durable official daily candidate artifact",
+    )
+    workbench.add_argument(
+        "--account-import-dir",
+        type=Path,
+        default=Path(".runtime/advisory/import-inbox"),
+        help="fixed local directory for official account CSV/XLS exports",
+    )
+    workbench.add_argument(
+        "--account-snapshot-path",
+        type=Path,
+        default=Path(".runtime/advisory/imported-account-snapshot.json"),
+        help="local integrity-checked imported position snapshot",
     )
     mode = workbench.add_mutually_exclusive_group()
     mode.add_argument("--network", action="store_true", help="allow provider requests")
@@ -120,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "workbench":
         repo_root = Path(__file__).resolve().parents[1]
         official_signal_path = _inside(repo_root, args.official_signal_path)
+        account_import_dir = _operator_path(repo_root, args.account_import_dir)
+        account_snapshot_path = _operator_path(repo_root, args.account_snapshot_path)
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
             repo_root=repo_root,
@@ -138,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
             known_instruments=known_instruments,
             official_signal_store=official_signal_store,
             context_provider=context_provider,
+            account_import_inbox=AccountImportInbox(account_import_dir),
+            account_snapshot_store=AccountSnapshotStore(account_snapshot_path),
         )
         run_server(
             port=args.port,
@@ -266,6 +284,12 @@ def _inside(root: Path, value: Path) -> Path:
     if candidate != root and root not in candidate.parents:
         raise SystemExit(f"path must stay inside repo root: {value}")
     return candidate
+
+
+def _operator_path(root: Path, value: Path) -> Path:
+    """Resolve a fixed operator-selected path without exposing it to HTTP."""
+
+    return (value if value.is_absolute() else root / value).resolve()
 
 
 if __name__ == "__main__":
