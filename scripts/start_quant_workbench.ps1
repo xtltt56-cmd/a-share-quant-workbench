@@ -16,6 +16,15 @@ $pidPath = Join-Path $runtimeDir 'quant_workbench.pid'
 $stdoutPath = Join-Path $repoRoot 'logs\quant_workbench.stdout.log'
 $stderrPath = Join-Path $repoRoot 'logs\quant_workbench.stderr.log'
 
+function Open-QuantWorkbenchPages {
+    param([int]$Port)
+
+    $dashboardUrl = "http://127.0.0.1:$Port/"
+    $advisoryUrl = "http://127.0.0.1:$Port/advisory"
+    Start-Process $dashboardUrl
+    Start-Process $advisoryUrl
+}
+
 if ([string]::IsNullOrWhiteSpace($AdvisoryLedger)) {
     $AdvisoryLedger = Join-Path $runtimeDir 'advisory\account-ledger.jsonl'
 }
@@ -35,7 +44,7 @@ if (Test-Path -LiteralPath $pidPath) {
         $oldProcess = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
         if ($null -ne $oldProcess) {
             Write-Output "Quant Workbench is already running (PID $oldPid)."
-            Start-Process "http://127.0.0.1:$Port/advisory"
+            Open-QuantWorkbenchPages -Port $Port
             exit 0
         }
     }
@@ -82,4 +91,4 @@ if (-not $ready) {
     exit 1
 }
 Write-Output "Quant Workbench started at http://127.0.0.1:$Port/ (PID $($workbenchProcess.Id))."
-Start-Process "http://127.0.0.1:$Port/advisory"
+Open-QuantWorkbenchPages -Port $Port
