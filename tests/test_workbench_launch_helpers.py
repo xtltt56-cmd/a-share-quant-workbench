@@ -5,18 +5,17 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HELPERS = ROOT / "scripts" / "workbench_launch_helpers.ps1"
 
 
-def _powershell(expression: str) -> str:
+def _shell(executable: str, expression: str) -> str:
     completed = subprocess.run(
         [
-            "powershell.exe",
+            executable,
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            f". '{HELPERS}'; {expression}",
+            f". '.\\scripts\\workbench_launch_helpers.ps1'; {expression}",
         ],
         cwd=ROOT,
         check=True,
@@ -25,6 +24,10 @@ def _powershell(expression: str) -> str:
         encoding="utf-8",
     )
     return completed.stdout.strip()
+
+
+def _powershell(expression: str) -> str:
+    return _shell("powershell.exe", expression)
 
 
 def _decision(**overrides: object) -> str:
@@ -120,3 +123,12 @@ def test_fingerprint_is_stable_and_metadata_round_trips(tmp_path: Path) -> None:
     assert payload["mode"] == "network"
     assert payload["git_revision"] == "abc"
     assert payload["code_fingerprint"] == "sha256:one"
+
+
+def test_fingerprint_is_identical_across_supported_powershell_hosts() -> None:
+    expression = "Get-QuantCodeFingerprint -RepoRoot (Get-Location).Path"
+
+    legacy = _shell("powershell.exe", expression)
+    modern = _shell("pwsh.exe", expression)
+
+    assert legacy == modern

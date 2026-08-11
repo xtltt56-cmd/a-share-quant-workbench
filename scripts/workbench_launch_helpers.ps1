@@ -17,23 +17,19 @@ function Get-QuantGitRevision {
 function Get-QuantCodeFingerprint {
     param([Parameter(Mandatory = $true)][string]$RepoRoot)
 
-    $sourceRoots = @((Join-Path $RepoRoot 'src'), (Join-Path $RepoRoot 'scripts'))
-    $files = Get-ChildItem -LiteralPath $sourceRoots -Recurse -File -ErrorAction Stop |
-        Where-Object { $_.Extension -in @('.py', '.ps1') } |
-        Sort-Object FullName
-    $lines = foreach ($file in $files) {
-        $relative = $file.FullName.Substring($RepoRoot.Length).TrimStart('\', '/')
-        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-        $relative + ':' + $hash
+    $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+    $fingerprintScript = Join-Path $RepoRoot 'scripts\workbench_code_fingerprint.py'
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw "项目 Python 环境不存在：$python"
     }
-    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join [Environment]::NewLine))
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try {
-        $digest = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join ''
-        return 'sha256:' + $digest
-    } finally {
-        $sha.Dispose()
+    if (-not (Test-Path -LiteralPath $fingerprintScript -PathType Leaf)) {
+        throw "源码指纹脚本不存在：$fingerprintScript"
     }
+    $fingerprint = (& $python -X utf8 $fingerprintScript $RepoRoot)
+    if ($LASTEXITCODE -ne 0 -or $fingerprint -notmatch '^sha256:[0-9a-f]{64}$') {
+        throw "无法计算有效的源码指纹：$fingerprint"
+    }
+    return $fingerprint
 }
 
 function Test-QuantWorkbenchCommandLine {
