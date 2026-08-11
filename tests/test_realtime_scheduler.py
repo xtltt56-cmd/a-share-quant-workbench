@@ -1,8 +1,9 @@
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timedelta
 from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
 
-from a_share_quant.contracts.realtime import MarketSnapshot, RealTimeQuote
+from a_share_quant.contracts.realtime import DataQualityStatus, MarketSnapshot, RealTimeQuote
 from a_share_quant.runtime.scheduler import (
     GapRecoveryTracker,
     MarketHours,
@@ -189,6 +190,61 @@ def test_scheduler_stores_only_fresh_quotes_from_partially_stale_full_market() -
     assert tick.quality_status.value == "DEGRADED"
     assert tick.quote_count == 1
     assert [quote.symbol for quote in store.quotes()] == ["000001"]
+    assert scheduler.circuit_breaker.state == "CLOSED"
+
+
+def test_scheduler_quarantines_one_backward_quote_in_a_mixed_snapshot() -> None:
+    first_time = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    second_time = first_time + timedelta(seconds=15)
+    first_one = _snapshot(first_time).quotes[0]
+    first_two = replace(first_one, symbol="000002", last=20.0)
+    second_one = replace(
+        first_one,
+        timestamp_exchange=first_time - timedelta(seconds=1),
+        timestamp_received=second_time,
+        last=10.2,
+    )
+    second_two = replace(
+        first_two,
+        timestamp_exchange=second_time,
+        timestamp_received=second_time,
+        last=20.2,
+    )
+    first = MarketSnapshot(
+        timestamp_exchange=first_time,
+        timestamp_received=first_time,
+        quotes=(first_one, first_two),
+        source="replay",
+    )
+    second = MarketSnapshot(
+        timestamp_exchange=second_time,
+        timestamp_received=second_time,
+        quotes=(second_one, second_two),
+        source="replay",
+    )
+    provider = FakeProvider(first)
+    snapshots = iter((first, second))
+    provider.get_market_snapshot = lambda: next(snapshots)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({first_time.date()}),
+    )
+    times = iter((first_time, second_time))
+    scheduler = RealTimeScheduler(
+        provider=provider,
+        store=RealTimeStore(),
+        resolver=resolver,
+        symbols=("000001", "000002"),
+        clock=lambda: next(times),
+    )
+
+    first_tick = scheduler.run_once()
+    second_tick = scheduler.run_once()
+
+    assert first_tick.updated is True
+    assert second_tick.updated is True
+    assert second_tick.quality_status is DataQualityStatus.DEGRADED
+    assert second_tick.quote_count == 1
     assert scheduler.circuit_breaker.state == "CLOSED"
 
 

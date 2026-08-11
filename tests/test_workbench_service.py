@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -186,6 +187,60 @@ def test_workbench_requires_two_live_updates_before_exposing_good_quality() -> N
     assert second["continuous_updates"] is True
     assert second["provider_telemetry"]["quote_count"] == 2
     assert second["intraday_monitor"][0]["official_model_signal"] is False
+
+
+def test_workbench_keeps_monitor_non_ready_when_scheduler_quarantines_partial_snapshot() -> None:
+    first_time = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    second_time = first_time + timedelta(seconds=15)
+    first_one = _live_provider(first_time).snapshot.quotes[0]
+    first_two = replace(first_one, symbol="000002", last=20.0)
+    second_one = replace(
+        first_one,
+        timestamp_exchange=first_time - timedelta(seconds=1),
+        timestamp_received=second_time,
+        last=10.3,
+    )
+    second_two = replace(
+        first_two,
+        timestamp_exchange=second_time,
+        timestamp_received=second_time,
+        last=20.3,
+    )
+    first_snapshot = MarketSnapshot(
+        timestamp_exchange=first_time,
+        timestamp_received=first_time,
+        quotes=(first_one, first_two),
+        source="akshare",
+    )
+    second_snapshot = MarketSnapshot(
+        timestamp_exchange=second_time,
+        timestamp_received=second_time,
+        quotes=(second_one, second_two),
+        source="akshare",
+    )
+    snapshots = iter((first_snapshot, second_snapshot))
+    provider = FakeProvider(first_snapshot)
+    provider.name = "akshare"
+    provider.get_market_snapshot = lambda: next(snapshots)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({first_time.date()}),
+    )
+    current = [first_time]
+    service = WorkbenchService(
+        provider=provider,
+        allow_network=True,
+        resolver=resolver,
+        clock=lambda: current[0],
+    )
+
+    service.refresh()
+    current[0] = second_time
+    second = service.refresh().to_dict()
+
+    assert second["data_quality"] == "DEGRADED"
+    assert second["continuous_updates"] is False
+    assert second["intraday_monitor"][0]["state"] == "STALE_DATA"
 
 
 def test_workbench_reports_the_actual_akshare_snapshot_endpoint() -> None:

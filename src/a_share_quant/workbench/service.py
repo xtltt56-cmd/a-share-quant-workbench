@@ -271,12 +271,17 @@ class WorkbenchService:
             now=tick.timestamp,
         )
         replay = _is_replay_provider(active_provider, quotes)
-        self._apply_quality_report(report, replay=replay)
+        effective_quality = _worst_quality(report.status, tick.quality_status)
+        self._apply_quality_report(
+            report,
+            replay=replay,
+            status=effective_quality,
+        )
         self.state.circuit_breaker_state = self.scheduler.circuit_breaker.state
         # Replay fixtures are explicitly separated in the state evidence mode;
         # keep their deterministic monitor behavior while applying the live
         # quality gate to every real-market snapshot.
-        monitor_quality = DataQualityStatus.GOOD if replay else report.status
+        monitor_quality = DataQualityStatus.GOOD if replay else effective_quality
         self._apply_quote_state(
             quotes,
             now=tick.timestamp,
@@ -309,13 +314,24 @@ class WorkbenchService:
         self.state.latency_ms = None
         self.state.provider_telemetry = self.telemetry.snapshot().to_dict()
 
-    def _apply_quality_report(self, report: Any, *, replay: bool) -> None:
+    def _apply_quality_report(
+        self,
+        report: Any,
+        *,
+        replay: bool,
+        status: DataQualityStatus | None = None,
+    ) -> None:
+        effective_status = status or report.status
         self.state.schema_pass = report.schema_pass
-        self.state.continuous_updates = False if replay else report.continuous_updates
+        self.state.continuous_updates = (
+            False
+            if replay or effective_status is not DataQualityStatus.GOOD
+            else report.continuous_updates
+        )
         self.state.distinct_update_count = 0 if replay else report.distinct_update_count
         self.state.evidence_mode = "REPLAY" if replay else "REAL_MARKET"
-        self.state.data_quality = "REPLAY" if replay else report.status.value
-        self.state.stale = report.status in {
+        self.state.data_quality = "REPLAY" if replay else effective_status.value
+        self.state.stale = effective_status in {
             DataQualityStatus.STALE,
             DataQualityStatus.FAILED,
         }
@@ -584,3 +600,20 @@ def _maximum_data_age(
     if not quotes:
         return None
     return round(max(quote.data_age_seconds(now=now) for quote in quotes), 3)
+
+
+def _worst_quality(
+    first: DataQualityStatus,
+    second: DataQualityStatus | None,
+) -> DataQualityStatus:
+    """Never let a service-level check upgrade a degraded scheduler tick."""
+
+    if second is None:
+        return first
+    order = {
+        DataQualityStatus.GOOD: 0,
+        DataQualityStatus.DEGRADED: 1,
+        DataQualityStatus.STALE: 2,
+        DataQualityStatus.FAILED: 3,
+    }
+    return first if order[first] >= order[second] else second

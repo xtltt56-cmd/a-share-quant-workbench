@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time as time_module
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from typing import Any, Protocol
@@ -221,29 +221,45 @@ class RealTimeScheduler:
             )
         try:
             snapshot = self._retry(self.provider.get_market_snapshot)
-            quotes = snapshot.quotes
-            try:
-                for quote in quotes:
+            quotes = tuple(snapshot.quotes)
+            timestamp_checked: list[Any] = []
+            timestamp_quarantined = False
+            for quote in quotes:
+                try:
                     self.timestamp_tracker.observe(
                         quote.symbol,
                         quote.timestamp_exchange,
                         now=now,
                     )
-            except ValueError:
-                self.circuit_breaker.state = "OPEN"
+                except ValueError:
+                    # Full-market feeds can contain one symbol whose exchange
+                    # timestamp lags the previous snapshot.  Quarantine only
+                    # that row; rejecting the whole snapshot would discard
+                    # thousands of otherwise usable quotes.
+                    timestamp_quarantined = True
+                    timestamp_checked.append(
+                        replace(
+                            quote,
+                            is_stale=True,
+                            quality_flag=DataQualityStatus.STALE,
+                        )
+                    )
+                else:
+                    timestamp_checked.append(quote)
+            report = self.circuit_breaker.evaluate(
+                timestamp_checked,
+                expected_symbols=self.symbols,
+                now=now,
+            )
+            if not report.is_usable:
                 return SchedulerTick(
                     timestamp=now,
                     session=session,
                     requested=True,
                     updated=False,
-                    quality_status=DataQualityStatus.STALE,
+                    quality_status=report.status,
                     error="DATA_STALE",
                 )
-            report = self.circuit_breaker.evaluate(
-                quotes,
-                expected_symbols=self.symbols,
-                now=now,
-            )
             usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
             self.store.put_quotes(usable_quotes)
             bars = (
@@ -264,6 +280,7 @@ class RealTimeScheduler:
                 quote_count=len(usable_quotes),
                 bar_count=len(bars),
                 quality_status=report.status,
+                error="PARTIAL_DATA_STALE" if timestamp_quarantined else "",
             )
         except Exception as exc:  # provider boundary: do not leak payloads
             self.circuit_breaker.state = "OPEN"
