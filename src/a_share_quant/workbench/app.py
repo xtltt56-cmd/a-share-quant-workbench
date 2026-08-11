@@ -54,6 +54,8 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._write_advisory_response(lambda service: service.today_guidance())
         elif path == "/api/advisory/health":
             self._write_advisory_response(lambda service: service.model_data_health())
+        elif path == "/api/advisory/imports":
+            self._write_advisory_response(lambda service: service.list_account_imports())
         elif path == "/api/refresh":
             self._write_json(
                 {"error": "use POST with the local refresh request header"},
@@ -72,6 +74,12 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/advisory/buy-confirm":
             self._manual_buy_confirm()
+            return
+        if path == "/api/advisory/import-preview":
+            self._account_import_preview()
+            return
+        if path == "/api/advisory/import-confirm":
+            self._account_import_confirm()
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -110,6 +118,30 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return
         self._write_advisory_response(
             lambda service: service.confirm_manual_buy(payload["confirmation_token"])
+        )
+
+    def _account_import_preview(self) -> None:
+        payload = self._manual_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"file_id"} or not isinstance(payload["file_id"], str):
+            self._write_advisory_error(HTTPStatus.BAD_REQUEST)
+            return
+        self._write_advisory_response(
+            lambda service: service.preview_account_import(payload["file_id"])
+        )
+
+    def _account_import_confirm(self) -> None:
+        payload = self._manual_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"confirmation_token"} or not isinstance(
+            payload["confirmation_token"], str
+        ):
+            self._write_advisory_error(HTTPStatus.BAD_REQUEST)
+            return
+        self._write_advisory_response(
+            lambda service: service.confirm_account_import(payload["confirmation_token"])
         )
 
     def _manual_request_payload(self) -> dict[str, Any] | None:
