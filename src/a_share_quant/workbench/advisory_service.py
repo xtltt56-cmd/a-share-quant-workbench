@@ -7,14 +7,21 @@ import os
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
 from a_share_quant.account.contracts import money
+from a_share_quant.account.import_inbox import (
+    AccountFilePreview,
+    AccountImportInbox,
+    AccountImportKind,
+)
 from a_share_quant.account.ledger import AccountLedger, LedgerReceipt
+from a_share_quant.account.service import AccountEntryService
+from a_share_quant.account.snapshot_store import AccountSnapshotStore, ImportedAccountSnapshot
 from a_share_quant.account.store import JsonlLedgerStore
 from a_share_quant.advisory.engine import AdvisoryContext, AdvisoryEngine
 from a_share_quant.advisory.risk import RiskPolicy
@@ -28,6 +35,12 @@ _INITIALIZATION_FORMAT_VERSION = 1
 class _ManualBuyPreview:
     confirmation_token: str
     receipt: LedgerReceipt
+
+
+@dataclass(frozen=True)
+class _AccountImportConfirmation:
+    confirmation_token: str
+    preview: AccountFilePreview
 
 
 class AdvisoryWorkbenchService:
@@ -49,7 +62,11 @@ class AdvisoryWorkbenchService:
         official_signal_store: OfficialSignalStore | None = None,
         context_provider: Callable[[], AdvisoryContext | None] | None = None,
         today: Callable[[], date] | None = None,
+        account_import_inbox: AccountImportInbox | None = None,
+        account_snapshot_store: AccountSnapshotStore | None = None,
     ) -> None:
+        if (account_import_inbox is None) != (account_snapshot_store is None):
+            raise ValueError("account import inbox and snapshot store must be provided together")
         self._ledger_store = JsonlLedgerStore(ledger_path)
         self._initialization_path = _initialization_path(self._ledger_store.path)
         self._known_instruments = dict(known_instruments or {})
@@ -74,6 +91,10 @@ class AdvisoryWorkbenchService:
             records=self._ledger_store.load_records(),
             known_instruments=self._known_instruments,
         )
+        self._account_entry_service = AccountEntryService(
+            ledger=self._ledger,
+            store=self._ledger_store,
+        )
         self._pending_initialization_cash: Decimal | None = None
         if recorded_initial_cash is None and requested_initial_cash > 0:
             if ledger_exists:
@@ -85,8 +106,98 @@ class AdvisoryWorkbenchService:
         self._official_signal_store = official_signal_store
         self._context_provider = context_provider
         self._today = today or date.today
+        self._account_import_inbox = account_import_inbox
+        self._account_snapshot_store = account_snapshot_store
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
+        self._account_import_confirmations: dict[str, _AccountImportConfirmation] = {}
         self._manual_buy_lock = RLock()
+
+    def list_account_imports(self) -> dict[str, object]:
+        """List safe file identifiers without exposing filesystem paths."""
+
+        with self._manual_buy_lock:
+            if self._account_import_inbox is None:
+                return {
+                    "files": [],
+                    "manual_execution_required": True,
+                    "notice_zh": "尚未配置券商导出收件箱。",
+                }
+            files = self._account_import_inbox.scan()
+        return {
+            "files": [
+                {
+                    "file_id": item.file_id,
+                    "file_name": item.file_name,
+                    "size_bytes": item.size_bytes,
+                    "modified_ns": item.modified_ns,
+                }
+                for item in files
+            ],
+            "manual_execution_required": True,
+            "notice_zh": "仅列出固定收件箱中的导出文件，不会读取券商登录状态。",
+        }
+
+    def preview_account_import(self, file_id: str) -> dict[str, object]:
+        """Generate a one-time preview; no ledger or snapshot is written."""
+
+        with self._manual_buy_lock:
+            if self._account_import_inbox is None:
+                raise ValueError("account import service is unavailable")
+            preview = self._account_import_inbox.preview(
+                file_id,
+                default_trade_date=self._today(),
+            )
+            confirmation_token = f"account-import-{uuid4().hex}"
+            self._account_import_confirmations[confirmation_token] = _AccountImportConfirmation(
+                confirmation_token=confirmation_token,
+                preview=preview,
+            )
+        return _account_preview_payload(preview, confirmation_token)
+
+    def confirm_account_import(self, confirmation_token: str) -> dict[str, object]:
+        """Confirm a preview after rechecking its source digest."""
+
+        with self._manual_buy_lock:
+            pending = self._account_import_confirmations.pop(str(confirmation_token), None)
+            if pending is None:
+                raise ValueError("unknown or expired account import confirmation")
+            if self._account_import_inbox is None:
+                raise ValueError("account import service is unavailable")
+            self._account_import_inbox.verify_unchanged(pending.preview)
+            preview = pending.preview
+            if preview.kind is AccountImportKind.FILLS:
+                if preview.fill_preview is None:
+                    raise ValueError("fill import preview is invalid")
+                receipts = self._account_entry_service.confirm_validated_preview(
+                    preview.fill_preview
+                )
+                return {
+                    "kind": preview.kind.value,
+                    "source_name": preview.source_name,
+                    "recorded_rows": sum(not item.idempotent for item in receipts),
+                    "idempotent_rows": sum(item.idempotent for item in receipts),
+                    "manual_execution_required": True,
+                    "notice_zh": "成交明细已按确认结果记录到本机账本；系统不会提交委托。",
+                }
+            if self._account_snapshot_store is None:
+                raise ValueError("account snapshot store is unavailable")
+            snapshot = ImportedAccountSnapshot(
+                snapshot_id=f"snapshot-{preview.preview_id}",
+                source_sha256=preview.source_sha256,
+                source_name=preview.source_name,
+                as_of=preview.as_of,
+                imported_at=datetime.now(timezone.utc),
+                cash=preview.cash,
+                positions=preview.positions,
+            )
+            self._account_snapshot_store.save(snapshot)
+            return {
+                "kind": preview.kind.value,
+                "source_name": preview.source_name,
+                "position_rows": len(preview.positions),
+                "manual_execution_required": True,
+                "notice_zh": "券商持仓快照已独立保存；它没有被伪造成历史成交。",
+            }
 
     def preview_manual_buy(
         self,
@@ -178,22 +289,54 @@ class AdvisoryWorkbenchService:
 
         with self._manual_buy_lock:
             snapshot = self._ledger.snapshot(as_of=self._today())
+            imported = (
+                self._account_snapshot_store.load()
+                if self._account_snapshot_store is not None
+                else None
+            )
+        local_positions = [
+            {
+                "name": position.name,
+                "code": position.symbol,
+                "total_quantity": position.total_quantity,
+                "available_quantity": position.available_quantity,
+                "frozen_quantity": position.frozen_quantity,
+                "average_cost": f"{position.average_cost:.4f}",
+            }
+            for position in snapshot.positions
+            if position.total_quantity > 0
+        ]
+        imported_payload = None
+        if imported is not None:
+            imported_payload = {
+                "source_name": imported.source_name,
+                "source_sha256": imported.source_sha256,
+                "as_of": imported.as_of.isoformat(),
+                "cash": f"{imported.cash:.2f}" if imported.cash is not None else None,
+                "positions": [
+                    {
+                        "name": position.name,
+                        "code": position.symbol,
+                        "total_quantity": position.total_quantity,
+                        "available_quantity": position.available_quantity,
+                        "frozen_quantity": position.frozen_quantity,
+                        "average_cost": f"{position.average_cost:.4f}",
+                    }
+                    for position in imported.positions
+                ],
+                "notice_zh": "券商导入快照独立展示，未伪造成历史成交。",
+            }
         return {
             "as_of": snapshot.as_of.isoformat(),
             "cash": f"{snapshot.cash:.2f}",
             "realized_pnl": f"{snapshot.realized_pnl:.2f}",
-            "positions": [
-                {
-                    "name": position.name,
-                    "code": position.symbol,
-                    "total_quantity": position.total_quantity,
-                    "available_quantity": position.available_quantity,
-                    "frozen_quantity": position.frozen_quantity,
-                    "average_cost": f"{position.average_cost:.4f}",
-                }
-                for position in snapshot.positions
-                if position.total_quantity > 0
-            ],
+            "positions": local_positions,
+            "local_ledger": {
+                "cash": f"{snapshot.cash:.2f}",
+                "positions": local_positions,
+                "notice_zh": "本机账本来自已确认的人工成交或成交明细导入。",
+            },
+            "imported_account_snapshot": imported_payload,
             "manual_execution_required": True,
             "notice_zh": "持仓来自本机账本回放，请以券商成交与持仓为准。",
         }
@@ -285,10 +428,13 @@ class AdvisoryWorkbenchService:
     def managed_local_files(self) -> dict[str, Path]:
         """Return the explicitly managed, credential-free local account files."""
 
-        return {
+        files = {
             "account-ledger.jsonl": self._ledger_store.path,
             "account-ledger.jsonl.initialization.json": self._initialization_path,
         }
+        if self._account_snapshot_store is not None:
+            files["imported-account-snapshot.json"] = self._account_snapshot_store.path
+        return files
 
     def managed_local_file_consistency_groups(self) -> dict[str, tuple[str, ...]]:
         """Require the durable account ledger and baseline metadata together."""
@@ -309,6 +455,60 @@ class AdvisoryWorkbenchService:
             next_trading_day=self._ledger.next_trading_day,
             lot_size=self._ledger.lot_size,
         )
+
+
+def _account_preview_payload(
+    preview: AccountFilePreview,
+    confirmation_token: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "confirmation_token": confirmation_token,
+        "preview_id": preview.preview_id,
+        "file_id": preview.file_id,
+        "source_name": preview.source_name,
+        "source_sha256": preview.source_sha256,
+        "kind": preview.kind.value,
+        "detected_mapping": dict(preview.detected_mapping),
+        "accepted_rows": (
+            preview.fill_preview.accepted_rows
+            if preview.fill_preview is not None
+            else len(preview.positions)
+        ),
+        "rejected_rows": [
+            {"row_number": issue.row_number, "reason": issue.reason}
+            for issue in preview.rejected_rows
+        ],
+        "warnings": list(preview.warnings),
+        "as_of": preview.as_of.isoformat(),
+        "manual_execution_required": True,
+        "notice_zh": "请先核对预览；确认前不会修改本机账本或持仓快照。",
+    }
+    if preview.fill_preview is not None:
+        payload["rows"] = [
+            {
+                "name": event.name,
+                "code": event.symbol,
+                "side": event.side.value,
+                "quantity": event.quantity,
+                "price": str(event.price),
+                "trade_date": event.trade_date.isoformat(),
+            }
+            for event in preview.fill_preview.candidate_events[:100]
+        ]
+    else:
+        payload["cash"] = str(preview.cash) if preview.cash is not None else None
+        payload["rows"] = [
+            {
+                "name": position.name,
+                "code": position.symbol,
+                "total_quantity": position.total_quantity,
+                "available_quantity": position.available_quantity,
+                "frozen_quantity": position.frozen_quantity,
+                "average_cost": str(position.average_cost),
+            }
+            for position in preview.positions[:100]
+        ]
+    return payload
 
 
 def _initialization_path(ledger_path: Path) -> Path:
