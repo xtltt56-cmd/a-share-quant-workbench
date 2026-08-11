@@ -101,7 +101,7 @@ class TimestampTracker:
 
 
 class RealtimeCircuitBreaker:
-    """Open when freshness is unsafe and close only after good data returns."""
+    """Open when no usable data remains; recover on a usable fresh subset."""
 
     def __init__(self, *, stale_after_seconds: float = 60.0) -> None:
         self.stale_after_seconds = stale_after_seconds
@@ -122,6 +122,6 @@ class RealtimeCircuitBreaker:
         )
         if report.status in {DataQualityStatus.STALE, DataQualityStatus.FAILED}:
             self.state = "OPEN"
-        elif report.status is DataQualityStatus.GOOD:
+        elif report.is_usable:
             self.state = "CLOSED"
         return report

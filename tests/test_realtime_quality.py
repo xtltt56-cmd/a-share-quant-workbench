@@ -83,6 +83,20 @@ def test_full_market_quality_quarantines_a_stale_subset_without_opening_breaker(
     assert breaker.state == "CLOSED"
 
 
+def test_circuit_breaker_recovers_from_open_on_usable_fresh_subset() -> None:
+    breaker = RealtimeCircuitBreaker(stale_after_seconds=60)
+    breaker.state = "OPEN"
+
+    report = breaker.evaluate(
+        [_quote("000001"), _quote("000002", age_seconds=61)],
+        now=NOW,
+    )
+
+    assert report.status.value == "DEGRADED"
+    assert report.is_usable is True
+    assert breaker.state == "CLOSED"
+
+
 def test_stale_circuit_breaker_blocks_updates_until_good_data_returns() -> None:
     breaker = RealtimeCircuitBreaker(stale_after_seconds=60)
 
