@@ -199,6 +199,34 @@ class ModelGovernance:
     def decisions(self) -> tuple[PromotionDecision, ...]:
         return tuple(self._decisions)
 
+    def rollback(
+        self,
+        *,
+        to_candidate_id: str | None,
+        approved_by: str,
+    ) -> PromotionDecision:
+        """Record an explicit rollback to a registered candidate or no champion."""
+
+        approver = str(approved_by).strip()
+        if not approver:
+            raise ValueError("approved_by is required")
+        target = None if to_candidate_id is None else str(to_candidate_id).strip()
+        if target is not None and target not in self._cards:
+            raise ValueError("rollback target is not a registered candidate")
+        previous = self.champion_id
+        self.champion_id = target
+        decision = PromotionDecision(
+            request_id=f"rollback-{uuid4().hex}",
+            accepted=True,
+            champion_id=target,
+            previous_champion_id=previous,
+            approved_by=approver,
+            decided_at=datetime.now(timezone.utc),
+            reason="explicit local rollback after model or data-quality review",
+        )
+        self._decisions.append(decision)
+        return decision
+
     def _validation_for(self, candidate_id: str) -> ValidationBundle:
         if candidate_id not in self._cards:
             raise ValueError("candidate_id is not registered")

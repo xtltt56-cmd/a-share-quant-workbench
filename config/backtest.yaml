@@ -8,9 +8,11 @@ backtest:
   enforce_suspension_rules: true
   transaction_costs:
     commission_rate: 0.0003
+    minimum_commission: 5.0
     stamp_duty_rate: 0.0005
     transfer_fee_rate: 0.00001
     slippage_bps: 5
+    lot_size: 100
   walk_forward:
     train_days: 756
     validation_days: 252

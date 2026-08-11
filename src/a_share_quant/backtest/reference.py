@@ -14,6 +14,7 @@ from a_share_quant.contracts.stage3 import ExecutionSpec, SignalFrame
 from a_share_quant.strategies.contracts import PortfolioSpec, PortfolioStrategy
 
 from .contracts import BacktestResult
+from .costs import AshareCostModel
 from .turnover import compute_turnover
 
 
@@ -147,12 +148,22 @@ class ReferenceFastResearchEngine:
         benchmark: pd.DataFrame | pd.Series | None = None,
         period: Any | None = None,
         current_positions: dict[str, float] | None = None,
+        initial_capital: float | None = None,
     ) -> BacktestResult:
         if not isinstance(signals, SignalFrame):
             raise TypeError("signals must be a SignalFrame")
         if period is not None and period.data_mode != signals.data_mode:
             raise ValueError("period and signals must use the same data_mode")
         bars = _prepare_bars(market_data, period)
+        if initial_capital is not None and (
+            not math.isfinite(float(initial_capital)) or float(initial_capital) <= 0
+        ):
+            raise ValueError("initial_capital must be finite and positive")
+        cost_model = (
+            AshareCostModel.from_execution_spec(execution_spec)
+            if initial_capital is not None and execution_spec is not None
+            else None
+        )
         dates = sorted(bars["date"].unique())
         by_date = {current_date: group for current_date, group in bars.groupby("date", sort=True)}
         close = bars.pivot_table(index="date", columns="symbol", values="close", aggfunc="last")
@@ -166,6 +177,11 @@ class ReferenceFastResearchEngine:
             "Fast research is an approximation; final A-share execution validation "
             "requires an event engine.",
         ]
+        if cost_model is not None:
+            warnings.append(
+                "Initial-capital mode estimates lot-rounded fills and cash costs; "
+                "it remains a research approximation.",
+            )
         for signal_date, group in signal_groups:
             if period is not None and not (period.start_date <= signal_date <= period.end_date):
                 continue
@@ -239,12 +255,33 @@ class ReferenceFastResearchEngine:
                     buy = max(delta, 0.0) if not blocked else 0.0
                     sell = max(-delta, 0.0) if not blocked else 0.0
                     price = float(bar["open"]) if bar is not None else float("nan")
-                    cost = buy * (current_execution.commission + current_execution.slippage)
-                    cost += sell * (
-                        current_execution.commission
-                        + current_execution.slippage
-                        + current_execution.tax
-                    )
+                    filled_quantity: int | None = None
+                    gross_notional = 0.0
+                    if not blocked and cost_model is not None:
+                        portfolio_value = nav * float(initial_capital)
+                        requested_notional = abs(delta) * portfolio_value
+                        filled_quantity = cost_model.fillable_quantity(requested_notional / price)
+                        if filled_quantity <= 0:
+                            blocked = True
+                            rejection_reason = "below_lot_size"
+                        else:
+                            side = "BUY" if delta > 0 else "SELL"
+                            fees = cost_model.estimate(
+                                side=side,
+                                price=price,
+                                quantity=filled_quantity,
+                            )
+                            gross_notional = fees.notional
+                            cost = fees.total / float(initial_capital)
+                    if not blocked and cost_model is None:
+                        cost = buy * (current_execution.commission + current_execution.slippage)
+                        cost += sell * (
+                            current_execution.commission
+                            + current_execution.slippage
+                            + current_execution.tax
+                        )
+                    elif blocked:
+                        cost = 0.0
                     daily_cost += cost
                     order = {
                         "date": current_date,
@@ -258,6 +295,8 @@ class ReferenceFastResearchEngine:
                         "rejection_reason": rejection_reason,
                         "execution_price": price,
                         "estimated_cost": cost,
+                        "filled_quantity": filled_quantity,
+                        "gross_notional": gross_notional,
                     }
                     order_rows.append(order)
                     if not blocked:

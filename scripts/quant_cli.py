@@ -137,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         run_server(
             port=args.port,
+            repo_root=repo_root,
             allow_network=bool(args.network and not args.offline),
             advisory_service=advisory_service,
             official_signal_store=official_signal_store,

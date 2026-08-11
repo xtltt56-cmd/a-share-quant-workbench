@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +13,7 @@ from a_share_quant.analysis.breadth import calculate_market_breadth
 from a_share_quant.contracts.realtime import DataQualityStatus, RealTimeQuote
 from a_share_quant.contracts.realtime_overlay import RealtimeOverlay
 from a_share_quant.data.realtime.base import RealTimeDataProvider
+from a_share_quant.data.realtime.cache import CachedQuoteSnapshot, RealtimeQuoteCache
 from a_share_quant.data.realtime.registry import (
     FailoverRealTimeProvider,
     ProviderRegistry,
@@ -76,6 +77,7 @@ class WorkbenchService:
         provider: RealTimeDataProvider | FailoverRealTimeProvider | None = None,
         registry: ProviderRegistry | None = None,
         store: RealTimeStore | None = None,
+        quote_cache: RealtimeQuoteCache | None = None,
         official_signal_store: OfficialSignalStore | None = None,
         realtime_overlay_store: RealtimeOverlayStore | None = None,
         symbols: Sequence[str] = (),
@@ -89,6 +91,7 @@ class WorkbenchService:
         telemetry_latency_samples: int = 256,
     ) -> None:
         self.store = store or RealTimeStore()
+        self.quote_cache = quote_cache
         self.official_signal_store = official_signal_store or OfficialSignalStore()
         self.realtime_overlay_store = realtime_overlay_store or RealtimeOverlayStore()
         self.registry = registry
@@ -102,9 +105,19 @@ class WorkbenchService:
         self.telemetry = ProviderTelemetry(max_latency_samples=telemetry_latency_samples)
         self._last_switch_event_count = 0
         self.state = WorkbenchState()
+        self._cached_snapshot: CachedQuoteSnapshot | None = None
+        self._cache_error: str | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._poll_interval_seconds = max(1.0, float(poll_interval_seconds))
+
+        if self.quote_cache is not None:
+            try:
+                self._cached_snapshot = self.quote_cache.load(now=self.clock())
+            except ValueError:
+                self._cache_error = "CACHE_REJECTED"
+            if self._cached_snapshot is not None:
+                self.store.put_quotes(self._cached_snapshot.quotes)
 
         if provider is None:
             self.registry = registry or build_default_registry()
@@ -151,6 +164,8 @@ class WorkbenchService:
         # the first refresh has not completed yet.  These rows are explicitly
         # marked stale/monitoring-only until a fresh quote is observed.
         self._apply_stored_signal_state(now=self.clock())
+        if self._cached_snapshot is not None:
+            self._apply_cached_state(now=self.clock(), error=self._cache_error or "CACHED_DATA")
         self.scheduler = (
             RealTimeScheduler(
                 provider=self._provider,
@@ -242,6 +257,14 @@ class WorkbenchService:
         self._record_new_fallbacks(observed_at=tick.timestamp)
 
         if not tick.updated:
+            if self._cached_snapshot is not None:
+                self._apply_cached_state(
+                    now=tick.timestamp,
+                    error=tick.error or tick.skip_reason or self._cache_error or "CACHED_DATA",
+                )
+                self.state.circuit_breaker_state = self.scheduler.circuit_breaker.state
+                self.state.provider_telemetry = self.telemetry.snapshot().to_dict()
+                return
             if tick.requested:
                 self.telemetry.record_failure(observed_at=tick.timestamp)
             report = self.live_quality_gate.evaluate(
@@ -257,6 +280,24 @@ class WorkbenchService:
             return
 
         quotes = self.store.quotes()
+        fresh_quotes = tuple(quote for quote in quotes if not quote.is_stale)
+        if self.quote_cache is not None and fresh_quotes:
+            try:
+                self.quote_cache.save(fresh_quotes, saved_at=tick.timestamp)
+                self._cached_snapshot = CachedQuoteSnapshot(
+                    quotes=tuple(
+                        replace(
+                            quote,
+                            quality_flag=DataQualityStatus.STALE,
+                            is_stale=True,
+                        )
+                        for quote in fresh_quotes
+                    ),
+                    saved_at=tick.timestamp,
+                )
+                self._cache_error = None
+            except ValueError:
+                self._cache_error = "CACHE_WRITE_FAILED"
         self.telemetry.record_success(
             provider=active_provider or "unknown",
             quotes=quotes,
@@ -301,6 +342,9 @@ class WorkbenchService:
         error: str,
         evidence_mode: str,
     ) -> None:
+        if self._cached_snapshot is not None:
+            self._apply_cached_state(now=now, error=error)
+            return
         self.state.updated_at = now.isoformat()
         self.state.last_error = error
         self.state.evidence_mode = evidence_mode
@@ -313,6 +357,25 @@ class WorkbenchService:
         self.state.data_age_seconds = None
         self.state.latency_ms = None
         self.state.provider_telemetry = self.telemetry.snapshot().to_dict()
+
+    def _apply_cached_state(self, *, now: datetime, error: str) -> None:
+        """Show the last validated snapshot without upgrading its quality."""
+
+        if self._cached_snapshot is None:
+            return
+        quotes = self._cached_snapshot.quotes
+        self._apply_quote_state(quotes, now=now, data_quality=DataQualityStatus.STALE)
+        self.state.updated_at = now.isoformat()
+        self.state.last_error = error
+        self.state.evidence_mode = "CACHED"
+        self.state.data_quality = DataQualityStatus.STALE.value
+        self.state.stale = True
+        self.state.schema_pass = False
+        self.state.continuous_updates = False
+        self.state.distinct_update_count = 0
+        self.state.last_update = _last_received_at(quotes)
+        self.state.data_age_seconds = _maximum_data_age(quotes, now=now)
+        self.state.latency_ms = None
 
     def _apply_quality_report(
         self,

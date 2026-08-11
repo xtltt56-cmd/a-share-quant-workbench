@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
@@ -206,14 +207,19 @@ def run_server(
     official_signal_path: Path | None = None,
     official_signal_store: OfficialSignalStore | None = None,
 ) -> None:
-    del repo_root  # reserved for future config loading; no path is trusted from HTTP
     official_store = official_signal_store or (
         OfficialSignalStore(path=official_signal_path)
         if official_signal_path is not None
         else None
     )
+    quote_cache = (
+        RealtimeQuoteCache(repo_root.resolve() / ".runtime" / "realtime" / "quotes.json")
+        if repo_root is not None
+        else None
+    )
     service = WorkbenchService(
         allow_network=allow_network,
+        quote_cache=quote_cache,
         official_signal_store=official_store,
     )
     service.start_background()

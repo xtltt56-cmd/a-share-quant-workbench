@@ -280,6 +280,9 @@ class ExecutionSpec:
     suspension_rule: bool
     minimum_order_size: float
     cash_constraint: bool
+    lot_size: int = 100
+    minimum_commission: float = 5.0
+    transfer_fee: float = 0.00001
 
     def __post_init__(self) -> None:
         signal = _as_date(self.signal_date, name="signal_date")
@@ -295,6 +298,13 @@ class ExecutionSpec:
                 raise ValueError(f"{name} must be non-negative")
         if not math.isfinite(float(self.minimum_order_size)) or self.minimum_order_size <= 0:
             raise ValueError("minimum_order_size must be positive")
+        if int(self.lot_size) != self.lot_size or int(self.lot_size) <= 0:
+            raise ValueError("lot_size must be a positive integer")
+        for name in ("minimum_commission", "transfer_fee"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        object.__setattr__(self, "lot_size", int(self.lot_size))
 
     def to_dict(self) -> dict[str, Any]:
         return {key: _json_value(value) for key, value in asdict(self).items()}
