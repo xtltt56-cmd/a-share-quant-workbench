@@ -122,3 +122,26 @@ def test_account_import_preview_and_confirm_use_identifier_only(tmp_path) -> Non
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_advisory_page_contains_chinese_account_import_workflow(tmp_path) -> None:
+    server, thread = _running_service(tmp_path)
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_address[1]}/advisory", timeout=3
+        ) as response:
+            html = response.read().decode("utf-8")
+        assert "券商导出文件导入" in html
+        assert "扫描导出文件" in html
+        assert "生成预览" in html
+        assert "确认导入" in html
+        assert "只读取固定收件箱" in html
+        assert "不会登录或控制券商客户端" in html
+        assert "系统不会提交委托" in html
+        assert "Broker Import" not in html
+        assert "Scan Files" not in html
+        assert "Confirm Import" not in html
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
