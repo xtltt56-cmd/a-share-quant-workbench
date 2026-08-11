@@ -1,7 +1,10 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from a_share_quant.account.ledger import AccountLedger
+from a_share_quant.account.importer import read_broker_file
 from a_share_quant.account.service import AccountEntryService
 from a_share_quant.account.store import JsonlLedgerStore
 
@@ -88,3 +91,25 @@ def test_csv_file_preview_uses_only_explicitly_mapped_columns(tmp_path) -> None:
 
     assert preview.accepted_rows == 1
     assert "do-not-store" not in str(preview)
+
+
+def test_csv_file_accepts_gb18030_from_chinese_broker(tmp_path) -> None:
+    source = tmp_path / "成交明细.csv"
+    source.write_bytes(
+        "证券名称,证券代码,成交数量,成交价格\n平安银行,000001,100,10.25\n".encode(
+            "gb18030"
+        )
+    )
+
+    rows, raw = read_broker_file(source)
+
+    assert raw == source.read_bytes()
+    assert rows[0]["证券代码"] == "000001"
+
+
+def test_excel_read_failure_is_sanitized(tmp_path) -> None:
+    source = tmp_path / "成交明细.xlsx"
+    source.write_bytes(b"not-an-excel-workbook")
+
+    with pytest.raises(ValueError, match="Excel import could not be read"):
+        read_broker_file(source)

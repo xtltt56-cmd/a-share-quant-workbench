@@ -92,10 +92,7 @@ def read_broker_file(source: Path) -> tuple[list[dict[str, Any]], bytes]:
         raise ValueError("broker import source exceeds the size limit")
     suffix = path.suffix.casefold()
     if suffix == ".csv":
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise ValueError("CSV must use UTF-8 encoding") from exc
+        text = _decode_csv(raw)
         return [dict(row) for row in csv.DictReader(text.splitlines())], raw
     if suffix not in {".xlsx", ".xls"}:
         raise ValueError("broker import supports only CSV, XLSX, or XLS")
@@ -168,3 +165,12 @@ def _parse_trade_date(value: Any, default: date) -> date:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _decode_csv(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("CSV encoding must be UTF-8 or GB18030")
