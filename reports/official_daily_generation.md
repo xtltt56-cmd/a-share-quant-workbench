@@ -8,7 +8,7 @@
 - 策略版本：`initial-free-data-v1`
 - 模型版本：`rule-ranking-v1`（非机器学习收益预测）
 - 估值因子：禁用（当前没有可验证的 PIT 基本面估值数据）
-- 本地数据根目录：`D:\量化交易\data`
+- 本地数据根目录：`data`
 - 持久化文件：`.runtime\signals\official-daily.json`
 
 ## 候选
