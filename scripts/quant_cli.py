@@ -12,6 +12,7 @@ from a_share_quant.data.realtime.diagnostics import (
     write_network_diagnostics_report,
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
+from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.storage.market_store import MarketDataStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.workbench.advisory_context import load_advisory_context, load_instrument_map
@@ -119,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "workbench":
         repo_root = Path(__file__).resolve().parents[1]
         official_signal_path = _inside(repo_root, args.official_signal_path)
-        official_signal_store = OfficialSignalStore(path=official_signal_path)
+        official_signal_store = load_or_generate_official_store(
+            official_signal_path,
+            repo_root=repo_root,
+        )
         known_instruments = _load_default_instrument_map()
         if args.advisory_instrument_map is not None:
             known_instruments = load_instrument_map(args.advisory_instrument_map)

@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
+from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
@@ -207,11 +208,15 @@ def run_server(
     official_signal_path: Path | None = None,
     official_signal_store: OfficialSignalStore | None = None,
 ) -> None:
-    official_store = official_signal_store or (
-        OfficialSignalStore(path=official_signal_path)
-        if official_signal_path is not None
-        else None
-    )
+    if official_signal_store is not None:
+        official_store = official_signal_store
+    elif repo_root is not None:
+        signal_path = official_signal_path or repo_root / ".runtime" / "signals" / "official-daily.json"
+        official_store = load_or_generate_official_store(signal_path, repo_root=repo_root)
+    elif official_signal_path is not None:
+        official_store = OfficialSignalStore(path=official_signal_path)
+    else:
+        official_store = None
     quote_cache = (
         RealtimeQuoteCache(repo_root.resolve() / ".runtime" / "realtime" / "quotes.json")
         if repo_root is not None
@@ -244,7 +249,13 @@ def main() -> int:
         help="allow real provider requests; without it the dashboard stays offline",
     )
     args = parser.parse_args()
-    run_server(port=args.port, allow_network=args.network)
+    repo_root = Path(__file__).resolve().parents[3]
+    run_server(
+        port=args.port,
+        allow_network=args.network,
+        repo_root=repo_root,
+        official_signal_path=repo_root / ".runtime" / "signals" / "official-daily.json",
+    )
     return 0
 
 
