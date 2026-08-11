@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from a_share_quant.account.importer import read_broker_file
+from a_share_quant.account.importer import preview_broker_rows, read_broker_file
 from a_share_quant.account.ledger import AccountLedger
 from a_share_quant.account.service import AccountEntryService
 from a_share_quant.account.store import JsonlLedgerStore
@@ -127,3 +127,21 @@ def test_xls_extension_with_gb18030_tabular_export_is_read_as_text(tmp_path) -> 
     assert raw == source.read_bytes()
     assert rows[0]["证券代码"] == '=\"002007\"'
     assert rows[0]["股票余额"] == "4200"
+
+
+def test_confirm_validated_preview_uses_same_idempotent_ledger_path(tmp_path) -> None:
+    ledger = AccountLedger(initial_cash=Decimal("100000"))
+    service = AccountEntryService(ledger=ledger, store=JsonlLedgerStore(tmp_path / "ledger.jsonl"))
+    preview = preview_broker_rows(
+        rows=[{"名称": "平安银行", "代码": "000001", "数量": "100", "价格": "10"}],
+        mapping={"name": "名称", "symbol": "代码", "quantity": "数量", "price": "价格"},
+        default_trade_date=date(2026, 8, 11),
+        source_bytes=b"validated-file",
+    )
+
+    first = service.confirm_validated_preview(preview)
+    second = service.confirm_validated_preview(preview)
+
+    assert first[0].idempotent is False
+    assert second[0].idempotent is True
+    assert len(service.store.load_fills()) == 1

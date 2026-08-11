@@ -60,6 +60,13 @@ class AccountEntryService:
         preview = self._previews.get(preview_id)
         if preview is None:
             raise ValueError("unknown or expired import preview")
+        return self.confirm_validated_preview(preview)
+
+    def confirm_validated_preview(self, preview: ImportPreview) -> tuple[LedgerReceipt, ...]:
+        """Confirm a preview that was validated by an external fixed-file boundary."""
+
+        if not isinstance(preview, ImportPreview):
+            raise TypeError("preview must be an ImportPreview")
         prospective = self._copy_ledger()
         prospective_receipts = [
             prospective.record_fill(event) for event in preview.candidate_events
