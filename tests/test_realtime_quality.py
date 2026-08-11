@@ -109,3 +109,18 @@ def test_timestamp_future_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="future"):
         tracker.observe("000001", NOW + timedelta(seconds=2), now=NOW)
+
+
+def test_future_exchange_quote_is_quarantined_and_never_good() -> None:
+    report = assess_quote_quality(
+        [_quote(age_seconds=-2)],
+        expected_symbols=["000001"],
+        now=NOW,
+        stale_after_seconds=60,
+    )
+
+    assert report.status.value == "STALE"
+    assert report.is_usable is False
+    assert report.can_generate_ready is False
+    assert report.quarantined_symbols == ("000001",)
+    assert report.quotes[0].is_stale is True

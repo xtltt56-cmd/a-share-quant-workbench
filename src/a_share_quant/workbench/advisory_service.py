@@ -19,6 +19,7 @@ from a_share_quant.account.store import JsonlLedgerStore
 from a_share_quant.advisory.engine import AdvisoryContext, AdvisoryEngine
 from a_share_quant.advisory.risk import RiskPolicy
 from a_share_quant.advisory.store import PredictionLedgerStore
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 
 _INITIALIZATION_FORMAT_VERSION = 1
 
@@ -45,6 +46,7 @@ class AdvisoryWorkbenchService:
         known_instruments: Mapping[str, str] | None = None,
         risk_policy: RiskPolicy | None = None,
         prediction_store: PredictionLedgerStore | None = None,
+        official_signal_store: OfficialSignalStore | None = None,
         context_provider: Callable[[], AdvisoryContext | None] | None = None,
         today: Callable[[], date] | None = None,
     ) -> None:
@@ -80,6 +82,7 @@ class AdvisoryWorkbenchService:
                 self._pending_initialization_cash = requested_initial_cash
         self._advisory_engine = AdvisoryEngine(risk_policy or RiskPolicy.conservative())
         self._prediction_store = prediction_store or PredictionLedgerStore()
+        self._official_signal_store = official_signal_store
         self._context_provider = context_provider
         self._today = today or date.today
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
@@ -201,6 +204,29 @@ class AdvisoryWorkbenchService:
         if context is None and self._context_provider is not None:
             context = self._context_provider()
         if context is None:
+            if self._official_signal_store is not None:
+                latest = self._official_signal_store.latest()
+                if latest:
+                    signal = latest[0]
+                    return {
+                        "state": "BLOCKED",
+                        "action_zh": "暂不操作",
+                        "reason_codes": [
+                            "OFFICIAL_RANKING_ONLY",
+                            "NO_CALIBRATED_RETURN_FORECAST",
+                        ],
+                        "suggested_quantity": 0,
+                        "market_validation": "LOCAL_DAILY_RANKING_ONLY",
+                        "manual_execution_required": True,
+                        "evidence_cutoff": signal.data_cutoff.isoformat(),
+                        "valid_until": signal.signal_date.isoformat(),
+                        "confidence": "0",
+                        "explanation_zh": (
+                            f"最新日选排名为 {signal.symbol}，但当前只有固定权重排序，"
+                            "尚无经过样本外校准的收益预测；在实时数据和模型验证完成前不生成买卖结论。"
+                        ),
+                        "notice_zh": "仅供人工复核；系统不会提交委托。",
+                    }
             return {
                 "state": "INSUFFICIENT_DATA",
                 "action_zh": "数据不足",
@@ -245,7 +271,12 @@ class AdvisoryWorkbenchService:
             "model_status": (
                 "FORECAST_RECORDS_PRESENT"
                 if self._prediction_store.predictions()
-                else "NO_FORECAST_RECORDS"
+                else (
+                    "RANKING_CANDIDATES_PRESENT"
+                    if self._official_signal_store is not None
+                    and self._official_signal_store.latest()
+                    else "NO_FORECAST_RECORDS"
+                )
             ),
             "data_status": "NO_LIVE_MARKET_VALIDATION",
             "manual_execution_required": True,

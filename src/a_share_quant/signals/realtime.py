@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
 from math import isfinite
@@ -11,6 +11,7 @@ from typing import Any
 
 import pandas as pd
 
+from a_share_quant.contracts.modes import validate_data_mode
 from a_share_quant.contracts.realtime import DataQualityStatus
 from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.signals.frequency import ModelFrequency
@@ -55,6 +56,18 @@ class OfficialModelSignal:
     normalized_score: float
     strategy_version: str
     frequency: ModelFrequency = ModelFrequency.DAILY
+    name: str = ""
+    model_version: str = "unknown"
+    feature_version: str = "unknown"
+    data_mode: str = "historical"
+    source: str = "unknown"
+    data_cutoff: date | None = None
+    generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    rank: int | None = None
+    reasons: tuple[str, ...] = ()
+    reference_price: float | None = None
+    average_amount: float | None = None
+    invalidation_price: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -64,6 +77,47 @@ class OfficialModelSignal:
             raise ValueError("normalized_score must be between 0 and 100")
         if not self.strategy_version:
             raise ValueError("strategy_version is required")
+        mode = validate_data_mode(self.data_mode)
+        if mode == "fixture":
+            raise ValueError("fixture data cannot become an official model signal")
+        object.__setattr__(self, "data_mode", mode)
+        source = str(self.source).strip()
+        if source.casefold() in {"fixture", "replay", "synthetic", "test", "test-data"}:
+            raise ValueError("non-market data cannot become an official model signal")
+        if not source:
+            raise ValueError("source is required")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "name", str(self.name).strip())
+        for version_field in ("model_version", "feature_version"):
+            value = str(getattr(self, version_field)).strip()
+            if not value:
+                raise ValueError(f"{version_field} is required")
+            object.__setattr__(self, version_field, value)
+        cutoff = self.data_cutoff or self.signal_date
+        if not isinstance(cutoff, date) or cutoff > self.signal_date:
+            raise ValueError("data_cutoff cannot be after signal_date")
+        object.__setattr__(self, "data_cutoff", cutoff)
+        generated_at = self.generated_at
+        if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+            raise ValueError("generated_at must be timezone-aware")
+        object.__setattr__(self, "generated_at", generated_at.astimezone(timezone.utc))
+        if self.rank is not None and (
+            not isinstance(self.rank, int) or isinstance(self.rank, bool) or self.rank < 1
+        ):
+            raise ValueError("rank must be a positive integer")
+        object.__setattr__(
+            self,
+            "reasons",
+            tuple(reason for reason in (str(item).strip() for item in self.reasons) if reason),
+        )
+        for numeric_field in ("reference_price", "average_amount", "invalidation_price"):
+            value = getattr(self, numeric_field)
+            if value is None:
+                continue
+            number = float(value)
+            if not isfinite(number) or number <= 0:
+                raise ValueError(f"{numeric_field} must be positive and finite")
+            object.__setattr__(self, numeric_field, number)
 
 
 @dataclass(frozen=True)

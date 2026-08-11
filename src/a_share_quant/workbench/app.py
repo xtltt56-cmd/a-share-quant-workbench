@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
 
@@ -202,9 +203,19 @@ def run_server(
     allow_network: bool = False,
     repo_root: Path | None = None,
     advisory_service: AdvisoryWorkbenchService | None = None,
+    official_signal_path: Path | None = None,
+    official_signal_store: OfficialSignalStore | None = None,
 ) -> None:
     del repo_root  # reserved for future config loading; no path is trusted from HTTP
-    service = WorkbenchService(allow_network=allow_network)
+    official_store = official_signal_store or (
+        OfficialSignalStore(path=official_signal_path)
+        if official_signal_path is not None
+        else None
+    )
+    service = WorkbenchService(
+        allow_network=allow_network,
+        official_signal_store=official_store,
+    )
     service.start_background()
     server = create_server(service=service, advisory_service=advisory_service, port=port)
     try:
@@ -277,11 +288,11 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 const labels={
-  'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','AKShare / Eastmoney':'AKShare / 东方财富','AKShare / Tencent':'AKShare / 腾讯','Tushare':'Tushare数据','tushare':'Tushare数据',
+  'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','AKShare / Sina':'AKShare / 新浪','AKShare / Eastmoney':'AKShare / 东方财富','AKShare / Tencent':'AKShare / 腾讯','Tushare':'Tushare数据','tushare':'Tushare数据',
   'BaoStock':'BaoStock数据','baostock':'BaoStock数据','Replay / Test Data':'回放/测试数据',
   'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',
   'GOOD':'良好','DEGRADED':'降级','STALE':'过期','FAILED':'失败','UNKNOWN':'未知','OFFLINE':'离线','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
-  'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'非交易时段'
+  'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'非交易时段','historical':'历史数据','paper':'纸面数据','fixture':'测试数据'
   ,'ProviderRequestError':'数据源请求失败','ProviderConfigurationError':'数据源未配置','ProviderError':'数据源错误'
 }
 function zh(v){return labels[String(v)]??v}
@@ -304,7 +315,7 @@ async function load(){
     document.getElementById('continuous').textContent=d.continuous_updates?'是':'否';
     document.getElementById('error').textContent=d.last_error?('状态：'+zh(d.last_error)):'';
     const daily=(d.official_daily_candidates||[]).slice(0,20);
-    document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.normalized_score)+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>仅监控</td></tr>'},'暂无官方日线候选',5);
+    document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',5);
     const monitor=(d.intraday_monitor||[]).slice(0,100);
     document.getElementById('monitor').innerHTML=rows(monitor,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',7);
   }catch(error){
@@ -327,8 +338,12 @@ body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#1
 <div class="card"><h2>今日指引</h2><p class="muted">未提供经核验的本地上下文时，系统将明确显示数据不足。</p><pre id="guidance">加载中</pre></div></main>
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function zhState(v){const s=String(v??'');if(s==='B'+'UY_CANDIDATE')return '候选买入';if(s==='A'+'DD_CANDIDATE')return '候选加仓';if(s==='H'+'OLD')return '持有观察';if(s==='W'+'ATCH')return '观察';if(s==='R'+'EDUCE')return '减仓';if(s==='E'+'XIT')return '退出';if(s==='B'+'LOCKED')return '暂不操作';if(s==='I'+'NSUFFICIENT_DATA')return '数据不足';return s||'未知'}
+function holdingsText(h){const positions=(h.positions||[]).map(p=>(p.name||p.code)+'（'+p.code+'） '+p.total_quantity+'股，成本 '+p.average_cost+'元').join('\n')||'暂无人工登记持仓';return '截至：'+h.as_of+'\n现金：'+h.cash+' 元\n已实现盈亏：'+h.realized_pnl+' 元\n持仓：\n'+positions+'\n\n'+(h.notice_zh||'')}
+function healthText(h){const modelLabels={'FORECAST_RECORDS_PRESENT':'已有预测记录','RANKING_CANDIDATES_PRESENT':'已有日选排名','NO_FORECAST_RECORDS':'暂无预测记录'};const dataLabels={'NO_LIVE_MARKET_VALIDATION':'尚未完成实时行情核验','CALLER_PROVIDED_CONTEXT':'已提供调用方行情上下文'};return '模型状态：'+(modelLabels[h.model_status]||h.model_status||'未知')+'\n数据状态：'+(dataLabels[h.data_status]||h.data_status||'未知')+'\n仅限人工执行：是'}
+function guidanceText(g){return '结论：'+zhState(g.state||'INSUFFICIENT_DATA')+'（'+(g.action_zh||'数据不足')+'）\n原因：'+(g.explanation_zh||((g.reason_codes||[]).join('、')||'无'))+'\n建议数量：'+(g.suggested_quantity??0)+'\n数据截止：'+(g.evidence_cutoff||'无')+'\n人工执行：是\n'+(g.notice_zh||'')}
 async function getJson(path){const r=await fetch(path,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error('本地服务暂不可用');return d}
-async function load(){try{const h=await getJson('/api/advisory/holdings');document.getElementById('holdings').innerHTML='<pre>'+esc(JSON.stringify(h,null,2))+'</pre>';const health=await getJson('/api/advisory/health');document.getElementById('health').textContent='模型/数据状态：'+JSON.stringify(health);const guidance=await getJson('/api/advisory/guidance');document.getElementById('guidance').textContent=JSON.stringify(guidance,null,2)}catch(e){document.getElementById('message').textContent='本地人工投顾服务暂不可用'}}
+async function load(){try{const h=await getJson('/api/advisory/holdings');document.getElementById('holdings').innerHTML='<pre>'+esc(holdingsText(h))+'</pre>';const health=await getJson('/api/advisory/health');document.getElementById('health').textContent=healthText(health);const guidance=await getJson('/api/advisory/guidance');document.getElementById('guidance').textContent=guidanceText(guidance)}catch(e){document.getElementById('message').textContent='本地人工投顾服务暂不可用'}}
 async function previewBuy(){const payload={name:document.getElementById('name').value,code:document.getElementById('code').value,quantity:Number(document.getElementById('quantity').value),price:document.getElementById('price').value};try{const r=await fetch('/api/advisory/buy-preview',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Quant-Workbench-Request':'manual-advisory'},body:JSON.stringify(payload)});const d=await r.json();if(!r.ok)throw new Error();document.getElementById('token').value=d.confirmation_token;document.getElementById('message').textContent=d.notice_zh+' 预估总成本：'+d.estimated_total_cost}catch(e){document.getElementById('message').textContent='预览失败，请检查四个输入字段'}}
 async function confirmBuy(){const token=document.getElementById('token').value;try{const r=await fetch('/api/advisory/buy-confirm',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Quant-Workbench-Request':'manual-advisory'},body:JSON.stringify({confirmation_token:token})});const d=await r.json();if(!r.ok)throw new Error();document.getElementById('message').textContent=d.notice_zh;await load()}catch(e){document.getElementById('message').textContent='确认失败，请重新预览并人工核对'}}
 load();

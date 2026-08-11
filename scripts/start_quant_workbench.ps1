@@ -5,7 +5,8 @@ param(
     [string]$AdvisoryInitialCash = '100000',
     [string]$AdvisoryLedger = '',
     [string]$AdvisoryContext = '',
-    [string]$AdvisoryInstrumentMap = ''
+    [string]$AdvisoryInstrumentMap = '',
+    [string]$OfficialSignalPath = ''
 )
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -17,6 +18,9 @@ $stderrPath = Join-Path $repoRoot 'logs\quant_workbench.stderr.log'
 
 if ([string]::IsNullOrWhiteSpace($AdvisoryLedger)) {
     $AdvisoryLedger = Join-Path $runtimeDir 'advisory\account-ledger.jsonl'
+}
+if ([string]::IsNullOrWhiteSpace($OfficialSignalPath)) {
+    $OfficialSignalPath = Join-Path $runtimeDir 'signals\official-daily.json'
 }
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
@@ -39,7 +43,7 @@ if (Test-Path -LiteralPath $pidPath) {
 }
 
 $cliPath = Join-Path $repoRoot 'scripts\quant_cli.py'
-$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash)
+$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath)
 if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
     $arguments += @('--advisory-context', $AdvisoryContext)
 }
@@ -48,7 +52,7 @@ if (-not [string]::IsNullOrWhiteSpace($AdvisoryInstrumentMap)) {
 }
 $arguments += '--network'
 if ($Offline) {
-    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash)
+    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath)
     if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
         $arguments += @('--advisory-context', $AdvisoryContext)
     }

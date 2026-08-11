@@ -14,6 +14,8 @@ import pytest
 from a_share_quant.advisory.contracts import ForecastRecord
 from a_share_quant.advisory.engine import AdvisoryContext
 from a_share_quant.advisory.risk import PortfolioRiskSnapshot
+from a_share_quant.signals.realtime import OfficialModelSignal
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.app import WorkbenchHTTPServer, create_server
 from a_share_quant.workbench.service import WorkbenchService
@@ -250,6 +252,44 @@ def test_model_and_data_health_does_not_claim_unavailable_live_validation(tmp_pa
         "data_status": "NO_LIVE_MARKET_VALIDATION",
         "manual_execution_required": True,
     }
+
+
+def test_daily_ranking_is_visible_but_guidance_stays_blocked_without_calibrated_forecast(
+    tmp_path,
+) -> None:
+    signal_store = OfficialSignalStore()
+    signal_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=date(2026, 8, 7),
+                symbol="600000",
+                name="浦发银行",
+                normalized_score=83.25,
+                strategy_version="initial-free-data-v1",
+                model_version="rule-ranking-v1",
+                feature_version="rule-features-v1-no-valuation",
+                data_mode="historical",
+                source="baostock",
+                data_cutoff=date(2026, 8, 7),
+                generated_at=datetime(2026, 8, 7, 8, tzinfo=timezone.utc),
+                rank=1,
+            )
+        ]
+    )
+    service = AdvisoryWorkbenchService(
+        initial_cash=100000,
+        ledger_path=tmp_path / "account-ledger.jsonl",
+        official_signal_store=signal_store,
+        today=lambda: date(2026, 8, 10),
+    )
+
+    guidance = service.today_guidance()
+
+    assert guidance["state"] == "BLOCKED"
+    assert guidance["action_zh"] == "暂不操作"
+    assert guidance["suggested_quantity"] == 0
+    assert guidance["manual_execution_required"] is True
+    assert service.model_data_health()["model_status"] == "RANKING_CANDIDATES_PRESENT"
 
 
 def test_advisory_routes_are_local_header_guarded_and_leave_restore_manual(tmp_path) -> None:

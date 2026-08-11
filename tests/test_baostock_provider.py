@@ -110,6 +110,20 @@ def test_baostock_provider_sanitizes_result_errors(monkeypatch: pytest.MonkeyPat
     assert "permission denied" not in str(error.value)
 
 
+def test_baostock_provider_maps_csi300_to_sh_index_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_baostock()
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    daily = BaoStockDataProvider().get_index_daily_bars(
+        "000300", "2026-08-08", "2026-08-08"
+    )
+
+    assert daily.loc[0, "symbol"] == "000300"
+    assert fake.daily_calls[0]["code"] == "sh.000300"
+
+
 def test_baostock_provider_requires_optional_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "baostock", None)
 

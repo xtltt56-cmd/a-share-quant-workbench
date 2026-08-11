@@ -116,7 +116,7 @@ class RuleFactorEngine:
                 factor
                 if factor in result.columns
                 else "value"
-                if factor == "valuation"
+                if factor == "valuation" and "value" in result.columns
                 else None
             )
             if source is None:

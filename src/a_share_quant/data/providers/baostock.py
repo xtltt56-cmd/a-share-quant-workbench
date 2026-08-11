@@ -97,9 +97,40 @@ class BaoStockDataProvider:
         end_date: date | str,
     ) -> pd.DataFrame:
         normalized = normalize_symbol(symbol)
+        return self._get_daily_bars(
+            normalized,
+            start_date=start_date,
+            end_date=end_date,
+            code=_baostock_code(normalized),
+        )
+
+    def get_index_daily_bars(
+        self,
+        symbol: str,
+        start_date: date | str,
+        end_date: date | str,
+    ) -> pd.DataFrame:
+        """Fetch an index series with BaoStock's index exchange mapping."""
+
+        normalized = normalize_symbol(symbol)
+        return self._get_daily_bars(
+            normalized,
+            start_date=start_date,
+            end_date=end_date,
+            code=_baostock_index_code(normalized),
+        )
+
+    def _get_daily_bars(
+        self,
+        normalized: str,
+        *,
+        start_date: date | str,
+        end_date: date | str,
+        code: str,
+    ) -> pd.DataFrame:
         try:
             result = self._client().query_history_k_data_plus(
-                code=_baostock_code(normalized),
+                code=code,
                 fields=self._daily_fields,
                 start_date=_format_date(start_date),
                 end_date=_format_date(end_date),
@@ -144,3 +175,9 @@ def _baostock_code(symbol: str) -> str:
         else "sz"
     )
     return f"{exchange}.{symbol}"
+
+
+def _baostock_index_code(symbol: str) -> str:
+    if symbol == "000300":
+        return "sh.000300"
+    return _baostock_code(symbol)

@@ -85,10 +85,25 @@ class LiveDataQualityGate:
         )
         if baseline.status in {DataQualityStatus.FAILED, DataQualityStatus.STALE}:
             self._reset_continuity()
+            # Keep a future-only snapshot distinguishable from an ordinary
+            # stale snapshot for telemetry compatibility.  It remains
+            # schema-invalid and can never reach GOOD; the quote-level
+            # validator has already quarantined every future row.
+            future_only = bool(materialized) and any(
+                quote.timestamp_exchange > reference for quote in materialized
+            )
             return self._report(
-                status=baseline.status,
+                status=(
+                    DataQualityStatus.DEGRADED
+                    if future_only
+                    else baseline.status
+                ),
                 schema_pass=False,
-                reason=baseline.reason,
+                reason=(
+                    "exchange timestamp is in the future"
+                    if future_only
+                    else baseline.reason
+                ),
             )
 
         schema_pass = baseline.status is DataQualityStatus.GOOD and _schema_passes(

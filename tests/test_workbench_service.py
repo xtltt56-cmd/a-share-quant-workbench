@@ -236,3 +236,100 @@ def test_workbench_without_capable_provider_stays_unavailable() -> None:
     assert service.health()["status"] == "DATA_UNAVAILABLE"
     assert state["last_error"] == "NO_PROVIDER"
     assert "secret payload" not in str(state)
+
+
+def test_workbench_exposes_persisted_daily_candidates_without_realtime_quotes() -> None:
+    now = datetime(2026, 8, 12, 9, 0, tzinfo=TZ)
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=datetime(2026, 8, 7).date(),
+                symbol="600000",
+                name="浦发银行",
+                normalized_score=88,
+                strategy_version="initial-free-data-v1",
+                model_version="rule-none-v1",
+                feature_version="rule-features-v1",
+                source="baostock",
+                rank=1,
+                reasons=("收盘价位于60日均线上方",),
+                reference_price=9.21,
+                average_amount=520_000_000,
+                invalidation_price=8.75,
+            )
+        ]
+    )
+
+    service = WorkbenchService(
+        provider=_provider(now),
+        official_signal_store=official_store,
+        allow_network=False,
+        clock=lambda: now,
+    )
+    state = service.snapshot()
+
+    assert state["official_daily_candidates"][0]["name"] == "浦发银行"
+    assert state["official_daily_candidates"][0]["data_mode"] == "historical"
+    assert state["official_daily_candidates"][0]["signal_stale"] is True
+    assert state["intraday_monitor"][0]["symbol"] == "600000"
+    assert state["intraday_monitor"][0]["state"] == "STALE_DATA"
+    assert state["intraday_monitor"][0]["data_quality"] == "FAILED"
+    assert state["intraday_monitor"][0]["current_price"] is None
+
+
+def test_workbench_prioritizes_official_candidates_in_realtime_monitor() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    ordinary = _provider(now).snapshot.quotes[0]
+    candidate_quote = RealTimeQuote(
+        symbol="600000",
+        market="A",
+        timestamp_exchange=now,
+        timestamp_received=now,
+        last=9.25,
+        previous_close=9.21,
+        open=9.22,
+        high=9.30,
+        low=9.18,
+        volume=100,
+        amount=925,
+        change_pct=0.43,
+        source="akshare",
+    )
+    provider = FakeProvider(
+        MarketSnapshot(
+            timestamp_exchange=now,
+            timestamp_received=now,
+            quotes=(ordinary, candidate_quote),
+            source="akshare",
+        )
+    )
+    provider.name = "akshare"
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=datetime(2026, 8, 7).date(),
+                symbol="600000",
+                normalized_score=88,
+                strategy_version="initial-free-data-v1",
+                source="baostock",
+            )
+        ]
+    )
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    service = WorkbenchService(
+        provider=provider,
+        official_signal_store=official_store,
+        allow_network=True,
+        resolver=resolver,
+        clock=lambda: now,
+    )
+
+    state = service.refresh().to_dict()
+
+    assert state["intraday_monitor"][0]["symbol"] == "600000"
+    assert state["intraday_monitor"][0]["official_model_signal"] is True

@@ -38,7 +38,14 @@ def assess_quote_quality(
     quarantined: list[str] = []
     for quote in quotes:
         age = quote.data_age_seconds(now=reference)
-        if age > stale_after_seconds or quote.is_stale:
+        # A future exchange timestamp is not a fresh quote.  It usually means
+        # the provider returned a different timezone/trading date; accepting it
+        # would make the scheduler and trigger engine disagree about safety.
+        if (
+            quote.timestamp_exchange > reference
+            or age > stale_after_seconds
+            or quote.is_stale
+        ):
             quarantined.append(quote.symbol)
             checked.append(
                 replace(quote, is_stale=True, quality_flag=DataQualityStatus.STALE)

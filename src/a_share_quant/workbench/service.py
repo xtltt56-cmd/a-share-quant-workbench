@@ -146,6 +146,11 @@ class WorkbenchService:
         self._set_source_metadata(
             getattr(self._provider, "active_source_name", initial_provider)
         )
+        # Load the last validated daily candidates immediately.  The dashboard
+        # must not appear empty merely because the live provider is offline or
+        # the first refresh has not completed yet.  These rows are explicitly
+        # marked stale/monitoring-only until a fresh quote is observed.
+        self._apply_stored_signal_state(now=self.clock())
         self.scheduler = (
             RealTimeScheduler(
                 provider=self._provider,
@@ -317,12 +322,21 @@ class WorkbenchService:
         official_signals = {
             signal.symbol: signal for signal in self.official_signal_store.latest()
         }
-        self.state.quotes = [_quote_payload(quote, now=now) for quote in quotes[:100]]
-        breadth = calculate_market_breadth(quotes)
+        ordered_quotes = tuple(
+            sorted(
+                quotes,
+                key=lambda quote: (
+                    0 if quote.symbol in official_signals else 1,
+                    quote.symbol,
+                ),
+            )
+        )
+        self.state.quotes = [_quote_payload(quote, now=now) for quote in ordered_quotes[:100]]
+        breadth = calculate_market_breadth(ordered_quotes)
         self.state.breadth = _breadth_payload(breadth)
         monitor_rows: list[dict[str, Any]] = []
         overlays: list[RealtimeOverlay] = []
-        for quote in quotes[:100]:
+        for quote in ordered_quotes[:100]:
             official = official_signals.get(quote.symbol)
             signal = _monitor_signal(quote, official=official, now=now)
             overlay = _overlay_from_quote(
@@ -335,7 +349,19 @@ class WorkbenchService:
         self.realtime_overlay_store.put_overlays(overlays)
         self.state.intraday_monitor = monitor_rows
         self.state.official_daily_candidates = [
-            _official_signal_payload(signal) for signal in self.official_signal_store.latest()
+            _official_signal_payload(signal, now=now)
+            for signal in self.official_signal_store.latest()
+        ]
+
+    def _apply_stored_signal_state(self, *, now: datetime) -> None:
+        """Expose durable candidates while live quotes are unavailable."""
+
+        signals = self.official_signal_store.latest()
+        self.state.official_daily_candidates = [
+            _official_signal_payload(signal, now=now) for signal in signals
+        ]
+        self.state.intraday_monitor = [
+            _stale_candidate_payload(signal, now=now) for signal in signals
         ]
 
     def _record_new_fallbacks(self, *, observed_at: datetime) -> None:
@@ -444,14 +470,58 @@ def _overlay_from_quote(
     )
 
 
-def _official_signal_payload(signal: OfficialModelSignal) -> dict[str, Any]:
+def _official_signal_payload(
+    signal: OfficialModelSignal,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    reference = now or datetime.now(timezone.utc)
+    age_days = max(0, (reference.date() - signal.signal_date).days)
     return {
         "signal_date": signal.signal_date.isoformat(),
         "symbol": signal.symbol,
+        "name": signal.name,
         "normalized_score": signal.normalized_score,
         "strategy_version": signal.strategy_version,
+        "model_version": signal.model_version,
+        "feature_version": signal.feature_version,
+        "data_mode": signal.data_mode,
+        "source": signal.source,
+        "data_cutoff": signal.data_cutoff.isoformat() if signal.data_cutoff else None,
+        "generated_at": signal.generated_at.isoformat(),
+        "rank": signal.rank,
+        "reasons": list(signal.reasons),
+        "reference_price": signal.reference_price,
+        "average_amount": signal.average_amount,
+        "invalidation_price": signal.invalidation_price,
+        "signal_age_days": age_days,
+        "signal_stale": age_days > 3,
         "frequency": signal.frequency.value,
         "monitoring_only": True,
+    }
+
+
+def _stale_candidate_payload(signal: OfficialModelSignal, *, now: datetime) -> dict[str, Any]:
+    """Build a visible but non-actionable monitor row without inventing a quote."""
+
+    return {
+        "symbol": signal.symbol,
+        "state": RealtimeSignalState.STALE_DATA.value,
+        "score": signal.normalized_score,
+        "current_price": None,
+        "change_pct": None,
+        "data_quality": DataQualityStatus.FAILED.value,
+        "data_age_seconds": None,
+        "source": signal.source,
+        "quote_timestamp": None,
+        "quote_received_at": None,
+        "official_model_signal": True,
+        "monitoring_only": True,
+        "evaluated_at": now.isoformat(),
+        "reasons": ["等待经过核验的实时行情"],
+        "risks": ["无实时行情，禁止生成可执行买卖结论"],
+        "trigger_state": RealtimeSignalState.STALE_DATA.value,
+        "risk_state": "STALE",
     }
 
 
