@@ -3,8 +3,8 @@ from decimal import Decimal
 
 import pytest
 
-from a_share_quant.account.ledger import AccountLedger
 from a_share_quant.account.importer import read_broker_file
+from a_share_quant.account.ledger import AccountLedger
 from a_share_quant.account.service import AccountEntryService
 from a_share_quant.account.store import JsonlLedgerStore
 
@@ -113,3 +113,17 @@ def test_excel_read_failure_is_sanitized(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="Excel import could not be read"):
         read_broker_file(source)
+
+
+def test_xls_extension_with_gb18030_tabular_export_is_read_as_text(tmp_path) -> None:
+    source = tmp_path / "table.xls"
+    source.write_bytes(
+        "证券代码\t股票名称\t股票余额\t可用数量\t参考成本\n"
+        "=\"002007\"\t华兰生物\t4200\t4200\t31.961\n".encode("gb18030")
+    )
+
+    rows, raw = read_broker_file(source)
+
+    assert raw == source.read_bytes()
+    assert rows[0]["证券代码"] == '=\"002007\"'
+    assert rows[0]["股票余额"] == "4200"

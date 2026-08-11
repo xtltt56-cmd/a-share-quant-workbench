@@ -101,6 +101,10 @@ def read_broker_file(source: Path) -> tuple[list[dict[str, Any]], bytes]:
 
         frame = pd.read_excel(path, dtype=object)
     except Exception as exc:
+        if suffix == ".xls":
+            delimited_rows = _read_legacy_text_export(raw)
+            if delimited_rows is not None:
+                return delimited_rows, raw
         raise ValueError("Excel import could not be read") from exc
     sanitized = frame.where(frame.notna(), None)
     return [dict(row) for row in sanitized.to_dict(orient="records")], raw
@@ -114,8 +118,8 @@ def _row_to_event(
     default_trade_date: date,
     source_sha256: str,
 ) -> FillEvent:
-    side = TradeSide(str(row.get(mapping.get("side", ""), "BUY")).strip().upper())
-    symbol = normalize_symbol(row[mapping["symbol"]])
+    side = _parse_trade_side(row.get(mapping.get("side", "")))
+    symbol = normalize_symbol(_clean_export_value(row[mapping["symbol"]]))
     quantity = _positive_integer(row[mapping["quantity"]], field="quantity")
     parsed_price = price(row[mapping["price"]])
     if parsed_price <= 0:
@@ -163,6 +167,26 @@ def _parse_trade_date(value: Any, default: date) -> date:
     return date.fromisoformat(str(value))
 
 
+def _parse_trade_side(value: Any) -> TradeSide:
+    if value is None or not str(value).strip():
+        return TradeSide.BUY
+    normalized = str(value).strip().upper()
+    if normalized in {"BUY", "B", "买入", "证券买入", "买"}:
+        return TradeSide.BUY
+    if normalized in {"SELL", "S", "卖出", "证券卖出", "卖"}:
+        return TradeSide.SELL
+    raise ValueError("unsupported trade side")
+
+
+def _clean_export_value(value: Any) -> str:
+    text = str(value).strip()
+    if len(text) >= 4 and text.startswith('="') and text.endswith('"'):
+        return text[2:-1].strip()
+    if text.startswith("'"):
+        return text[1:].strip()
+    return text
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -174,3 +198,16 @@ def _decode_csv(raw: bytes) -> str:
         except UnicodeDecodeError:
             continue
     raise ValueError("CSV encoding must be UTF-8 or GB18030")
+
+
+def _read_legacy_text_export(raw: bytes) -> list[dict[str, Any]] | None:
+    try:
+        text = _decode_csv(raw)
+    except ValueError:
+        return None
+    if "\t" not in text or "\n" not in text:
+        return None
+    rows = [dict(row) for row in csv.DictReader(text.splitlines(), delimiter="\t")]
+    if not rows or not any(str(key).strip() for key in rows[0]):
+        return None
+    return rows
