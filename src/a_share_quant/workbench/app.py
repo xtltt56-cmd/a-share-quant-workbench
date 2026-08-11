@@ -341,7 +341,7 @@ const labels={
   'BaoStock':'BaoStock数据','baostock':'BaoStock数据','Replay / Test Data':'回放/测试数据',
   'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',
   'GOOD':'良好','DEGRADED':'降级','STALE':'过期','FAILED':'失败','UNKNOWN':'未知','OFFLINE':'离线','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
-  'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'非交易时段','historical':'历史数据','paper':'纸面数据','fixture':'测试数据'
+  'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'已收盘','NON_TRADING':'非交易日','PRE_MARKET':'盘前时段','LUNCH_BREAK':'午间休市','MARKET_CLOSED':'市场已收盘','MARKET_NOT_OPEN':'尚未开盘','MARKET_LUNCH_BREAK':'午间休市','historical':'历史数据','paper':'纸面数据','fixture':'测试数据'
   ,'ProviderRequestError':'数据源请求失败','ProviderConfigurationError':'数据源未配置','ProviderError':'数据源错误'
 }
 function zh(v){return labels[String(v)]??v}

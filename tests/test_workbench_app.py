@@ -68,6 +68,14 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "后端行情时间戳" in html
         assert "AKShare / 东方财富" in html
         assert "数据源请求失败" in html
+        assert "'MARKET_CLOSED':'市场已收盘'" in html
+        assert "'MARKET_NOT_OPEN':'尚未开盘'" in html
+        assert "'MARKET_LUNCH_BREAK':'午间休市'" in html
+        assert "'CLOSED':'已收盘'" in html
+        assert "'NON_TRADING':'非交易日'" in html
+        assert "'LUNCH_BREAK':'午间休市'" in html
+        assert "'PRE_MARKET':'盘前时段'" in html
+        assert "'CLOSED':'非交易时段'" not in html
         assert '<div class="label">ACTIVE SOURCE</div>' not in html
         assert '<div class="label">PUBLIC DATA SOURCE</div>' not in html
         assert "<th>Backend Quote Timestamp</th>" not in html
