@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from a_share_quant.contracts.realtime import MarketSnapshot, RealTimeQuote
+from a_share_quant.contracts.realtime import DataQualityStatus, MarketSnapshot, RealTimeQuote
 from a_share_quant.data.realtime.registry import ProviderRegistry
 from a_share_quant.runtime.scheduler import MarketHours, SessionResolver, StaticTradingCalendar
 from a_share_quant.signals.realtime import OfficialModelSignal
@@ -122,6 +122,37 @@ def test_workbench_service_exposes_paper_only_state_and_sanitized_snapshot() -> 
     assert state["intraday_monitor"][0]["quote_timestamp"] == now.isoformat()
     assert "BUY" not in str(state["intraday_monitor"][0])
     assert state["intraday_monitor"][0]["data_age_seconds"] == 0.0
+
+
+def test_workbench_blocks_ready_when_global_quality_is_not_good() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=82.5,
+                strategy_version="stage2-v1",
+            )
+        ]
+    )
+    service = WorkbenchService(
+        provider=_live_provider(now),
+        official_signal_store=official_store,
+        allow_network=False,
+        clock=lambda: now,
+    )
+
+    service._apply_quote_state(
+        service.provider.snapshot.quotes,
+        now=now,
+        data_quality=DataQualityStatus.FAILED,
+    )
+
+    monitor = service.snapshot()["intraday_monitor"][0]
+    assert monitor["state"] == "STALE_DATA"
+    assert monitor["data_quality"] == "FAILED"
 
 
 def test_workbench_requires_two_live_updates_before_exposing_good_quality() -> None:

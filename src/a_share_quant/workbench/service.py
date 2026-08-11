@@ -273,7 +273,15 @@ class WorkbenchService:
         replay = _is_replay_provider(active_provider, quotes)
         self._apply_quality_report(report, replay=replay)
         self.state.circuit_breaker_state = self.scheduler.circuit_breaker.state
-        self._apply_quote_state(quotes, now=tick.timestamp, data_quality=report.status)
+        # Replay fixtures are explicitly separated in the state evidence mode;
+        # keep their deterministic monitor behavior while applying the live
+        # quality gate to every real-market snapshot.
+        monitor_quality = DataQualityStatus.GOOD if replay else report.status
+        self._apply_quote_state(
+            quotes,
+            now=tick.timestamp,
+            data_quality=monitor_quality,
+        )
         self.state.last_update = _last_received_at(quotes)
         self.state.data_age_seconds = _maximum_data_age(quotes, now=tick.timestamp)
         telemetry = self.telemetry.snapshot()
@@ -338,7 +346,12 @@ class WorkbenchService:
         overlays: list[RealtimeOverlay] = []
         for quote in ordered_quotes[:100]:
             official = official_signals.get(quote.symbol)
-            signal = _monitor_signal(quote, official=official, now=now)
+            signal = _monitor_signal(
+                quote,
+                official=official,
+                data_quality=data_quality,
+                now=now,
+            )
             overlay = _overlay_from_quote(
                 quote,
                 signal=signal,
@@ -393,16 +406,22 @@ def _monitor_signal(
     quote: RealTimeQuote,
     *,
     official: OfficialModelSignal | None = None,
+    data_quality: DataQualityStatus = DataQualityStatus.GOOD,
     now: datetime,
 ) -> RealtimeMonitorSignal:
+    quality_blocks_ready = data_quality is not DataQualityStatus.GOOD
     return TriggerEngine().evaluate(
         {
             "symbol": quote.symbol,
             "timestamp_exchange": quote.timestamp_exchange,
             "current_price": quote.last,
             "change_pct": quote.change_pct,
-            "data_quality": quote.quality_flag.value,
-            "is_stale": quote.is_stale,
+            "data_quality": (
+                DataQualityStatus.STALE.value
+                if quality_blocks_ready
+                else quote.quality_flag.value
+            ),
+            "is_stale": quote.is_stale or quality_blocks_ready,
             "normalized_score": official.normalized_score if official is not None else None,
             "official_model_signal": official is not None,
         },
