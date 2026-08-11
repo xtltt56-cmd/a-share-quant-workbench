@@ -84,6 +84,8 @@
 .\scripts\stop_quant_workbench.ps1
 ```
 
+桌面快捷方式现在会同时打开主工作台和人工投顾。启动器会核对运行中的进程、联网/离线模式、Git 版本和 `src/`、`scripts/` 源码指纹：完全一致才复用；模式或程序有变化时会安全重启。它不会停止其他 Python 进程，也不会把 `.env`、账户数据或日志写入启动元数据。
+
 页面地址：
 
 - 主工作台：`http://127.0.0.1:8765/`
@@ -112,8 +114,8 @@ Invoke-RestMethod http://127.0.0.1:8765/api/state  | ConvertTo-Json -Depth 10
 
 ## 五、测试与审查证据
 
-- 全量测试：`417 passed, 1 skipped, 2 warnings`（2026-08-11 现场复核）。
-- 跳过项是 Windows 当前没有创建文件符号链接权限，不是业务失败。
+- 全量测试：`458 passed, 3 skipped, 2 warnings`（2026-08-11 最终现场复核）。
+- 3 个跳过项都是 Windows 当前没有创建文件符号链接权限，不是业务失败。
 - Ruff：`All checks passed!`
 - `git diff --check`：通过。
 - 重点覆盖：日选真实性与门槛、信号原子持久化、未来/过期/局部倒退行情隔离、免费实时源单位换算、中文页面、人工账本并发确认、备份恢复、QMT 只读安全边界和启动器路径安全。
@@ -140,6 +142,8 @@ Invoke-RestMethod http://127.0.0.1:8765/api/state  | ConvertTo-Json -Depth 10
 - `src/a_share_quant/workbench/service.py`：日选与盘中监控状态汇总。
 - `src/a_share_quant/workbench/advisory_service.py`：人工账本和指导建议边界。
 - `src/a_share_quant/integrations/qmt/read_only.py`：QMT 只读安全边界（尚未连接真实 SDK）。
+- `scripts/start_quant_workbench.ps1`：桌面入口、双页面打开和安全复用/重启。
+- `scripts/workbench_launch_helpers.ps1`、`scripts/workbench_code_fingerprint.py`：启动元数据、进程身份与跨 PowerShell 一致的源码指纹。
 - `reports/official_daily_generation.md`：本次日选生成记录。
 - `reports/realtime_data_smoke_test_current.md`：实时数据现场烟测记录。
 - `reports/network_diagnostics_current.md`：脱敏网络诊断记录。
