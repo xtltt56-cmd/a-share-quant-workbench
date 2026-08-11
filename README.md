@@ -364,3 +364,7 @@ RiceQuant 的 `idea-generation` 和 `report-renderer` Skill 已安装到本机�
 后续工作按 [生产可用化实施计划](docs/superpowers/plans/2026-08-11-a-share-production-readiness.md)
 执行。当前验收矩阵位于 [config/production_readiness.yaml](config/production_readiness.yaml)，
 其中 `BLOCKED` 和 `NOT_OBSERVED` 不会被汇总为可发布状态；系统只有在数据、样本外模型、指导、券商边界、界面和纸面安全门全部通过后，才可提升发布级别。
+
+## 财信导出文件导入
+
+系统支持把财信证券官方导出的成交明细或持仓文件放入固定收件箱后，在中文“本地人工投顾”页面预览并确认导入。详细步骤见 [财信导出文件导入操作手册](docs/ACCOUNT_IMPORT_GUIDE_ZH.md)。该功能不读取客户端私有协议、不保存账号密码、不提交委托；没有官方 API 授权时，不能宣称为实时券商连接。
