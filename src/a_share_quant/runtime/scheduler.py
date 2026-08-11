@@ -28,6 +28,14 @@ class MarketSession(str, Enum):
     NON_TRADING = "NON_TRADING"
 
 
+_NON_OPEN_REASON = {
+    MarketSession.PRE_MARKET: "MARKET_NOT_OPEN",
+    MarketSession.LUNCH_BREAK: "MARKET_LUNCH_BREAK",
+    MarketSession.CLOSED: "MARKET_CLOSED",
+    MarketSession.NON_TRADING: "MARKET_CLOSED",
+}
+
+
 @dataclass(frozen=True)
 class MarketHours:
     timezone: str = "Asia/Shanghai"
@@ -217,7 +225,7 @@ class RealTimeScheduler:
                 session=session,
                 requested=False,
                 updated=False,
-                skip_reason=f"market session is {session.value}",
+                skip_reason=_NON_OPEN_REASON[session],
             )
         try:
             snapshot = self._retry(self.provider.get_market_snapshot)

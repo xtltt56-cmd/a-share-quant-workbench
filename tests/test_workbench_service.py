@@ -279,8 +279,42 @@ def test_workbench_never_labels_a_non_requested_session_as_real_market() -> None
 
     state = service.refresh().to_dict()
 
-    assert state["evidence_mode"] == "OFFLINE"
+    assert state["session"] == "NON_TRADING"
+    assert state["last_error"] == "MARKET_CLOSED"
+    assert state["evidence_mode"] == "MARKET_CLOSED"
     assert state["data_quality"] == "FAILED"
+
+
+def test_workbench_labels_closed_session_without_calling_live_provider() -> None:
+    now = datetime(2026, 8, 10, 15, 5, tzinfo=TZ)
+    provider = _live_provider(now)
+    calls = 0
+    original = provider.get_market_snapshot
+
+    def counted_snapshot():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    provider.get_market_snapshot = counted_snapshot
+    service = WorkbenchService(
+        provider=provider,
+        allow_network=True,
+        resolver=SessionResolver(
+            hours=MarketHours(),
+            calendar=StaticTradingCalendar({now.date()}),
+        ),
+        clock=lambda: now,
+    )
+
+    state = service.refresh().to_dict()
+
+    assert calls == 0
+    assert state["session"] == "CLOSED"
+    assert state["last_error"] == "MARKET_CLOSED"
+    assert state["evidence_mode"] == "MARKET_CLOSED"
+    assert state["data_quality"] == "FAILED"
+    assert state["continuous_updates"] is False
 
 
 def test_workbench_offline_mode_does_not_call_provider() -> None:

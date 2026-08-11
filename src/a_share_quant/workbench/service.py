@@ -274,7 +274,11 @@ class WorkbenchService:
                 now=tick.timestamp,
             )
             self._apply_quality_report(report, replay=False)
-            self.state.evidence_mode = "OFFLINE"
+            self.state.evidence_mode = (
+                tick.skip_reason
+                if not tick.requested and tick.skip_reason
+                else "OFFLINE"
+            )
             self.state.circuit_breaker_state = self.scheduler.circuit_breaker.state
             self.state.provider_telemetry = self.telemetry.snapshot().to_dict()
             return

@@ -113,6 +113,52 @@ def test_scheduler_skips_lunch_break_and_nontrading_day() -> None:
     assert provider.calls == []
 
 
+def test_scheduler_emits_stable_non_open_status_codes_without_provider_calls() -> None:
+    trading_day = datetime(2026, 8, 10).date()
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({trading_day}),
+    )
+    moments = (
+        (
+            datetime(2026, 8, 10, 9, 10, tzinfo=TZ),
+            MarketSession.PRE_MARKET,
+            "MARKET_NOT_OPEN",
+        ),
+        (
+            datetime(2026, 8, 10, 12, 0, tzinfo=TZ),
+            MarketSession.LUNCH_BREAK,
+            "MARKET_LUNCH_BREAK",
+        ),
+        (
+            datetime(2026, 8, 10, 15, 5, tzinfo=TZ),
+            MarketSession.CLOSED,
+            "MARKET_CLOSED",
+        ),
+        (
+            datetime(2026, 8, 11, 10, 0, tzinfo=TZ),
+            MarketSession.NON_TRADING,
+            "MARKET_CLOSED",
+        ),
+    )
+    for now, expected_session, expected_reason in moments:
+        provider = FakeProvider(_snapshot(now))
+        scheduler = RealTimeScheduler(
+            provider=provider,
+            store=RealTimeStore(),
+            resolver=resolver,
+            clock=lambda now=now: now,
+        )
+
+        tick = scheduler.run_once()
+
+        assert tick.session is expected_session
+        assert tick.requested is False
+        assert tick.updated is False
+        assert tick.skip_reason == expected_reason
+        assert provider.calls == []
+
+
 def test_gap_recovery_reports_missing_intervals_and_uses_provider() -> None:
     tracker = GapRecoveryTracker(interval_seconds=60)
     first = datetime(2026, 8, 10, 1, 30, tzinfo=TZ)
