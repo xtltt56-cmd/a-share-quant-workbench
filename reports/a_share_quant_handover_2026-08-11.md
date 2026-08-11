@@ -112,7 +112,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/state  | ConvertTo-Json -Depth 10
 
 ## 五、测试与审查证据
 
-- 全量测试：`415 passed, 1 skipped, 2 warnings`（2026-08-11 现场复核）。
+- 全量测试：`417 passed, 1 skipped, 2 warnings`（2026-08-11 现场复核）。
 - 跳过项是 Windows 当前没有创建文件符号链接权限，不是业务失败。
 - Ruff：`All checks passed!`
 - `git diff --check`：通过。
