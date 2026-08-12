@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
@@ -60,6 +60,79 @@ class GuidanceState(str, Enum):
     T_PLUS_ONE_BLOCKED = "T_PLUS_ONE_BLOCKED"
     REDUCE_WATCH = "REDUCE_WATCH"
     HOLD_WATCH = "HOLD_WATCH"
+
+
+@dataclass(frozen=True)
+class PriceGuidanceObservation:
+    observation_id: str
+    plan_id: str
+    symbol: str
+    observed_at: datetime
+    quote_timestamp: datetime
+    current_price: Decimal | float | int | str
+    data_quality: str
+    state: GuidanceState | str
+    reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field in ("observation_id", "plan_id"):
+            value = str(getattr(self, field)).strip()
+            if not value:
+                raise ValueError(f"{field} is required")
+            object.__setattr__(self, field, value)
+        object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
+        object.__setattr__(self, "observed_at", _utc(self.observed_at, field="observed_at"))
+        object.__setattr__(
+            self,
+            "quote_timestamp",
+            _utc(self.quote_timestamp, field="quote_timestamp"),
+        )
+        if self.observed_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("observed_at cannot be in the future")
+        object.__setattr__(
+            self,
+            "current_price",
+            _decimal(self.current_price, field="current_price"),
+        )
+        quality = str(self.data_quality).strip().upper()
+        if quality not in {"GOOD", "STALE", "FAILED", "DEGRADED"}:
+            raise ValueError("invalid data quality")
+        object.__setattr__(self, "data_quality", quality)
+        state = (
+            self.state
+            if isinstance(self.state, GuidanceState)
+            else GuidanceState(str(self.state))
+        )
+        object.__setattr__(self, "state", state)
+        reasons = tuple(str(reason).strip() for reason in self.reason_codes)
+        if any(not reason for reason in reasons):
+            raise ValueError("reason_codes cannot contain empty values")
+        object.__setattr__(self, "reason_codes", reasons)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "plan_id": self.plan_id,
+            "symbol": self.symbol,
+            "observed_at": self.observed_at.isoformat(),
+            "quote_timestamp": self.quote_timestamp.isoformat(),
+            "current_price": _format_decimal(self.current_price),
+            "data_quality": self.data_quality,
+            "state": self.state.value,
+            "reason_codes": list(self.reason_codes),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PriceGuidanceObservation:
+        try:
+            values = dict(payload)
+            values["observed_at"] = datetime.fromisoformat(values["observed_at"])
+            values["quote_timestamp"] = datetime.fromisoformat(values["quote_timestamp"])
+            values["state"] = GuidanceState(values["state"])
+            values["reason_codes"] = tuple(values["reason_codes"])
+            return cls(**values)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("price guidance observation is invalid") from exc
 
 
 def _decimal(value: Any, *, field: str, quantize: bool = True) -> Decimal | None:
@@ -262,6 +335,7 @@ def _format_decimal(value: Decimal | None) -> str | None:
 __all__ = [
     "GuidanceLevel",
     "GuidanceState",
+    "PriceGuidanceObservation",
     "PriceGuidancePlan",
     "PricePlanType",
 ]
