@@ -16,7 +16,11 @@ from a_share_quant.data.realtime.diagnostics import (
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
 from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
-from a_share_quant.runtime.price_guidance import PriceGuidanceRuntime, load_bars
+from a_share_quant.runtime.price_guidance import (
+    PriceGuidanceRuntime,
+    load_bars,
+    load_or_generate_price_guidance_store,
+)
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.market_store import MarketDataStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
@@ -171,10 +175,14 @@ def main(argv: list[str] | None = None) -> int:
         research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
         research_supervisor = ResearchJobSupervisor(research_checkpoint_path.parent)
         governance = EvolutionRegistry()
-        price_guidance_store = PriceGuidanceStore(price_guidance_path)
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
             repo_root=repo_root,
+        )
+        price_guidance_store = load_or_generate_price_guidance_store(
+            price_guidance_path,
+            repo_root=repo_root,
+            official_signal_store=official_signal_store,
         )
         known_instruments = _load_default_instrument_map()
         if args.advisory_instrument_map is not None:

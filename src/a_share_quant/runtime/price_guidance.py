@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ from a_share_quant.advisory.price_contracts import (
 )
 from a_share_quant.advisory.price_engine import PriceGuidanceEngine
 from a_share_quant.features.price_guidance import build_price_features
+from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 
 
@@ -180,6 +181,47 @@ def load_bars(data_root: Path, symbols: tuple[str, ...]) -> dict[str, pd.DataFra
     return result
 
 
+def load_or_generate_price_guidance_store(
+    path: str | Path,
+    *,
+    repo_root: str | Path,
+    official_signal_store: OfficialSignalStore,
+) -> PriceGuidanceStore:
+    """Load durable plans and refresh daily plans from the latest official signals.
+
+    The workbench must not require a second operator command after daily signals
+    have been loaded.  This startup refresh only uses the local validated data
+    lake; missing or insufficient data keeps the previous artifact and leaves
+    the UI fail-closed.  Existing holding plans are preserved because account
+    state is owned by the manual-advisory boundary.
+    """
+
+    store = PriceGuidanceStore(path)
+    signals = official_signal_store.latest()
+    if not signals:
+        return store
+    symbols = tuple(signal.symbol for signal in signals)
+    calculation = max(signal.data_cutoff or signal.signal_date for signal in signals)
+    valid_for = calculation + timedelta(days=1)
+    existing_holding_plans = tuple(
+        item for item in store.plans() if item.plan_type is PricePlanType.HOLDING
+    )
+    try:
+        bars_by_symbol = load_bars(Path(repo_root).resolve() / "data", symbols)
+        if not bars_by_symbol:
+            return store
+        result = PriceGuidanceRuntime(
+            bars_by_symbol=bars_by_symbol,
+            store=store,
+            candidate_symbols=symbols,
+        ).generate(calculation, valid_for)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return store
+    if existing_holding_plans:
+        store.replace_plans(result.plans + existing_holding_plans)
+    return store
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成纸面价格指导计划")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -218,4 +260,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["PriceGuidanceRuntime", "PriceGuidanceRuntimeResult", "load_bars", "main"]
+__all__ = [
+    "PriceGuidanceRuntime",
+    "PriceGuidanceRuntimeResult",
+    "load_bars",
+    "load_or_generate_price_guidance_store",
+    "main",
+]

@@ -2,7 +2,7 @@
 
 日期：2026-08-12  
 当前分支：`codex/phase1-data-foundation`  
-合并提交：`de327c8 merge: complete price guidance and controlled evolution`；后续接线修复：`84dab17 fix: wire canonical daily closes into price guidance`
+合并提交：`de327c8 merge: complete price guidance and controlled evolution`；后续接线修复：`55c1db0 fix: wire canonical daily closes into price guidance`、`c7583b1 fix: refresh price guidance during workbench startup`
 
 ## 一、交付结论
 
@@ -45,6 +45,7 @@
 
 - `src/a_share_quant/runtime/research_jobs.py`：白名单研究任务、原子 JSON 检查点、损坏拒绝和安全停止。
 - `scripts/start_quant_workbench.ps1` / `scripts/stop_quant_workbench.ps1`：不创建开机启动；停止时先请求受保护的 loopback 安全退出，再只清理身份匹配的工作台进程。
+- 工作台启动时自动读取最新官方日选，并从本地真实日线刷新冻结价格计划；数据缺失或规则不满足时保留旧计划并故障关闭，不要求用户另行运行价格指导命令。
 - `docs/PRICE_GUIDANCE_GUIDE_ZH.md`：简体中文操作说明、字段含义、研究数量为 0 的原因、人工执行和免责声明。
 - `scripts/run_price_guidance_acceptance.py`：真实本地日线输入的纸面验收和故障关闭回放。
 
@@ -56,7 +57,7 @@
 D:\量化交易\.venv\Scripts\python.exe -m pytest -q
 ```
 
-结果：`536 passed, 3 skipped`。
+结果：`537 passed, 3 skipped`。
 
 3 个跳过均为当前 Windows 账户没有创建符号链接权限（WinError 1314）的能力型测试，不是业务失败。测试过程中有 2 个第三方库警告（Pandas 弃用提示、Qlib 链式赋值提示），不影响退出码。
 
@@ -71,7 +72,7 @@ git diff --check
 
 价格指导聚焦验收：`24 passed`（运行时、引擎、工作台和验收组合）；此前纸面验收记录为 `73 passed`。验收报告见 `reports/price_guidance_acceptance_2026-08-12.md`。
 
-本机真实数据核对（2026-08-12）：`.runtime/signals/official-daily.json` 含 10 条 BaoStock 日选候选，`.runtime/advisory/price-guidance.json` 已能读取对应日线。当前保守规则对其中 1 条生成研究参考价格边界，另外 9 条因边界一致性或风险距离门槛不满足而明确返回 `NO_RELIABLE_GUIDANCE`；页面显示“暂无可靠指导价”，建议数量仍为 0。这是故障关闭行为，不是用估算值填充价格。盘中快照已能覆盖这些候选，但免费 AKShare 端点存在延迟和部分过期，数据质量为 `DEGRADED` 时不会显示为可执行信号。
+本机真实数据核对（2026-08-12）：`.runtime/signals/official-daily.json` 含 10 条 BaoStock 日选候选，`.runtime/advisory/price-guidance.json` 已能读取对应日线。工作台重启后会自动加载 10 条计划；当前保守规则对其中 1 条生成研究参考价格边界，另外 9 条因边界一致性或风险距离门槛不满足而明确返回 `NO_RELIABLE_GUIDANCE`；页面显示“暂无可靠指导价”，建议数量仍为 0。这是故障关闭行为，不是用估算值填充价格。盘中快照已能覆盖这些候选，但免费 AKShare 端点存在延迟和部分过期，数据质量为 `DEGRADED` 时不会显示为可执行信号。
 
 ## 四、当前发布状态
 
