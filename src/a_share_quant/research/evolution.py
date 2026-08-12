@@ -93,6 +93,12 @@ class EvolutionRegistry:
     def register_report(self, report: EvolutionReport) -> None:
         self._reports[report.report_id] = report
 
+    def report(self, report_id: str) -> EvolutionReport:
+        report = self._reports.get(report_id)
+        if report is None:
+            raise ValueError("unknown evolution report")
+        return report
+
     def issue_confirmation_token(self, subject_id: str) -> str:
         report = self._reports.get(subject_id)
         if report is not None and report.status != "AWAITING_MANUAL_APPROVAL":
@@ -153,6 +159,9 @@ class EvolutionRegistry:
             hashlib.sha256(str(token).encode()).hexdigest(),
         ):
             raise ValueError("confirmation token is invalid or already used")
+
+    def invalidate_confirmation_token(self, subject_id: str) -> None:
+        self._tokens.pop(subject_id, None)
 
 
 __all__ = [

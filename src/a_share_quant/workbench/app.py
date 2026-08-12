@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
+from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
@@ -30,12 +32,15 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         service: WorkbenchService,
         advisory_service: AdvisoryWorkbenchService | None = None,
         supervisor: ResearchJobSupervisor | None = None,
+        governance: EvolutionRegistry | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
         self.service = service
         self.advisory_service = advisory_service
         self.supervisor = supervisor
+        self.governance = governance
+        self._governance_previews: dict[str, tuple[str, str, str]] = {}
         super().__init__(server_address, WorkbenchRequestHandler)
 
 
@@ -60,6 +65,8 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._write_advisory_response(lambda service: service.model_data_health())
         elif path == "/api/advisory/imports":
             self._write_advisory_response(lambda service: service.list_account_imports())
+        elif path == "/api/models/governance":
+            self._write_governance_state()
         elif path == "/api/refresh":
             self._write_json(
                 {"error": "use POST with the local refresh request header"},
@@ -87,6 +94,18 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/advisory/import-confirm":
             self._account_import_confirm()
+            return
+        if path == "/api/models/promotion-preview":
+            self._promotion_preview()
+            return
+        if path == "/api/models/promotion-confirm":
+            self._promotion_confirm()
+            return
+        if path == "/api/models/rollback-preview":
+            self._rollback_preview()
+            return
+        if path == "/api/models/rollback-confirm":
+            self._rollback_confirm()
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -173,6 +192,147 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             lambda service: service.confirm_account_import(payload["confirmation_token"])
         )
 
+    def _model_request_payload(self) -> dict[str, Any] | None:
+        if self.headers.get("X-Quant-Workbench-Request") != "model-governance":
+            self._write_json({"error": "local model governance request header required"}, status=HTTPStatus.FORBIDDEN)
+            return None
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";", maxsplit=1)[0].strip().casefold() != "application/json":
+            self._write_json({"error": "application/json is required"}, status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 4096:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            self._write_json({"error": "model governance request could not be processed"}, status=HTTPStatus.BAD_REQUEST)
+            return None
+
+    def _write_governance_state(self) -> None:
+        governance = self.server.governance
+        if governance is None:
+            self._write_json({"state": "UNAVAILABLE", "manual_execution_required": True})
+            return
+        self._write_json(
+            {
+                "state": "READY",
+                "champion_id": governance.champion_id,
+                "audit_count": len(governance.audit_log()),
+                "manual_execution_required": True,
+            }
+        )
+
+    def _promotion_preview(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"report_id"} or not isinstance(payload["report_id"], str):
+            self._write_json({"error": "report_id is required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        governance = self.server.governance
+        if governance is None:
+            self._write_json({"error": "model governance is unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        try:
+            report = governance.report(payload["report_id"])
+            if report.status != "AWAITING_MANUAL_APPROVAL":
+                raise ValueError("report is not awaiting manual approval")
+            token = governance.issue_confirmation_token(report.report_id)
+            digest = _governance_digest(report)
+            self.server._governance_previews[token] = ("promotion", report.report_id, digest)
+            self._write_json(
+                {
+                    "report_id": report.report_id,
+                    "candidate_id": report.candidate_id,
+                    "state": "AWAITING_MANUAL_APPROVAL",
+                    "checks": report.checks,
+                    "confirmation_token": token,
+                    "manual_execution_required": True,
+                }
+            )
+        except ValueError:
+            self._write_json({"error": "promotion report is unavailable"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _promotion_confirm(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"report_id", "confirmation_token"}:
+            self._write_json({"error": "report_id and confirmation_token are required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._confirm_governance("promotion", payload["report_id"], payload["confirmation_token"])
+
+    def _rollback_preview(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"record_id"} or not isinstance(payload["record_id"], str):
+            self._write_json({"error": "record_id is required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        governance = self.server.governance
+        if governance is None:
+            self._write_json({"error": "model governance is unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        try:
+            record = next(item for item in governance.audit_log() if item.record_id == payload["record_id"])
+            token = governance.issue_confirmation_token(record.record_id)
+            digest = _governance_digest(record)
+            self.server._governance_previews[token] = ("rollback", record.record_id, digest)
+            self._write_json(
+                {
+                    "record_id": record.record_id,
+                    "state": "AWAITING_MANUAL_APPROVAL",
+                    "champion_id": record.champion_id,
+                    "confirmation_token": token,
+                    "manual_execution_required": True,
+                }
+            )
+        except (StopIteration, ValueError):
+            self._write_json({"error": "rollback record is unavailable"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _rollback_confirm(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"record_id", "confirmation_token"}:
+            self._write_json({"error": "record_id and confirmation_token are required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._confirm_governance("rollback", payload["record_id"], payload["confirmation_token"])
+
+    def _confirm_governance(self, action: str, subject_id: Any, token: Any) -> None:
+        governance = self.server.governance
+        preview = self.server._governance_previews.pop(str(token), None)
+        if governance is None or preview is None or preview[0] != action or preview[1] != subject_id:
+            self._write_json({"error": "confirmation is invalid", "state": "CONFIRMATION_INVALID"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            current = governance.report(subject_id) if action == "promotion" else next(
+                item for item in governance.audit_log() if item.record_id == subject_id
+            )
+            if _governance_digest(current) != preview[2]:
+                governance.invalidate_confirmation_token(str(subject_id))
+                self._write_json({"error": "report changed after preview", "state": "REPORT_CHANGED"}, status=HTTPStatus.CONFLICT)
+                return
+            result = (
+                governance.approve(subject_id, confirmation_token=str(token))
+                if action == "promotion"
+                else governance.rollback(subject_id, confirmation_token=str(token))
+            )
+            self._write_json(
+                {
+                    "record_id": result.record_id,
+                    "champion_id": result.champion_id,
+                    "action": result.action,
+                    "manual_execution_required": True,
+                }
+            )
+        except (StopIteration, ValueError):
+            self._write_json({"error": "confirmation is invalid", "state": "CONFIRMATION_INVALID"}, status=HTTPStatus.BAD_REQUEST)
+
     def _manual_request_payload(self) -> dict[str, Any] | None:
         if self.headers.get("X-Quant-Workbench-Request") != "manual-advisory":
             self._write_json(
@@ -249,6 +409,7 @@ def create_server(
     service: WorkbenchService | None = None,
     advisory_service: AdvisoryWorkbenchService | None = None,
     supervisor: ResearchJobSupervisor | None = None,
+    governance: EvolutionRegistry | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -259,6 +420,7 @@ def create_server(
         service or WorkbenchService(allow_network=False),
         advisory_service,
         supervisor,
+        governance,
     )
 
 
@@ -272,6 +434,7 @@ def run_server(
     official_signal_store: OfficialSignalStore | None = None,
     price_guidance_store: PriceGuidanceStore | None = None,
     supervisor: ResearchJobSupervisor | None = None,
+    governance: EvolutionRegistry | None = None,
 ) -> None:
     if official_signal_store is not None:
         official_store = official_signal_store
@@ -298,6 +461,7 @@ def run_server(
         service=service,
         advisory_service=advisory_service,
         supervisor=supervisor,
+        governance=governance,
         port=port,
     )
     try:
@@ -311,6 +475,22 @@ def run_server(
         service.stop_background()
         if supervisor is not None:
             supervisor.shutdown(timeout_seconds=5.0)
+
+
+def _governance_digest(value: Any) -> str:
+    if hasattr(value, "checks"):
+        payload = {
+            "id": getattr(value, "report_id", getattr(value, "record_id", "")),
+            "candidate_id": getattr(value, "candidate_id", ""),
+            "status": getattr(value, "status", getattr(value, "action", "")),
+            "checks": getattr(value, "checks", None),
+            "champion_id": getattr(value, "champion_id", None),
+            "previous_champion_id": getattr(value, "previous_champion_id", None),
+        }
+    else:
+        payload = value
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def main() -> int:
@@ -427,7 +607,8 @@ body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#1
 <div class="card"><h2>持仓与状态</h2><div id="holdings" class="muted">加载中</div><div id="holding-guidance" class="muted"></div><div id="health" class="muted"></div></div>
 <div class="card"><h2>券商导出文件导入</h2><p class="muted">只读取固定收件箱，不会登录或控制券商客户端。请先在财信客户端使用官方导出功能，再在这里预览和确认；系统不会提交委托。</p><p><select id="import-file"><option value="">请先扫描导出文件</option></select> <button onclick="scanImports()">扫描导出文件</button> <button onclick="previewImport()">生成预览</button> <button id="confirm-import" onclick="confirmImport()" disabled>确认导入</button></p><pre id="import-preview">尚未生成预览</pre><p id="import-message" class="warn"></p></div>
 <div class="card"><h2>人工成交记录</h2><p class="muted">输入只包含名称、代码、数量和价格。先预览，再使用一次性确认令牌记录人工成交。</p><div class="grid"><label>证券名称<input id="name" value=""></label><label>证券代码<input id="code" value=""></label><label>数量<input id="quantity" inputmode="numeric" value=""></label><label>价格<input id="price" inputmode="decimal" value=""></label></div><p><button onclick="previewBuy()">预览人工成交</button> <button onclick="confirmBuy()">确认记录人工成交</button></p><label>确认令牌<input id="token" readonly></label><p id="message" class="warn"></p></div>
-<div class="card"><h2>今日指引</h2><p class="muted">未提供经核验的本地上下文时，系统将明确显示数据不足。</p><pre id="guidance">加载中</pre></div></main>
+<div class="card"><h2>今日指引</h2><p class="muted">未提供经核验的本地上下文时，系统将明确显示数据不足。</p><pre id="guidance">加载中</pre></div>
+<div class="card"><h2>模型治理</h2><p class="muted">挑战者仅影子运行；满足门槛后仍需人工批准，系统不会自动晋级。</p><div id="governance">当前冠军：加载中；挑战者：无；状态：影子运行。</div><p class="warn">等待人工批准 · 可审计回滚 · 仅供研究和人工复核</p></div></main>
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function zhState(v){const s=String(v??'');if(s==='B'+'UY_CANDIDATE')return '候选买入';if(s==='A'+'DD_CANDIDATE')return '候选加仓';if(s==='H'+'OLD')return '持有观察';if(s==='W'+'ATCH')return '观察';if(s==='R'+'EDUCE')return '减仓';if(s==='E'+'XIT')return '退出';if(s==='B'+'LOCKED')return '暂不操作';if(s==='I'+'NSUFFICIENT_DATA')return '数据不足';return s||'未知'}

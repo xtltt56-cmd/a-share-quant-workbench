@@ -14,9 +14,10 @@ from a_share_quant.data.realtime.diagnostics import (
     write_network_diagnostics_report,
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
+from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
-from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.runtime.price_guidance import PriceGuidanceRuntime, load_bars
+from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.market_store import MarketDataStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
@@ -169,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         price_guidance_path = _inside(repo_root, args.price_guidance_path)
         research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
         research_supervisor = ResearchJobSupervisor(research_checkpoint_path.parent)
+        governance = EvolutionRegistry()
         price_guidance_store = PriceGuidanceStore(price_guidance_path)
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
@@ -200,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             official_signal_store=official_signal_store,
             price_guidance_store=price_guidance_store,
             supervisor=research_supervisor,
+            governance=governance,
         )
         return 0
     if args.command == "price-guidance":
