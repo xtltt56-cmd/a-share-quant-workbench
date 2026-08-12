@@ -160,6 +160,13 @@ def test_holdings_replays_local_jsonl_and_keeps_manual_execution_requirement(tmp
     assert holdings["positions"][0]["total_quantity"] == 100
 
 
+def test_holdings_expose_price_guidance_without_using_cost_as_current_price(tmp_path) -> None:
+    service = _service(tmp_path)
+    result = service.holdings()
+    assert "price_guidance" in result
+    assert result["price_guidance"] == []
+
+
 def test_initial_cash_metadata_replays_a_confirmed_fill_after_zero_value_restart(tmp_path) -> None:
     first = _service(tmp_path)
     preview = first.preview_manual_buy(name="平安银行", code="000001", quantity=100, price=10)
