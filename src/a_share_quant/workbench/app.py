@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
+from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
 
@@ -239,6 +240,7 @@ def run_server(
     advisory_service: AdvisoryWorkbenchService | None = None,
     official_signal_path: Path | None = None,
     official_signal_store: OfficialSignalStore | None = None,
+    price_guidance_store: PriceGuidanceStore | None = None,
 ) -> None:
     if official_signal_store is not None:
         official_store = official_signal_store
@@ -258,6 +260,7 @@ def run_server(
         allow_network=allow_network,
         quote_cache=quote_cache,
         official_signal_store=official_store,
+        price_guidance_store=price_guidance_store,
     )
     service.start_background()
     server = create_server(service=service, advisory_service=advisory_service, port=port)
@@ -328,10 +331,10 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <p id="error" class="warn"></p></div>
 <div class="card"><h2>官方日线候选</h2>
 <p class="muted">日线模型分数与盘中观察分开显示。</p>
-<table><thead><tr><th>证券代码</th><th>分数</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
+<table><thead><tr><th>证券代码</th><th>分数</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
 <tbody id="daily"></tbody></table></div>
 <div class="card"><h2>盘中监控</h2><table><thead><tr>
-<th>证券代码</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
+<th>证券代码</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
 </tr></thead><tbody id="monitor"></tbody></table></div>
 </main>
 <script>
@@ -348,6 +351,7 @@ function zh(v){return labels[String(v)]??v}
 function display(v,fallback){return v===null||v===undefined||v===''?(fallback===undefined?'暂不可用':fallback):zh(v)}
 function seconds(v){return v===null||v===undefined?'暂不可用':String(v)+' 秒'}
 function millis(v){return v===null||v===undefined?'暂不可用':String(v)+' 毫秒'}
+function priceGuidance(g){if(!g)return '暂无可靠指导价';const state=zh(g.state||'NO_RELIABLE_GUIDANCE');const range=(g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无';return state+'：'+range+'；最高 '+(g.maximum_acceptable_price||'暂无')+'；失效 '+(g.invalidation_price||'暂无')}
 function rows(items,render,empty,colspan){
   return items.length?items.map(render).join(''):'<tr><td colspan="'+esc(colspan)+'" class="muted">'+esc(empty)+'</td></tr>'}
 async function load(){
@@ -364,9 +368,9 @@ async function load(){
     document.getElementById('continuous').textContent=d.continuous_updates?'是':'否';
     document.getElementById('error').textContent=d.last_error?('状态：'+zh(d.last_error)):'';
     const daily=(d.official_daily_candidates||[]).slice(0,20);
-    document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',5);
+    document.getElementById('daily').innerHTML=rows(daily,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',9);
     const monitor=(d.intraday_monitor||[]).slice(0,100);
-    document.getElementById('monitor').innerHTML=rows(monitor,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',7);
+    document.getElementById('monitor').innerHTML=rows(monitor,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',11);
   }catch(error){
     document.getElementById('error').textContent='状态：本地工作台暂不可用';
   }

@@ -453,3 +453,31 @@ def test_workbench_prioritizes_official_candidates_in_realtime_monitor() -> None
 
     assert state["intraday_monitor"][0]["symbol"] == "600000"
     assert state["intraday_monitor"][0]["official_model_signal"] is True
+
+
+def test_workbench_exposes_frozen_price_guidance_for_daily_candidates() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=82.5,
+                strategy_version="stage2-v1",
+                source="baostock",
+            )
+        ]
+    )
+    service = WorkbenchService(
+        provider=_live_provider(now),
+        official_signal_store=official_store,
+        allow_network=True,
+        clock=lambda: now,
+        resolver=SessionResolver(hours=MarketHours(), calendar=StaticTradingCalendar({now.date()})),
+        poll_interval_seconds=1,
+    )
+    state = service.refresh().to_dict()
+    row = state["intraday_monitor"][0]
+    assert "price_guidance" in row
+    assert row["price_guidance"]["manual_execution_required"] is True

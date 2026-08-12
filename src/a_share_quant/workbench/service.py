@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
+from a_share_quant.advisory.price_contracts import PriceGuidancePlan
+from a_share_quant.advisory.price_overlay import PriceGuidanceOverlay
 from a_share_quant.analysis.breadth import calculate_market_breadth
 from a_share_quant.contracts.realtime import DataQualityStatus, RealTimeQuote
 from a_share_quant.contracts.realtime_overlay import RealtimeOverlay
@@ -28,6 +30,7 @@ from a_share_quant.signals.realtime import (
     TriggerEngine,
 )
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
+from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.storage.realtime_overlay_store import RealtimeOverlayStore
 from a_share_quant.storage.realtime_store import RealTimeStore
 
@@ -57,6 +60,7 @@ class WorkbenchState:
     breadth: dict[str, Any] = field(default_factory=dict)
     intraday_monitor: list[dict[str, Any]] = field(default_factory=list)
     official_daily_candidates: list[dict[str, Any]] = field(default_factory=list)
+    price_guidance_plans: list[dict[str, Any]] = field(default_factory=list)
     paper_only: bool = True
     live_trading_enabled: bool = False
 
@@ -79,6 +83,7 @@ class WorkbenchService:
         store: RealTimeStore | None = None,
         quote_cache: RealtimeQuoteCache | None = None,
         official_signal_store: OfficialSignalStore | None = None,
+        price_guidance_store: PriceGuidanceStore | None = None,
         realtime_overlay_store: RealtimeOverlayStore | None = None,
         symbols: Sequence[str] = (),
         allow_network: bool = False,
@@ -93,6 +98,8 @@ class WorkbenchService:
         self.store = store or RealTimeStore()
         self.quote_cache = quote_cache
         self.official_signal_store = official_signal_store or OfficialSignalStore()
+        self.price_guidance_store = price_guidance_store
+        self.price_guidance_overlay = PriceGuidanceOverlay()
         self.realtime_overlay_store = realtime_overlay_store or RealtimeOverlayStore()
         self.registry = registry
         self.allow_network = allow_network
@@ -413,6 +420,7 @@ class WorkbenchService:
         official_signals = {
             signal.symbol: signal for signal in self.official_signal_store.latest()
         }
+        guidance_plans = self._guidance_plans_by_symbol()
         ordered_quotes = tuple(
             sorted(
                 quotes,
@@ -441,12 +449,22 @@ class WorkbenchService:
                 data_quality=data_quality,
             )
             monitor_rows.append(_monitor_payload(signal, quote=quote, overlay=overlay, now=now))
+            monitor_rows[-1]["price_guidance"] = self._quote_guidance_payload(
+                guidance_plans.get(quote.symbol), quote=quote, data_quality=data_quality, now=now
+            )
             overlays.append(overlay)
         self.realtime_overlay_store.put_overlays(overlays)
         self.state.intraday_monitor = monitor_rows
         self.state.official_daily_candidates = [
-            _official_signal_payload(signal, now=now)
+            _official_signal_payload(
+                signal,
+                now=now,
+                price_guidance=guidance_plans.get(signal.symbol),
+            )
             for signal in self.official_signal_store.latest()
+        ]
+        self.state.price_guidance_plans = [
+            item.to_dict() for item in self._guidance_plans()
         ]
 
     def _apply_stored_signal_state(self, *, now: datetime) -> None:
@@ -454,11 +472,92 @@ class WorkbenchService:
 
         signals = self.official_signal_store.latest()
         self.state.official_daily_candidates = [
-            _official_signal_payload(signal, now=now) for signal in signals
+            _official_signal_payload(
+                signal, now=now, price_guidance=self._guidance_plans_by_symbol().get(signal.symbol)
+            )
+            for signal in signals
         ]
         self.state.intraday_monitor = [
-            _stale_candidate_payload(signal, now=now) for signal in signals
+            {
+                **_stale_candidate_payload(signal, now=now),
+                "price_guidance": self._quote_guidance_payload(
+                    self._guidance_plans_by_symbol().get(signal.symbol),
+                    quote=None,
+                    data_quality=DataQualityStatus.FAILED,
+                    now=now,
+                ),
+            }
+            for signal in signals
         ]
+        self.state.price_guidance_plans = [item.to_dict() for item in self._guidance_plans()]
+
+    def _guidance_plans(self) -> tuple[PriceGuidancePlan, ...]:
+        if self.price_guidance_store is None:
+            return ()
+        try:
+            return self.price_guidance_store.plans()
+        except ValueError:
+            return ()
+
+    def _guidance_plans_by_symbol(self) -> dict[str, PriceGuidancePlan]:
+        return {
+            item.symbol: item
+            for item in self._guidance_plans()
+            if item.plan_type.value == "DAILY_CANDIDATE"
+        }
+
+    def _quote_guidance_payload(
+        self,
+        plan: PriceGuidancePlan | None,
+        *,
+        quote: RealTimeQuote | None,
+        data_quality: DataQualityStatus,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if plan is None:
+            return {
+                "state": "NO_RELIABLE_GUIDANCE",
+                "manual_execution_required": True,
+                "notice_zh": "暂无可靠指导价；当前标的没有冻结价格计划。",
+            }
+        if quote is None:
+            return {
+                **plan.to_dict(),
+                "state": "NO_RELIABLE_GUIDANCE",
+                "current_price": None,
+                "data_quality": data_quality.value,
+                "manual_execution_required": True,
+                "notice_zh": "暂无可靠指导价；尚无经过核验的盘中行情。",
+            }
+        try:
+            result = self.price_guidance_overlay.evaluate(
+                plan,
+                {
+                    "current_price": quote.last,
+                    "data_quality": data_quality.value,
+                    "quote_timestamp": quote.timestamp_exchange,
+                    "observed_at": quote.timestamp_received,
+                },
+                now=now,
+            )
+            return {
+                **plan.to_dict(),
+                **result.to_dict(),
+                "notice_zh": (
+                    "研究参考区间，尚未通过正式模型晋升门槛。"
+                    if plan.guidance_level.value == "RESEARCH_REFERENCE"
+                    else "仅供人工复核，系统不会提交委托。"
+                ),
+            }
+        except ValueError:
+            return {
+                **plan.to_dict(),
+                "state": "NO_RELIABLE_GUIDANCE",
+                "current_price": None,
+                "data_quality": data_quality.value,
+                "manual_execution_required": True,
+                "notice_zh": "暂无可靠指导价；计划已过期或行情时间无效。",
+            }
 
     def _record_new_fallbacks(self, *, observed_at: datetime) -> None:
         switch_events = tuple(getattr(self._provider, "switch_events", ()))
@@ -576,6 +675,7 @@ def _official_signal_payload(
     signal: OfficialModelSignal,
     *,
     now: datetime | None = None,
+    price_guidance: PriceGuidancePlan | None = None,
 ) -> dict[str, Any]:
     reference = now or datetime.now(timezone.utc)
     age_days = max(0, (reference.date() - signal.signal_date).days)
@@ -600,6 +700,15 @@ def _official_signal_payload(
         "signal_stale": age_days > 3,
         "frequency": signal.frequency.value,
         "monitoring_only": True,
+        "price_guidance": (
+            price_guidance.to_dict()
+            if price_guidance is not None
+            else {
+                "state": "NO_RELIABLE_GUIDANCE",
+                "manual_execution_required": True,
+                "notice_zh": "暂无可靠指导价；请先生成冻结价格计划。",
+            }
+        ),
     }
 
 
