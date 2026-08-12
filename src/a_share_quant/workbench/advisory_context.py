@@ -51,9 +51,7 @@ def load_advisory_context(path: str | Path) -> AdvisoryContext:
         "context artifact",
     )
     forecast_payload = _mapping(payload["forecast"], "forecast")
-    _require_keys(
-        forecast_payload,
-        {
+    forecast_fields = {
             "forecast_id",
             "symbol",
             "generated_at",
@@ -71,9 +69,32 @@ def load_advisory_context(path: str | Path) -> AdvisoryContext:
             "proposed_state",
             "report_id",
             "data_mode",
-        },
+        }
+    optional_forecast_fields = {
+        "benchmark_symbol",
+        "minimum_edge",
+        "calibration_version",
+        "interval_lower",
+        "interval_upper",
+        "interval_status",
+        "artifact_sha256",
+    }
+    _require_keys(
+        forecast_payload,
+        forecast_fields | optional_forecast_fields,
         "forecast",
+        allow_legacy=forecast_fields,
     )
+    for field, default in {
+        "benchmark_symbol": "",
+        "minimum_edge": "0",
+        "calibration_version": "",
+        "interval_lower": None,
+        "interval_upper": None,
+        "interval_status": "UNCALIBRATED",
+        "artifact_sha256": "",
+    }.items():
+        forecast_payload.setdefault(field, default)
     forecast = ForecastRecord(
         **{
             **forecast_payload,
@@ -148,8 +169,17 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _require_keys(payload: Mapping[str, Any], required: set[str], label: str) -> None:
-    if set(payload) != required:
+def _require_keys(
+    payload: Mapping[str, Any],
+    required: set[str],
+    label: str,
+    *,
+    allow_legacy: set[str] | None = None,
+) -> None:
+    accepted = [required]
+    if allow_legacy is not None:
+        accepted.append(allow_legacy)
+    if set(payload) not in accepted:
         raise ValueError(f"{label} context artifact fields are invalid")
 
 
