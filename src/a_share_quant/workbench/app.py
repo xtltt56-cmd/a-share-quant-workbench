@@ -107,6 +107,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/models/rollback-confirm":
             self._rollback_confirm()
             return
+        self._discard_request_body()
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def _safe_exit(self) -> None:
@@ -194,10 +195,12 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def _model_request_payload(self) -> dict[str, Any] | None:
         if self.headers.get("X-Quant-Workbench-Request") != "model-governance":
+            self._discard_request_body()
             self._write_json({"error": "local model governance request header required"}, status=HTTPStatus.FORBIDDEN)
             return None
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", maxsplit=1)[0].strip().casefold() != "application/json":
+            self._discard_request_body()
             self._write_json({"error": "application/json is required"}, status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             return None
         try:
@@ -211,6 +214,14 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
             self._write_json({"error": "model governance request could not be processed"}, status=HTTPStatus.BAD_REQUEST)
             return None
+
+    def _discard_request_body(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if 0 < length <= 1_048_576:
+            self.rfile.read(length)
 
     def _write_governance_state(self) -> None:
         governance = self.server.governance
@@ -335,6 +346,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def _manual_request_payload(self) -> dict[str, Any] | None:
         if self.headers.get("X-Quant-Workbench-Request") != "manual-advisory":
+            self._discard_request_body()
             self._write_json(
                 {
                     "error": "local manual advisory request header required",
@@ -345,6 +357,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return None
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", maxsplit=1)[0].strip().casefold() != "application/json":
+            self._discard_request_body()
             self._write_advisory_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             return None
         try:
