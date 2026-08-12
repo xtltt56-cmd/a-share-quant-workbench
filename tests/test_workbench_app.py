@@ -76,6 +76,9 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "最高可接受价" in html
         assert "失效价" in html
         assert "价格指导" in html
+        assert "失效价不低于入场下限" in html
+        assert "风险距离超过 12%" in html
+        assert "暂无可靠指导价；原因：" in html
         assert "AKShare / 东方财富" in html
         assert "数据源请求失败" in html
         assert "'MARKET_CLOSED':'市场已收盘'" in html

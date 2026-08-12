@@ -72,6 +72,32 @@ def test_holdings_are_added_and_missing_data_is_fail_closed(tmp_path) -> None:
     missing = next(item for item in result.plans if item.symbol == "000002")
     assert missing.state.value == "NO_RELIABLE_GUIDANCE"
     assert missing.suggested_quantity == 0
+    assert missing.reason_codes == ("NO_RELIABLE_GUIDANCE",)
+
+
+def test_invalid_candidate_plan_preserves_specific_rejection_reason(tmp_path) -> None:
+    store = PriceGuidanceStore(tmp_path / "guidance.json")
+    runtime = PriceGuidanceRuntime(
+        bars_by_symbol={"000001": _bars("000001")},
+        store=store,
+        candidate_symbols=("000001",),
+        engine=_RejectingEngine(),
+    )
+
+    result = runtime.generate(date(2026, 4, 15), date(2026, 4, 16))
+
+    assert result.plans[0].state.value == "NO_RELIABLE_GUIDANCE"
+    assert result.plans[0].reason_codes == ("RISK_DISTANCE_TOO_HIGH",)
+
+
+class _RejectingEngine:
+    def candidate_plan(self, *args, **kwargs):
+        from a_share_quant.advisory.price_engine import PriceGuidanceValidationError
+
+        raise PriceGuidanceValidationError(
+            "risk distance is outside configured bounds",
+            reason_codes=("RISK_DISTANCE_TOO_HIGH",),
+        )
 
 
 def test_adjustment_factor_change_recalculates_old_protection(tmp_path) -> None:

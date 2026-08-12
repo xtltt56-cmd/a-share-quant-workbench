@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from a_share_quant.advisory.price_contracts import PriceGuidancePlan
+from a_share_quant.advisory.price_contracts import GuidanceState, PriceGuidancePlan
 from a_share_quant.advisory.price_overlay import PriceGuidanceOverlay
 from a_share_quant.analysis.breadth import calculate_market_breadth
 from a_share_quant.contracts.realtime import DataQualityStatus, RealTimeQuote
@@ -525,8 +525,18 @@ class WorkbenchService:
         if plan is None:
             return {
                 "state": "NO_RELIABLE_GUIDANCE",
+                "reason_codes": ["PRICE_PLAN_MISSING"],
                 "manual_execution_required": True,
-                "notice_zh": "暂无可靠指导价；当前标的没有冻结价格计划。",
+                "notice_zh": _unavailable_guidance_notice(("PRICE_PLAN_MISSING",)),
+            }
+        if plan.state is GuidanceState.NO_RELIABLE_GUIDANCE:
+            return {
+                **plan.to_dict(),
+                "state": GuidanceState.NO_RELIABLE_GUIDANCE.value,
+                "current_price": quote.last if quote is not None else None,
+                "data_quality": data_quality.value,
+                "manual_execution_required": True,
+                "notice_zh": _unavailable_guidance_notice(plan.reason_codes),
             }
         if quote is None:
             return {
@@ -535,7 +545,7 @@ class WorkbenchService:
                 "current_price": None,
                 "data_quality": data_quality.value,
                 "manual_execution_required": True,
-                "notice_zh": "暂无可靠指导价；尚无经过核验的盘中行情。",
+                "notice_zh": "暂无可靠指导价；原因：尚无经过核验的盘中行情。",
             }
         try:
             result = self.price_guidance_overlay.evaluate(
@@ -564,7 +574,8 @@ class WorkbenchService:
                 "current_price": None,
                 "data_quality": data_quality.value,
                 "manual_execution_required": True,
-                "notice_zh": "暂无可靠指导价；计划已过期或行情时间无效。",
+                "reason_codes": ["PLAN_OR_QUOTE_INVALID"],
+                "notice_zh": "暂无可靠指导价；原因：计划已过期或行情时间无效。",
             }
 
     def _record_new_fallbacks(self, *, observed_at: datetime) -> None:
@@ -710,16 +721,43 @@ def _official_signal_payload(
         "signal_stale": age_days > 3,
         "frequency": signal.frequency.value,
         "monitoring_only": True,
-        "price_guidance": (
-            price_guidance.to_dict()
-            if price_guidance is not None
-            else {
-                "state": "NO_RELIABLE_GUIDANCE",
-                "manual_execution_required": True,
-                "notice_zh": "暂无可靠指导价；请先生成冻结价格计划。",
-            }
-        ),
+        "price_guidance": _official_price_guidance_payload(price_guidance),
     }
+
+
+def _official_price_guidance_payload(plan: PriceGuidancePlan | None) -> dict[str, Any]:
+    if plan is None:
+        return {
+            "state": GuidanceState.NO_RELIABLE_GUIDANCE.value,
+            "reason_codes": ["PRICE_PLAN_MISSING"],
+            "manual_execution_required": True,
+            "notice_zh": _unavailable_guidance_notice(("PRICE_PLAN_MISSING",)),
+        }
+    payload = plan.to_dict()
+    if plan.state is GuidanceState.NO_RELIABLE_GUIDANCE:
+        payload["notice_zh"] = _unavailable_guidance_notice(plan.reason_codes)
+    return payload
+
+
+_GUIDANCE_REASON_ZH = {
+    "INVALIDATION_NOT_BELOW_ENTRY": "失效价不低于入场下限",
+    "ENTRY_RANGE_INVERTED": "入场区间上下限倒置",
+    "ENTRY_ABOVE_MAXIMUM": "入场上限超过最高可接受价",
+    "PRICE_BOUNDARIES_INCONSISTENT": "价格边界不一致",
+    "RISK_DISTANCE_TOO_HIGH": "风险距离超过 12%",
+    "RISK_DISTANCE_TOO_LOW": "风险距离低于 2%",
+    "INSUFFICIENT_HISTORY": "历史数据不足 252 个交易日",
+    "UNSUPPORTED_SECURITY_RULES": "证券交易规则不受支持",
+    "PRICE_PLAN_MISSING": "尚未生成冻结价格计划",
+    "PLAN_OR_QUOTE_INVALID": "计划已过期或行情时间无效",
+    "NO_RELIABLE_GUIDANCE": "未通过价格边界或风险距离安全校验",
+}
+
+
+def _unavailable_guidance_notice(reason_codes: tuple[str, ...] | list[str]) -> str:
+    reasons = tuple(_GUIDANCE_REASON_ZH.get(str(code), str(code)) for code in reason_codes)
+    detail = "；".join(reasons) if reasons else "未提供具体原因"
+    return f"暂无可靠指导价；原因：{detail}。"
 
 
 def _stale_candidate_payload(signal: OfficialModelSignal, *, now: datetime) -> dict[str, Any]:

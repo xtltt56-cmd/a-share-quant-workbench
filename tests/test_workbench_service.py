@@ -484,3 +484,48 @@ def test_workbench_exposes_frozen_price_guidance_for_daily_candidates() -> None:
     row = state["intraday_monitor"][0]
     assert "price_guidance" in row
     assert row["price_guidance"]["manual_execution_required"] is True
+
+
+def test_workbench_exposes_specific_reason_for_unavailable_plan(tmp_path) -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=82.5,
+                strategy_version="stage2-v1",
+                source="baostock",
+            )
+        ]
+    )
+    from a_share_quant.advisory.price_contracts import PricePlanType
+    from a_share_quant.runtime.price_guidance import _unavailable_plan
+    from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
+    store = PriceGuidanceStore(tmp_path / "guidance.json")
+    store.replace_plans(
+        (
+            _unavailable_plan(
+                "000001",
+                PricePlanType.DAILY_CANDIDATE,
+                now.date(),
+                (now + timedelta(days=1)).date(),
+                ("INVALIDATION_NOT_BELOW_ENTRY",),
+            ),
+        )
+    )
+    service = WorkbenchService(
+        provider=_live_provider(now),
+        official_signal_store=official_store,
+        price_guidance_store=store,
+        allow_network=True,
+        clock=lambda: now,
+        resolver=SessionResolver(hours=MarketHours(), calendar=StaticTradingCalendar({now.date()})),
+    )
+
+    row = service.refresh().to_dict()["intraday_monitor"][0]["price_guidance"]
+
+    assert row["state"] == "NO_RELIABLE_GUIDANCE"
+    assert row["reason_codes"] == ["INVALIDATION_NOT_BELOW_ENTRY"]
+    assert "失效价不低于入场下限" in row["notice_zh"]

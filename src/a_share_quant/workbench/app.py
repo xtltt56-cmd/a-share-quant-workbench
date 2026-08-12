@@ -592,13 +592,25 @@ const labels={
   'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',
   'GOOD':'良好','DEGRADED':'降级','STALE':'过期','FAILED':'失败','UNKNOWN':'未知','OFFLINE':'离线','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
   'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'已收盘','NON_TRADING':'非交易日','PRE_MARKET':'盘前时段','LUNCH_BREAK':'午间休市','MARKET_CLOSED':'市场已收盘','MARKET_NOT_OPEN':'尚未开盘','MARKET_LUNCH_BREAK':'午间休市','historical':'历史数据','paper':'纸面数据','fixture':'测试数据'
-  ,'ProviderRequestError':'数据源请求失败','ProviderConfigurationError':'数据源未配置','ProviderError':'数据源错误'
+   ,'ProviderRequestError':'数据源请求失败','ProviderConfigurationError':'数据源未配置','ProviderError':'数据源错误',
+   'INVALIDATION_NOT_BELOW_ENTRY':'失效价不低于入场下限',
+   'ENTRY_RANGE_INVERTED':'入场区间上下限倒置',
+   'ENTRY_ABOVE_MAXIMUM':'入场上限超过最高可接受价',
+   'PRICE_BOUNDARIES_INCONSISTENT':'价格边界不一致',
+   'RISK_DISTANCE_TOO_HIGH':'风险距离超过 12%',
+   'RISK_DISTANCE_TOO_LOW':'风险距离低于 2%',
+   'INSUFFICIENT_HISTORY':'历史数据不足 252 个交易日',
+   'UNSUPPORTED_SECURITY_RULES':'证券交易规则不受支持',
+   'PRICE_PLAN_MISSING':'尚未生成冻结价格计划',
+   'PLAN_OR_QUOTE_INVALID':'计划已过期或行情时间无效',
+   'NO_RELIABLE_GUIDANCE':'暂无可靠指导价'
 }
 function zh(v){return labels[String(v)]??v}
 function display(v,fallback){return v===null||v===undefined||v===''?(fallback===undefined?'暂不可用':fallback):zh(v)}
 function seconds(v){return v===null||v===undefined?'暂不可用':String(v)+' 秒'}
 function millis(v){return v===null||v===undefined?'暂不可用':String(v)+' 毫秒'}
-function priceGuidance(g){if(!g)return '暂无可靠指导价';const state=zh(g.state||'NO_RELIABLE_GUIDANCE');const range=(g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无';return state+'：'+range+'；最高 '+(g.maximum_acceptable_price||'暂无')+'；失效 '+(g.invalidation_price||'暂无')}
+ function guidanceReasons(g){const reasons=(g&&g.reason_codes)||[];return reasons.length?reasons.map(function(x){return zh(x)}).join('；'):'未提供具体原因'}
+ function priceGuidance(g){if(!g)return '暂无可靠指导价；原因：尚未生成冻结价格计划';const state=zh(g.state||'NO_RELIABLE_GUIDANCE');const range=(g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无';const detail=g.state==='NO_RELIABLE_GUIDANCE'?'；原因：'+guidanceReasons(g):'';return state+'：'+range+'；最高 '+(g.maximum_acceptable_price||'暂无')+'；失效 '+(g.invalidation_price||'暂无')+detail}
 function rows(items,render,empty,colspan){
   return items.length?items.map(render).join(''):'<tr><td colspan="'+esc(colspan)+'" class="muted">'+esc(empty)+'</td></tr>'}
 async function load(){

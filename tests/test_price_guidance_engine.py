@@ -6,7 +6,10 @@ from decimal import Decimal
 import pytest
 
 from a_share_quant.advisory.price_contracts import GuidanceLevel, GuidanceState, PricePlanType
-from a_share_quant.advisory.price_engine import PriceGuidanceEngine
+from a_share_quant.advisory.price_engine import (
+    PriceGuidanceEngine,
+    PriceGuidanceValidationError,
+)
 from a_share_quant.features.price_guidance import PriceFeatures
 
 
@@ -59,7 +62,32 @@ def test_position_size_obeys_all_caps_and_round_lot() -> None:
 
 
 def test_invalid_risk_distance_is_blocked() -> None:
-    with pytest.raises(ValueError, match="risk distance"):
+    with pytest.raises(PriceGuidanceValidationError, match="risk distance") as error:
         PriceGuidanceEngine().candidate_plan(
             feature_snapshot(), previous_protection="9.95", promoted=False
         )
+    assert "RISK_DISTANCE_TOO_LOW" in error.value.reason_codes
+
+
+def test_invalid_boundaries_expose_machine_readable_reasons() -> None:
+    features = PriceFeatures(
+        symbol="000001",
+        cutoff=date(2026, 8, 12),
+        close=Decimal("10"),
+        raw_close=Decimal("10"),
+        high=Decimal("10.2"),
+        low=Decimal("9.8"),
+        atr14=Decimal("0.4"),
+        ma20=Decimal("9.9"),
+        ma60=Decimal("10.5"),
+        support20=Decimal("10.5"),
+        amount20=Decimal("20000000"),
+        adjustment_factor=Decimal("1"),
+        data_version="sha256:bars",
+    )
+    with pytest.raises(PriceGuidanceValidationError) as error:
+        PriceGuidanceEngine().candidate_plan(features, promoted=False)
+    assert error.value.reason_codes == (
+        "INVALIDATION_NOT_BELOW_ENTRY",
+        "RISK_DISTANCE_TOO_LOW",
+    )

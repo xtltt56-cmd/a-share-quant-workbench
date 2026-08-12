@@ -16,6 +16,14 @@ from a_share_quant.data.market_rules import resolve_security_rule
 from a_share_quant.features.price_guidance import PriceFeatures
 
 
+class PriceGuidanceValidationError(ValueError):
+    """A conservative plan was rejected, with safe diagnostic reason codes."""
+
+    def __init__(self, message: str, *, reason_codes: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.reason_codes = tuple(reason_codes)
+
+
 class PriceGuidanceEngine:
     def __init__(self, *, config_version: str = "price-guidance-rule-v1") -> None:
         self.config_version = config_version
@@ -55,11 +63,38 @@ class PriceGuidanceEngine:
         upper = _round_down(upper, rule.tick_size)
         maximum = _round_down(maximum, rule.tick_size)
         protection = _round_up(protection, rule.tick_size)
+        reasons: list[str] = []
         if not invalidation < lower <= upper <= maximum:
-            raise ValueError("price boundaries are inconsistent")
+            if invalidation >= lower:
+                reasons.append("INVALIDATION_NOT_BELOW_ENTRY")
+            if lower > upper:
+                reasons.append("ENTRY_RANGE_INVERTED")
+            if upper > maximum:
+                reasons.append("ENTRY_ABOVE_MAXIMUM")
+            if not reasons:
+                reasons.append("PRICE_BOUNDARIES_INCONSISTENT")
         risk_distance = (close - protection) / close
         if not Decimal("0.02") <= risk_distance <= Decimal("0.12"):
-            raise ValueError("risk distance is outside configured bounds")
+            reason = (
+                "RISK_DISTANCE_TOO_LOW"
+                if risk_distance < Decimal("0.02")
+                else "RISK_DISTANCE_TOO_HIGH"
+            )
+            reasons.append(reason)
+        if reasons:
+            boundary_failure = any(
+                reason.startswith(("INVALIDATION_", "ENTRY_", "PRICE_"))
+                for reason in reasons
+            )
+            message = (
+                "price boundaries are inconsistent"
+                if boundary_failure
+                else "risk distance is outside configured bounds"
+            )
+            raise PriceGuidanceValidationError(
+                message,
+                reason_codes=tuple(reasons),
+            )
         calculation = calculation_date or features.cutoff
         valid = valid_for or calculation + timedelta(days=1)
         level = GuidanceLevel.CONDITIONS_MET if promoted else GuidanceLevel.RESEARCH_REFERENCE
@@ -125,4 +160,4 @@ def _cutoff_utc(value: Any):
     return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
 
 
-__all__ = ["PriceGuidanceEngine"]
+__all__ = ["PriceGuidanceEngine", "PriceGuidanceValidationError"]

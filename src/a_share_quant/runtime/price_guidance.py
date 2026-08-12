@@ -17,7 +17,10 @@ from a_share_quant.advisory.price_contracts import (
     PriceGuidancePlan,
     PricePlanType,
 )
-from a_share_quant.advisory.price_engine import PriceGuidanceEngine
+from a_share_quant.advisory.price_engine import (
+    PriceGuidanceEngine,
+    PriceGuidanceValidationError,
+)
 from a_share_quant.features.price_guidance import build_price_features
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
@@ -89,6 +92,16 @@ class PriceGuidanceRuntime:
                         reasons.append("PREVIOUS_PROTECTION_REBASED")
                     plan = _as_holding_plan(plan, position, tuple(reasons))
                 plans.append(plan)
+            except PriceGuidanceValidationError as exc:
+                plans.append(
+                    _unavailable_plan(
+                        symbol,
+                        plan_type,
+                        calculation,
+                        valid,
+                        exc.reason_codes,
+                    )
+                )
             except Exception as exc:
                 plans.append(_unavailable_plan(symbol, plan_type, calculation, valid, _reason(exc)))
         result = PriceGuidanceRuntimeResult(tuple(plans), calculation, valid)
@@ -114,8 +127,9 @@ def _unavailable_plan(
     plan_type: PricePlanType,
     calculation: date,
     valid: date,
-    reason: str,
+    reason: str | tuple[str, ...],
 ) -> PriceGuidancePlan:
+    reasons = (reason,) if isinstance(reason, str) else tuple(reason)
     return PriceGuidancePlan(
         plan_id=f"price-{symbol}-{plan_type.value.lower()}-{calculation.isoformat()}",
         symbol=symbol,
@@ -142,7 +156,7 @@ def _unavailable_plan(
         feature_version="price-features-v1",
         config_version="price-guidance-rule-v1",
         data_version="unavailable",
-        reason_codes=(reason,),
+        reason_codes=reasons or ("NO_RELIABLE_GUIDANCE",),
     )
 
 
