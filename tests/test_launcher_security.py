@@ -21,6 +21,7 @@ def test_launcher_scripts_use_local_dashboard_and_no_broker_path() -> None:
     assert "Open-QuantWorkbenchPages -Port $Port" in content
     assert "--account-import-dir" in content
     assert "--account-snapshot-path" in content
+    assert "safe-exit" in content
 
 
 def test_start_launcher_opens_dashboard_and_advisory_for_both_success_paths() -> None:
@@ -33,6 +34,7 @@ def test_start_launcher_opens_dashboard_and_advisory_for_both_success_paths() ->
     assert '$advisoryUrl = "http://127.0.0.1:$Port/advisory"' in launcher
     assert "Start-Process $dashboardUrl" in launcher
     assert "Start-Process $advisoryUrl" in launcher
+    assert "api/system/safe-exit" not in launcher  # stop script owns the guarded shutdown request
     assert launcher.count("Open-QuantWorkbenchPages -Port $Port") == 2
     assert ".runtime\\advisory\\import-inbox" in launcher
 
@@ -53,6 +55,7 @@ def test_launcher_validates_runtime_before_reuse_or_stop() -> None:
         "Write-QuantLaunchMetadata",
         "Get-CimInstance Win32_Process",
         "REUSE",
+        "research-checkpoint",
     ):
         assert required in launcher
 
@@ -61,6 +64,7 @@ def test_launcher_validates_runtime_before_reuse_or_stop() -> None:
         "quant_workbench.launch.json",
         "Test-QuantWorkbenchCommandLine",
         "Remove-Item -LiteralPath $launchMetadataPath",
+        "api/system/safe-exit",
     ):
         assert required in stopper
 

@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
+from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
@@ -28,11 +29,13 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         service: WorkbenchService,
         advisory_service: AdvisoryWorkbenchService | None = None,
+        supervisor: ResearchJobSupervisor | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
         self.service = service
         self.advisory_service = advisory_service
+        self.supervisor = supervisor
         super().__init__(server_address, WorkbenchRequestHandler)
 
 
@@ -67,6 +70,9 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
+        if path == "/api/system/safe-exit":
+            self._safe_exit()
+            return
         if path == "/api/refresh":
             self._refresh()
             return
@@ -83,6 +89,28 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._account_import_confirm()
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _safe_exit(self) -> None:
+        if self.headers.get("X-Quant-Workbench-Request") != "safe-exit":
+            self._write_json(
+                {"error": "local safe-exit request header required"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+        supervisor = self.server.supervisor
+        if supervisor is None:
+            self._write_json(
+                {"error": "research supervisor is unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        result = supervisor.shutdown(timeout_seconds=5.0)
+        self._write_json(
+            {
+                "checkpoint_saved": result.checkpoint_saved,
+                "children_stopped": result.children_stopped,
+            }
+        )
 
     def _refresh(self) -> None:
         if self.headers.get("X-Quant-Workbench-Request") != "refresh":
@@ -220,6 +248,7 @@ def create_server(
     *,
     service: WorkbenchService | None = None,
     advisory_service: AdvisoryWorkbenchService | None = None,
+    supervisor: ResearchJobSupervisor | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -229,6 +258,7 @@ def create_server(
         (host, port),
         service or WorkbenchService(allow_network=False),
         advisory_service,
+        supervisor,
     )
 
 
@@ -241,6 +271,7 @@ def run_server(
     official_signal_path: Path | None = None,
     official_signal_store: OfficialSignalStore | None = None,
     price_guidance_store: PriceGuidanceStore | None = None,
+    supervisor: ResearchJobSupervisor | None = None,
 ) -> None:
     if official_signal_store is not None:
         official_store = official_signal_store
@@ -263,7 +294,12 @@ def run_server(
         price_guidance_store=price_guidance_store,
     )
     service.start_background()
-    server = create_server(service=service, advisory_service=advisory_service, port=port)
+    server = create_server(
+        service=service,
+        advisory_service=advisory_service,
+        supervisor=supervisor,
+        port=port,
+    )
     try:
         print(f"A股量化交易工作台：http://127.0.0.1:{server.server_address[1]}/")
         server.serve_forever()
@@ -273,6 +309,8 @@ def run_server(
         server.shutdown()
         server.server_close()
         service.stop_background()
+        if supervisor is not None:
+            supervisor.shutdown(timeout_seconds=5.0)
 
 
 def main() -> int:

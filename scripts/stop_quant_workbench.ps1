@@ -21,6 +21,17 @@ if ([int]::TryParse($pidText, [ref]$quantWorkbenchPid)) {
             -CommandLine $quantWorkbenchProcess.CommandLine `
             -RepoRoot $repoRoot
         if ($owned) {
+            try {
+                $safeExitHeaders = @{ 'X-Quant-Workbench-Request' = 'safe-exit' }
+                Invoke-WebRequest `
+                    -Uri 'http://127.0.0.1:8765/api/system/safe-exit' `
+                    -Method Post `
+                    -Headers $safeExitHeaders `
+                    -UseBasicParsing `
+                    -TimeoutSec 3 | Out-Null
+            } catch {
+                Write-Warning 'Research safe-exit did not respond; continuing with owned-process stop.'
+            }
             Stop-Process -Id $quantWorkbenchPid -ErrorAction SilentlyContinue
             Wait-Process -Id $quantWorkbenchPid -Timeout 5 -ErrorAction SilentlyContinue
             Write-Output "Quant Workbench stopped (PID $quantWorkbenchPid)."
