@@ -541,7 +541,15 @@ box-shadow:0 2px 8px #12233f12}
 button{background:#1d5fd1;color:white;border:0;border-radius:6px;padding:9px 14px;cursor:pointer}
 table{width:100%;border-collapse:collapse;background:white;margin-top:14px}
 .card table{margin-top:8px}
-th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px;vertical-align:top}th{color:#667085}
+.table-scroll{overflow-x:auto;max-width:100%}
+.monitor-table{min-width:1500px;table-layout:fixed}
+.monitor-table th,.monitor-table td{padding:10px 12px;line-height:1.45}
+.monitor-table th:first-child,.monitor-table td:first-child{width:155px;min-width:155px}
+.monitor-table th:nth-child(2),.monitor-table td:nth-child(2){width:78px;white-space:nowrap}
+.monitor-table th:nth-child(3),.monitor-table td:nth-child(3){width:82px;white-space:nowrap}
+.monitor-table th:nth-child(4),.monitor-table td:nth-child(4){width:82px;white-space:nowrap}
+.monitor-symbol{white-space:nowrap;font-weight:600;color:#172033}
+ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px;vertical-align:top}th{color:#667085}
 .muted{color:#667085}.safe{color:#147a46}.warn{color:#a15c00}.danger{color:#b42318}
 </style></head>
 <body><header><h1>A股量化交易工作台</h1>
@@ -564,9 +572,9 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <p class="muted">日线模型分数与盘中观察分开显示。</p>
 <table><thead><tr><th>证券代码</th><th>分数</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
 <tbody id="daily"></tbody></table></div>
-<div class="card"><h2>盘中监控</h2><table><thead><tr>
-<th>证券代码</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
-</tr></thead><tbody id="monitor"></tbody></table></div>
+<div class="card"><h2>盘中监控</h2><div class="table-scroll"><table class="monitor-table"><thead><tr>
+<th>股票名称（代码）</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
+</tr></thead><tbody id="monitor"></tbody></table></div></div>
 </main>
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -601,7 +609,7 @@ async function load(){
     const daily=(d.official_daily_candidates||[]).slice(0,20);
     document.getElementById('daily').innerHTML=rows(daily,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',9);
     const monitor=(d.intraday_monitor||[]).slice(0,100);
-    document.getElementById('monitor').innerHTML=rows(monitor,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',11);
+     document.getElementById('monitor').innerHTML=rows(monitor,function(x){const g=x.price_guidance||{};const label=(x.name?x.name+'（':'')+x.symbol+(x.name?'）':'');return '<tr><td class="monitor-symbol">'+esc(label)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',11);
   }catch(error){
     document.getElementById('error').textContent='状态：本地工作台暂不可用';
   }

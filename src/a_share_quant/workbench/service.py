@@ -448,7 +448,15 @@ class WorkbenchService:
                 signal=signal,
                 data_quality=data_quality,
             )
-            monitor_rows.append(_monitor_payload(signal, quote=quote, overlay=overlay, now=now))
+            monitor_rows.append(
+                _monitor_payload(
+                    signal,
+                    quote=quote,
+                    overlay=overlay,
+                    now=now,
+                    name=quote.name or (official.name if official is not None else None),
+                )
+            )
             monitor_rows[-1]["price_guidance"] = self._quote_guidance_payload(
                 guidance_plans.get(quote.symbol), quote=quote, data_quality=data_quality, now=now
             )
@@ -617,11 +625,13 @@ def _monitor_payload(
     quote: RealTimeQuote,
     overlay: RealtimeOverlay,
     now: datetime,
+    name: str | None = None,
 ) -> dict[str, Any]:
     payload = overlay.to_dict()
     payload["state"] = signal.state.value
     payload["evaluated_at"] = signal.evaluated_at.isoformat()
     payload["score"] = signal.score
+    payload["name"] = name
     payload["current_price"] = signal.current_price
     payload["change_pct"] = quote.change_pct
     payload["data_age_seconds"] = round(quote.data_age_seconds(now=now), 3)
@@ -717,6 +727,7 @@ def _stale_candidate_payload(signal: OfficialModelSignal, *, now: datetime) -> d
 
     return {
         "symbol": signal.symbol,
+        "name": signal.name,
         "state": RealtimeSignalState.STALE_DATA.value,
         "score": signal.normalized_score,
         "current_price": None,

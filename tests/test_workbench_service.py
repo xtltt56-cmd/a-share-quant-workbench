@@ -43,6 +43,7 @@ def _provider(now: datetime) -> FakeProvider:
         amount=1020,
         change_pct=2.0,
         source="replay",
+        name="平安银行",
     )
     return FakeProvider(
         MarketSnapshot(
@@ -120,6 +121,7 @@ def test_workbench_service_exposes_paper_only_state_and_sanitized_snapshot() -> 
     assert state["official_daily_candidates"][0]["normalized_score"] == 82.5
     assert state["intraday_monitor"][0]["state"] == "READY"
     assert state["intraday_monitor"][0]["official_model_signal"] is True
+    assert state["intraday_monitor"][0]["name"] == "平安银行"
     assert state["intraday_monitor"][0]["quote_timestamp"] == now.isoformat()
     assert "BUY" not in str(state["intraday_monitor"][0])
     assert state["intraday_monitor"][0]["data_age_seconds"] == 0.0
@@ -393,6 +395,7 @@ def test_workbench_exposes_persisted_daily_candidates_without_realtime_quotes() 
     assert state["official_daily_candidates"][0]["data_mode"] == "historical"
     assert state["official_daily_candidates"][0]["signal_stale"] is True
     assert state["intraday_monitor"][0]["symbol"] == "600000"
+    assert state["intraday_monitor"][0]["name"] == "浦发银行"
     assert state["intraday_monitor"][0]["state"] == "STALE_DATA"
     assert state["intraday_monitor"][0]["data_quality"] == "FAILED"
     assert state["intraday_monitor"][0]["current_price"] is None
