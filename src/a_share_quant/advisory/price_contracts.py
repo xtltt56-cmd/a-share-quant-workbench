@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
 
@@ -182,7 +181,11 @@ class PriceGuidancePlan:
             raise ValueError("research guidance quantity must be zero")
         if self.manual_execution_required is not True:
             raise ValueError("manual execution is required")
-        object.__setattr__(self, "evidence_cutoff", _utc(self.evidence_cutoff, field="evidence_cutoff"))
+        object.__setattr__(
+            self,
+            "evidence_cutoff",
+            _utc(self.evidence_cutoff, field="evidence_cutoff"),
+        )
         for field in ("model_version", "feature_version", "config_version", "data_version"):
             value = str(getattr(self, field)).strip()
             if not value:

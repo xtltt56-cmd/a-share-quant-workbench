@@ -110,10 +110,18 @@ def build_price_features(
     adjustment_factor = latest["raw_close"] / latest["close"]
     if not pd.notna(adjustment_factor) or adjustment_factor <= 0:
         raise ValueError("adjustment factor is invalid")
-    canonical_rows = frame.loc[:, ["symbol", "date", "high", "low", "close", "raw_close", "amount", "source"]]
+    canonical_rows = frame.loc[
+        :, ["symbol", "date", "high", "low", "close", "raw_close", "amount", "source"]
+    ]
     records = canonical_rows.astype({"date": str}).to_dict(orient="records")
     data_version = "sha256:" + hashlib.sha256(
-        json.dumps(records, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()
+        json.dumps(
+            records,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()
     return PriceFeatures(
         symbol=str(latest["symbol"]),
