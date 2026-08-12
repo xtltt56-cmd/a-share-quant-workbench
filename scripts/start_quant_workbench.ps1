@@ -44,11 +44,12 @@ if ([string]::IsNullOrWhiteSpace($AccountImportDirectory)) {
     $AccountImportDirectory = Join-Path $runtimeDir 'advisory\import-inbox'
 }
 $AccountSnapshotPath = Join-Path $runtimeDir 'advisory\imported-account-snapshot.json'
+$ResearchCheckpointPath = Join-Path $runtimeDir 'research-checkpoint.json'
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python environment not found: $pythonPath"
 }
-New-Item -ItemType Directory -Force -Path $runtimeDir, (Split-Path $stdoutPath), $AccountImportDirectory | Out-Null
+New-Item -ItemType Directory -Force -Path $runtimeDir, (Split-Path $stdoutPath), $AccountImportDirectory, (Split-Path $ResearchCheckpointPath) | Out-Null
 
 if (Test-Path -LiteralPath $pidPath) {
     $oldPidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
@@ -87,7 +88,7 @@ if (Test-Path -LiteralPath $pidPath) {
 }
 
 $cliPath = Join-Path $repoRoot 'scripts\quant_cli.py'
-$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath, '--account-import-dir', $AccountImportDirectory, '--account-snapshot-path', $AccountSnapshotPath)
+$arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath, '--account-import-dir', $AccountImportDirectory, '--account-snapshot-path', $AccountSnapshotPath, '--research-checkpoint', $ResearchCheckpointPath)
 if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
     $arguments += @('--advisory-context', $AdvisoryContext)
 }
@@ -96,7 +97,7 @@ if (-not [string]::IsNullOrWhiteSpace($AdvisoryInstrumentMap)) {
 }
 $arguments += '--network'
 if ($Offline) {
-    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath, '--account-import-dir', $AccountImportDirectory, '--account-snapshot-path', $AccountSnapshotPath)
+    $arguments = @('-X', 'utf8', $cliPath, 'workbench', '--port', $Port, '--advisory-ledger', $AdvisoryLedger, '--advisory-initial-cash', $AdvisoryInitialCash, '--official-signal-path', $OfficialSignalPath, '--account-import-dir', $AccountImportDirectory, '--account-snapshot-path', $AccountSnapshotPath, '--research-checkpoint', $ResearchCheckpointPath)
     if (-not [string]::IsNullOrWhiteSpace($AdvisoryContext)) {
         $arguments += @('--advisory-context', $AdvisoryContext)
     }

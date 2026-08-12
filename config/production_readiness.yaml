@@ -25,6 +25,12 @@ checks:
     status: BLOCKED
     evidence: reports/a_share_advisory_v1_acceptance.md
     blocking: true
+  - key: price_guidance_workflow
+    name: 价格指导工作流
+    category: advisory
+    status: PASS
+    evidence: reports/price_guidance_acceptance_2026-08-12.md
+    blocking: false
   - key: manual_account
     name: 人工账户账本
     category: account

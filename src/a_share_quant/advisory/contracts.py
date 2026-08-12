@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -65,6 +66,13 @@ class ForecastRecord:
     proposed_state: AdvisoryState | str = AdvisoryState.WATCH
     report_id: str = ""
     data_mode: str = "historical"
+    benchmark_symbol: str = ""
+    minimum_edge: Decimal | float | int | str = Decimal("0")
+    calibration_version: str = ""
+    interval_lower: Decimal | float | int | str | None = None
+    interval_upper: Decimal | float | int | str | None = None
+    interval_status: str = "UNCALIBRATED"
+    artifact_sha256: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.forecast_id).strip():
@@ -114,6 +122,43 @@ class ForecastRecord:
         object.__setattr__(self, "proposed_state", proposed_state)
         object.__setattr__(self, "report_id", str(self.report_id).strip())
         object.__setattr__(self, "data_mode", validate_data_mode(self.data_mode))
+        benchmark = str(self.benchmark_symbol).strip()
+        object.__setattr__(
+            self,
+            "benchmark_symbol",
+            normalize_symbol(benchmark) if benchmark else "",
+        )
+        minimum_edge = _decimal(self.minimum_edge, field="minimum_edge")
+        if minimum_edge < 0:
+            raise ValueError("minimum_edge cannot be negative")
+        object.__setattr__(self, "minimum_edge", minimum_edge.quantize(_RETURN))
+        object.__setattr__(self, "calibration_version", str(self.calibration_version).strip())
+        interval_status = str(self.interval_status).strip().upper()
+        if interval_status not in {"UNCALIBRATED", "CALIBRATED"}:
+            raise ValueError("interval_status must be UNCALIBRATED or CALIBRATED")
+        lower = _optional_decimal(self.interval_lower, field="interval_lower")
+        upper = _optional_decimal(self.interval_upper, field="interval_upper")
+        if (lower is None) != (upper is None):
+            raise ValueError("interval_lower and interval_upper must be provided together")
+        if lower is not None and (lower <= 0 or upper < lower):
+            raise ValueError("forecast interval prices are invalid")
+        if interval_status == "CALIBRATED" and lower is None:
+            raise ValueError("calibrated interval requires lower and upper prices")
+        object.__setattr__(
+            self,
+            "interval_lower",
+            lower.quantize(_PRICE) if lower is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "interval_upper",
+            upper.quantize(_PRICE) if upper is not None else None,
+        )
+        object.__setattr__(self, "interval_status", interval_status)
+        artifact = str(self.artifact_sha256).strip().lower()
+        if artifact and not re.fullmatch(r"[0-9a-f]{64}", artifact):
+            raise ValueError("artifact_sha256 must be a SHA-256 hex digest")
+        object.__setattr__(self, "artifact_sha256", artifact)
 
     @classmethod
     def for_horizons(
@@ -134,6 +179,13 @@ class ForecastRecord:
         uncertainties: Mapping[int, Decimal | float | int | str] | None = None,
         report_id: str = "",
         data_mode: str = "historical",
+        benchmark_symbol: str = "",
+        minimum_edge: Decimal | float | int | str = Decimal("0"),
+        calibration_version: str = "",
+        interval_lowers: Mapping[int, Decimal | float | int | str] | None = None,
+        interval_uppers: Mapping[int, Decimal | float | int | str] | None = None,
+        interval_status: str = "UNCALIBRATED",
+        artifact_sha256: str = "",
     ) -> tuple[ForecastRecord, ...]:
         """Build the 5/10/20-day records with deterministic IDs for idempotency."""
 
@@ -172,6 +224,13 @@ class ForecastRecord:
                     uncertainty=(uncertainties or {}).get(horizon, Decimal("0.5")),
                     report_id=report_id,
                     data_mode=data_mode,
+                    benchmark_symbol=benchmark_symbol,
+                    minimum_edge=minimum_edge,
+                    calibration_version=calibration_version,
+                    interval_lower=(interval_lowers or {}).get(horizon),
+                    interval_upper=(interval_uppers or {}).get(horizon),
+                    interval_status=interval_status,
+                    artifact_sha256=artifact_sha256,
                 )
             )
         return tuple(result)
@@ -228,3 +287,13 @@ def _forecast_id(
         )
     )
     return f"forecast-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _optional_decimal(
+    value: Decimal | float | int | str | None,
+    *,
+    field: str,
+) -> Decimal | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _decimal(value, field=field)

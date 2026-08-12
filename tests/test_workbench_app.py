@@ -66,6 +66,10 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "当前数据源" in html
         assert "数据源类别" in html
         assert "后端行情时间戳" in html
+        assert "参考买入区间" in html
+        assert "最高可接受价" in html
+        assert "失效价" in html
+        assert "价格指导" in html
         assert "AKShare / 东方财富" in html
         assert "数据源请求失败" in html
         assert "'MARKET_CLOSED':'市场已收盘'" in html
@@ -112,3 +116,47 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
 def test_dashboard_rejects_non_loopback_bind() -> None:
     with pytest.raises(ValueError, match="127.0.0.1"):
         create_server(host="0.0.0.0", port=0)
+
+
+def test_safe_exit_requires_guarded_loopback_post() -> None:
+    class Supervisor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def shutdown(self, *, timeout_seconds: float = 5.0):
+            self.calls += 1
+            return type(
+                "Result",
+                (),
+                {"checkpoint_saved": True, "children_stopped": True},
+            )()
+
+    supervisor = Supervisor()
+    server = create_server(service=FakeService(), supervisor=supervisor, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        with pytest.raises(HTTPError) as missing_header:
+            urlopen(
+                Request(
+                    f"http://127.0.0.1:{port}/api/system/safe-exit",
+                    method="POST",
+                ),
+                timeout=3,
+            )
+        assert missing_header.value.code == 403
+
+        request = Request(
+            f"http://127.0.0.1:{port}/api/system/safe-exit",
+            method="POST",
+            headers={"X-Quant-Workbench-Request": "safe-exit"},
+        )
+        with urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["checkpoint_saved"] is True
+        assert supervisor.calls == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)

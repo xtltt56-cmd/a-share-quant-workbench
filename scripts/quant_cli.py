@@ -14,9 +14,13 @@ from a_share_quant.data.realtime.diagnostics import (
     write_network_diagnostics_report,
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
+from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
+from a_share_quant.runtime.price_guidance import PriceGuidanceRuntime, load_bars
+from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.market_store import MarketDataStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
+from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.workbench.advisory_context import load_advisory_context, load_instrument_map
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.app import run_server
@@ -69,6 +73,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(".runtime/advisory/imported-account-snapshot.json"),
         help="local integrity-checked imported position snapshot",
+    )
+    workbench.add_argument(
+        "--price-guidance-path",
+        type=Path,
+        default=Path(".runtime/advisory/price-guidance.json"),
+        help="冻结价格指导计划存储路径",
+    )
+    workbench.add_argument(
+        "--research-checkpoint",
+        type=Path,
+        default=Path(".runtime/research-checkpoint.json"),
+        help="研究任务的可校验检查点路径",
     )
     mode = workbench.add_mutually_exclusive_group()
     mode.add_argument("--network", action="store_true", help="allow provider requests")
@@ -126,6 +142,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("reports/official_daily_generation.md"),
     )
     daily.add_argument("--top-k", type=int, default=10)
+    price_guidance = subcommands.add_parser("price-guidance", help="生成或查看冻结价格指导")
+    price_guidance_sub = price_guidance.add_subparsers(dest="price_guidance_command", required=True)
+    generate = price_guidance_sub.add_parser("generate")
+    generate.add_argument("--data-root", type=Path, default=Path("data"))
+    generate.add_argument(
+        "--output", type=Path, default=Path(".runtime/advisory/price-guidance.json")
+    )
+    generate.add_argument("--calculation-date", required=True)
+    generate.add_argument("--valid-for", required=True)
+    generate.add_argument("--symbols", nargs="+", required=True)
+    inspect = price_guidance_sub.add_parser("inspect")
+    inspect.add_argument(
+        "--output", type=Path, default=Path(".runtime/advisory/price-guidance.json")
+    )
+    inspect.add_argument("--symbol", default=None)
     return parser
 
 
@@ -136,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
         official_signal_path = _inside(repo_root, args.official_signal_path)
         account_import_dir = _operator_path(repo_root, args.account_import_dir)
         account_snapshot_path = _operator_path(repo_root, args.account_snapshot_path)
+        price_guidance_path = _inside(repo_root, args.price_guidance_path)
+        research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
+        research_supervisor = ResearchJobSupervisor(research_checkpoint_path.parent)
+        governance = EvolutionRegistry()
+        price_guidance_store = PriceGuidanceStore(price_guidance_path)
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
             repo_root=repo_root,
@@ -156,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             context_provider=context_provider,
             account_import_inbox=AccountImportInbox(account_import_dir),
             account_snapshot_store=AccountSnapshotStore(account_snapshot_path),
+            price_guidance_store=price_guidance_store,
         )
         run_server(
             port=args.port,
@@ -163,7 +200,29 @@ def main(argv: list[str] | None = None) -> int:
             allow_network=bool(args.network and not args.offline),
             advisory_service=advisory_service,
             official_signal_store=official_signal_store,
+            price_guidance_store=price_guidance_store,
+            supervisor=research_supervisor,
+            governance=governance,
         )
+        return 0
+    if args.command == "price-guidance":
+        repo_root = Path(__file__).resolve().parents[1]
+        output = _inside(repo_root, args.output)
+        store = PriceGuidanceStore(output)
+        if args.price_guidance_command == "inspect":
+            plans = store.plans()
+            if args.symbol:
+                plans = tuple(item for item in plans if item.symbol == args.symbol)
+            print(json.dumps([item.to_dict() for item in plans], ensure_ascii=False, indent=2))
+            return 0
+        data_root = _inside(repo_root, args.data_root)
+        symbols = tuple(args.symbols)
+        result = PriceGuidanceRuntime(
+            bars_by_symbol=load_bars(data_root, symbols),
+            store=store,
+            candidate_symbols=symbols,
+        ).generate(args.calculation_date, args.valid_for)
+        print(json.dumps([item.to_dict() for item in result.plans], ensure_ascii=False, indent=2))
         return 0
     if args.command == "daily-candidates":
         repo_root = args.repo_root.resolve()

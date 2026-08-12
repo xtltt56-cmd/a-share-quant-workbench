@@ -24,9 +24,12 @@ from a_share_quant.account.service import AccountEntryService
 from a_share_quant.account.snapshot_store import AccountSnapshotStore, ImportedAccountSnapshot
 from a_share_quant.account.store import JsonlLedgerStore
 from a_share_quant.advisory.engine import AdvisoryContext, AdvisoryEngine
+from a_share_quant.advisory.holding_guidance import HoldingPriceGuidanceEngine
+from a_share_quant.advisory.price_contracts import PricePlanType
 from a_share_quant.advisory.risk import RiskPolicy
 from a_share_quant.advisory.store import PredictionLedgerStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
+from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 
 _INITIALIZATION_FORMAT_VERSION = 1
 
@@ -60,6 +63,7 @@ class AdvisoryWorkbenchService:
         risk_policy: RiskPolicy | None = None,
         prediction_store: PredictionLedgerStore | None = None,
         official_signal_store: OfficialSignalStore | None = None,
+        price_guidance_store: PriceGuidanceStore | None = None,
         context_provider: Callable[[], AdvisoryContext | None] | None = None,
         today: Callable[[], date] | None = None,
         account_import_inbox: AccountImportInbox | None = None,
@@ -104,6 +108,7 @@ class AdvisoryWorkbenchService:
         self._advisory_engine = AdvisoryEngine(risk_policy or RiskPolicy.conservative())
         self._prediction_store = prediction_store or PredictionLedgerStore()
         self._official_signal_store = official_signal_store
+        self._price_guidance_store = price_guidance_store
         self._context_provider = context_provider
         self._today = today or date.today
         self._account_import_inbox = account_import_inbox
@@ -111,6 +116,7 @@ class AdvisoryWorkbenchService:
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
         self._account_import_confirmations: dict[str, _AccountImportConfirmation] = {}
         self._manual_buy_lock = RLock()
+        self._holding_guidance_engine = HoldingPriceGuidanceEngine()
 
     def list_account_imports(self) -> dict[str, object]:
         """List safe file identifiers without exposing filesystem paths."""
@@ -326,6 +332,7 @@ class AdvisoryWorkbenchService:
                 ],
                 "notice_zh": "券商导入快照独立展示，未伪造成历史成交。",
             }
+        guidance = self._holding_guidance(imported, local_positions)
         return {
             "as_of": snapshot.as_of.isoformat(),
             "cash": f"{snapshot.cash:.2f}",
@@ -337,9 +344,74 @@ class AdvisoryWorkbenchService:
                 "notice_zh": "本机账本来自已确认的人工成交或成交明细导入。",
             },
             "imported_account_snapshot": imported_payload,
+            "price_guidance": guidance,
             "manual_execution_required": True,
             "notice_zh": "持仓来自本机账本回放，请以券商成交与持仓为准。",
         }
+
+    def _holding_guidance(
+        self,
+        imported: ImportedAccountSnapshot | None,
+        local_positions: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        if self._official_signal_store is None:
+            return []
+        imported_positions = (
+            {item.symbol: item for item in imported.positions} if imported is not None else {}
+        )
+        plans = (
+            {
+                item.symbol: item
+                for item in self._price_guidance_store.plans()
+                if item.plan_type is PricePlanType.HOLDING
+            }
+            if self._price_guidance_store is not None
+            else {}
+        )
+        result: list[dict[str, object]] = []
+        for item in local_positions:
+            plan = plans.get(str(item["code"]))
+            source = imported_positions.get(str(item["code"]))
+            if plan is None:
+                result.append(
+                    {
+                        "symbol": item["code"],
+                        "state": "NO_RELIABLE_GUIDANCE",
+                        "manual_execution_required": True,
+                    }
+                )
+                continue
+            try:
+                if (
+                    source is None
+                    or not isinstance(source, Mapping)
+                    or "current_price" not in source
+                ):
+                    result.append(
+                        {
+                            **plan.to_dict(),
+                            "state": "NO_RELIABLE_GUIDANCE",
+                            "current_price": None,
+                            "manual_execution_required": True,
+                            "notice_zh": "暂无经过核验的当前价；不使用成本价替代行情。",
+                        }
+                    )
+                    continue
+                guidance = self._holding_guidance_engine.evaluate(
+                    source,
+                    plan,
+                    current_price=source["current_price"],
+                )
+                result.append(guidance.to_dict())
+            except (TypeError, ValueError):
+                result.append(
+                    {
+                        "symbol": item["code"],
+                        "state": "NO_RELIABLE_GUIDANCE",
+                        "manual_execution_required": True,
+                    }
+                )
+        return result
 
     def today_guidance(self, context: AdvisoryContext | None = None) -> dict[str, object]:
         """Evaluate a supplied formal context without inventing market inputs."""

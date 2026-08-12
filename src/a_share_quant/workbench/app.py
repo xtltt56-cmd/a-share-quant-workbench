@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,8 +14,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
+from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
+from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
+from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
 
@@ -27,11 +31,16 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         service: WorkbenchService,
         advisory_service: AdvisoryWorkbenchService | None = None,
+        supervisor: ResearchJobSupervisor | None = None,
+        governance: EvolutionRegistry | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
         self.service = service
         self.advisory_service = advisory_service
+        self.supervisor = supervisor
+        self.governance = governance
+        self._governance_previews: dict[str, tuple[str, str, str]] = {}
         super().__init__(server_address, WorkbenchRequestHandler)
 
 
@@ -56,6 +65,8 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._write_advisory_response(lambda service: service.model_data_health())
         elif path == "/api/advisory/imports":
             self._write_advisory_response(lambda service: service.list_account_imports())
+        elif path == "/api/models/governance":
+            self._write_governance_state()
         elif path == "/api/refresh":
             self._write_json(
                 {"error": "use POST with the local refresh request header"},
@@ -66,6 +77,9 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
+        if path == "/api/system/safe-exit":
+            self._safe_exit()
+            return
         if path == "/api/refresh":
             self._refresh()
             return
@@ -81,7 +95,42 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/advisory/import-confirm":
             self._account_import_confirm()
             return
+        if path == "/api/models/promotion-preview":
+            self._promotion_preview()
+            return
+        if path == "/api/models/promotion-confirm":
+            self._promotion_confirm()
+            return
+        if path == "/api/models/rollback-preview":
+            self._rollback_preview()
+            return
+        if path == "/api/models/rollback-confirm":
+            self._rollback_confirm()
+            return
+        self._discard_request_body()
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _safe_exit(self) -> None:
+        if self.headers.get("X-Quant-Workbench-Request") != "safe-exit":
+            self._write_json(
+                {"error": "local safe-exit request header required"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+        supervisor = self.server.supervisor
+        if supervisor is None:
+            self._write_json(
+                {"error": "research supervisor is unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        result = supervisor.shutdown(timeout_seconds=5.0)
+        self._write_json(
+            {
+                "checkpoint_saved": result.checkpoint_saved,
+                "children_stopped": result.children_stopped,
+            }
+        )
 
     def _refresh(self) -> None:
         if self.headers.get("X-Quant-Workbench-Request") != "refresh":
@@ -144,8 +193,160 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             lambda service: service.confirm_account_import(payload["confirmation_token"])
         )
 
+    def _model_request_payload(self) -> dict[str, Any] | None:
+        if self.headers.get("X-Quant-Workbench-Request") != "model-governance":
+            self._discard_request_body()
+            self._write_json({"error": "local model governance request header required"}, status=HTTPStatus.FORBIDDEN)
+            return None
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";", maxsplit=1)[0].strip().casefold() != "application/json":
+            self._discard_request_body()
+            self._write_json({"error": "application/json is required"}, status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 4096:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            self._write_json({"error": "model governance request could not be processed"}, status=HTTPStatus.BAD_REQUEST)
+            return None
+
+    def _discard_request_body(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if 0 < length <= 1_048_576:
+            self.rfile.read(length)
+
+    def _write_governance_state(self) -> None:
+        governance = self.server.governance
+        if governance is None:
+            self._write_json({"state": "UNAVAILABLE", "manual_execution_required": True})
+            return
+        self._write_json(
+            {
+                "state": "READY",
+                "champion_id": governance.champion_id,
+                "audit_count": len(governance.audit_log()),
+                "manual_execution_required": True,
+            }
+        )
+
+    def _promotion_preview(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"report_id"} or not isinstance(payload["report_id"], str):
+            self._write_json({"error": "report_id is required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        governance = self.server.governance
+        if governance is None:
+            self._write_json({"error": "model governance is unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        try:
+            report = governance.report(payload["report_id"])
+            if report.status != "AWAITING_MANUAL_APPROVAL":
+                raise ValueError("report is not awaiting manual approval")
+            token = governance.issue_confirmation_token(report.report_id)
+            digest = _governance_digest(report)
+            self.server._governance_previews[token] = ("promotion", report.report_id, digest)
+            self._write_json(
+                {
+                    "report_id": report.report_id,
+                    "candidate_id": report.candidate_id,
+                    "state": "AWAITING_MANUAL_APPROVAL",
+                    "checks": report.checks,
+                    "confirmation_token": token,
+                    "manual_execution_required": True,
+                }
+            )
+        except ValueError:
+            self._write_json({"error": "promotion report is unavailable"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _promotion_confirm(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"report_id", "confirmation_token"}:
+            self._write_json({"error": "report_id and confirmation_token are required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._confirm_governance("promotion", payload["report_id"], payload["confirmation_token"])
+
+    def _rollback_preview(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"record_id"} or not isinstance(payload["record_id"], str):
+            self._write_json({"error": "record_id is required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        governance = self.server.governance
+        if governance is None:
+            self._write_json({"error": "model governance is unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        try:
+            record = next(item for item in governance.audit_log() if item.record_id == payload["record_id"])
+            token = governance.issue_confirmation_token(record.record_id)
+            digest = _governance_digest(record)
+            self.server._governance_previews[token] = ("rollback", record.record_id, digest)
+            self._write_json(
+                {
+                    "record_id": record.record_id,
+                    "state": "AWAITING_MANUAL_APPROVAL",
+                    "champion_id": record.champion_id,
+                    "confirmation_token": token,
+                    "manual_execution_required": True,
+                }
+            )
+        except (StopIteration, ValueError):
+            self._write_json({"error": "rollback record is unavailable"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _rollback_confirm(self) -> None:
+        payload = self._model_request_payload()
+        if payload is None:
+            return
+        if set(payload) != {"record_id", "confirmation_token"}:
+            self._write_json({"error": "record_id and confirmation_token are required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._confirm_governance("rollback", payload["record_id"], payload["confirmation_token"])
+
+    def _confirm_governance(self, action: str, subject_id: Any, token: Any) -> None:
+        governance = self.server.governance
+        preview = self.server._governance_previews.pop(str(token), None)
+        if governance is None or preview is None or preview[0] != action or preview[1] != subject_id:
+            self._write_json({"error": "confirmation is invalid", "state": "CONFIRMATION_INVALID"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            current = governance.report(subject_id) if action == "promotion" else next(
+                item for item in governance.audit_log() if item.record_id == subject_id
+            )
+            if _governance_digest(current) != preview[2]:
+                governance.invalidate_confirmation_token(str(subject_id))
+                self._write_json({"error": "report changed after preview", "state": "REPORT_CHANGED"}, status=HTTPStatus.CONFLICT)
+                return
+            result = (
+                governance.approve(subject_id, confirmation_token=str(token))
+                if action == "promotion"
+                else governance.rollback(subject_id, confirmation_token=str(token))
+            )
+            self._write_json(
+                {
+                    "record_id": result.record_id,
+                    "champion_id": result.champion_id,
+                    "action": result.action,
+                    "manual_execution_required": True,
+                }
+            )
+        except (StopIteration, ValueError):
+            self._write_json({"error": "confirmation is invalid", "state": "CONFIRMATION_INVALID"}, status=HTTPStatus.BAD_REQUEST)
+
     def _manual_request_payload(self) -> dict[str, Any] | None:
         if self.headers.get("X-Quant-Workbench-Request") != "manual-advisory":
+            self._discard_request_body()
             self._write_json(
                 {
                     "error": "local manual advisory request header required",
@@ -156,6 +357,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return None
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", maxsplit=1)[0].strip().casefold() != "application/json":
+            self._discard_request_body()
             self._write_advisory_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             return None
         try:
@@ -219,6 +421,8 @@ def create_server(
     *,
     service: WorkbenchService | None = None,
     advisory_service: AdvisoryWorkbenchService | None = None,
+    supervisor: ResearchJobSupervisor | None = None,
+    governance: EvolutionRegistry | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -228,6 +432,8 @@ def create_server(
         (host, port),
         service or WorkbenchService(allow_network=False),
         advisory_service,
+        supervisor,
+        governance,
     )
 
 
@@ -239,6 +445,9 @@ def run_server(
     advisory_service: AdvisoryWorkbenchService | None = None,
     official_signal_path: Path | None = None,
     official_signal_store: OfficialSignalStore | None = None,
+    price_guidance_store: PriceGuidanceStore | None = None,
+    supervisor: ResearchJobSupervisor | None = None,
+    governance: EvolutionRegistry | None = None,
 ) -> None:
     if official_signal_store is not None:
         official_store = official_signal_store
@@ -258,9 +467,16 @@ def run_server(
         allow_network=allow_network,
         quote_cache=quote_cache,
         official_signal_store=official_store,
+        price_guidance_store=price_guidance_store,
     )
     service.start_background()
-    server = create_server(service=service, advisory_service=advisory_service, port=port)
+    server = create_server(
+        service=service,
+        advisory_service=advisory_service,
+        supervisor=supervisor,
+        governance=governance,
+        port=port,
+    )
     try:
         print(f"A股量化交易工作台：http://127.0.0.1:{server.server_address[1]}/")
         server.serve_forever()
@@ -270,6 +486,24 @@ def run_server(
         server.shutdown()
         server.server_close()
         service.stop_background()
+        if supervisor is not None:
+            supervisor.shutdown(timeout_seconds=5.0)
+
+
+def _governance_digest(value: Any) -> str:
+    if hasattr(value, "checks"):
+        payload = {
+            "id": getattr(value, "report_id", getattr(value, "record_id", "")),
+            "candidate_id": getattr(value, "candidate_id", ""),
+            "status": getattr(value, "status", getattr(value, "action", "")),
+            "checks": getattr(value, "checks", None),
+            "champion_id": getattr(value, "champion_id", None),
+            "previous_champion_id": getattr(value, "previous_champion_id", None),
+        }
+    else:
+        payload = value
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def main() -> int:
@@ -328,10 +562,10 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <p id="error" class="warn"></p></div>
 <div class="card"><h2>官方日线候选</h2>
 <p class="muted">日线模型分数与盘中观察分开显示。</p>
-<table><thead><tr><th>证券代码</th><th>分数</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
+<table><thead><tr><th>证券代码</th><th>分数</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
 <tbody id="daily"></tbody></table></div>
 <div class="card"><h2>盘中监控</h2><table><thead><tr>
-<th>证券代码</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
+<th>证券代码</th><th>最新价</th><th>涨跌幅</th><th>状态</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>后端行情时间戳</th><th>数据年龄</th><th>数据质量</th>
 </tr></thead><tbody id="monitor"></tbody></table></div>
 </main>
 <script>
@@ -348,6 +582,7 @@ function zh(v){return labels[String(v)]??v}
 function display(v,fallback){return v===null||v===undefined||v===''?(fallback===undefined?'暂不可用':fallback):zh(v)}
 function seconds(v){return v===null||v===undefined?'暂不可用':String(v)+' 秒'}
 function millis(v){return v===null||v===undefined?'暂不可用':String(v)+' 毫秒'}
+function priceGuidance(g){if(!g)return '暂无可靠指导价';const state=zh(g.state||'NO_RELIABLE_GUIDANCE');const range=(g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无';return state+'：'+range+'；最高 '+(g.maximum_acceptable_price||'暂无')+'；失效 '+(g.invalidation_price||'暂无')}
 function rows(items,render,empty,colspan){
   return items.length?items.map(render).join(''):'<tr><td colspan="'+esc(colspan)+'" class="muted">'+esc(empty)+'</td></tr>'}
 async function load(){
@@ -364,9 +599,9 @@ async function load(){
     document.getElementById('continuous').textContent=d.continuous_updates?'是':'否';
     document.getElementById('error').textContent=d.last_error?('状态：'+zh(d.last_error)):'';
     const daily=(d.official_daily_candidates||[]).slice(0,20);
-    document.getElementById('daily').innerHTML=rows(daily,function(x){return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',5);
+    document.getElementById('daily').innerHTML=rows(daily,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',9);
     const monitor=(d.intraday_monitor||[]).slice(0,100);
-    document.getElementById('monitor').innerHTML=rows(monitor,function(x){return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',7);
+    document.getElementById('monitor').innerHTML=rows(monitor,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc(x.symbol)+'</td><td>'+esc(x.current_price??x.last)+'</td><td>'+esc(x.change_pct??'')+'</td><td>'+esc(zh(x.state))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.quote_timestamp)+'</td><td>'+esc(x.data_age_seconds??'')+'</td><td>'+esc(zh(x.data_quality))+'</td></tr>'},'暂无盘中观察',11);
   }catch(error){
     document.getElementById('error').textContent='状态：本地工作台暂不可用';
   }
@@ -382,18 +617,20 @@ _ADVISORY_DASHBOARD_HTML = """<!doctype html>
 body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#172033;margin:0}header{background:#12233f;color:white;padding:20px 28px}main{max-width:960px;margin:22px auto;padding:0 18px}.card{background:white;border:1px solid #dfe5ef;border-radius:10px;padding:16px;margin-top:14px;box-shadow:0 2px 8px #12233f12}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}label{display:grid;gap:5px;font-size:13px}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}button{background:#1d5fd1;color:white;border:0;border-radius:6px;padding:9px 14px;cursor:pointer}.muted{color:#667085}.warn{color:#a15c00;white-space:pre-wrap}pre{overflow:auto;background:#f8fafc;padding:12px;border-radius:6px}</style></head>
 <body><header><h1>本地人工投顾</h1><div>仅供人工复核、人工下单与本机成交记录；本页面不提交委托。</div></header><main>
 <div class="card"><strong>重要提示：</strong>请先在券商端自行完成交易，再在此确认记录；数据与模型状态不构成实时市场验证。</div>
-<div class="card"><h2>持仓与状态</h2><div id="holdings" class="muted">加载中</div><div id="health" class="muted"></div></div>
+<div class="card"><h2>持仓与状态</h2><div id="holdings" class="muted">加载中</div><div id="holding-guidance" class="muted"></div><div id="health" class="muted"></div></div>
 <div class="card"><h2>券商导出文件导入</h2><p class="muted">只读取固定收件箱，不会登录或控制券商客户端。请先在财信客户端使用官方导出功能，再在这里预览和确认；系统不会提交委托。</p><p><select id="import-file"><option value="">请先扫描导出文件</option></select> <button onclick="scanImports()">扫描导出文件</button> <button onclick="previewImport()">生成预览</button> <button id="confirm-import" onclick="confirmImport()" disabled>确认导入</button></p><pre id="import-preview">尚未生成预览</pre><p id="import-message" class="warn"></p></div>
 <div class="card"><h2>人工成交记录</h2><p class="muted">输入只包含名称、代码、数量和价格。先预览，再使用一次性确认令牌记录人工成交。</p><div class="grid"><label>证券名称<input id="name" value=""></label><label>证券代码<input id="code" value=""></label><label>数量<input id="quantity" inputmode="numeric" value=""></label><label>价格<input id="price" inputmode="decimal" value=""></label></div><p><button onclick="previewBuy()">预览人工成交</button> <button onclick="confirmBuy()">确认记录人工成交</button></p><label>确认令牌<input id="token" readonly></label><p id="message" class="warn"></p></div>
-<div class="card"><h2>今日指引</h2><p class="muted">未提供经核验的本地上下文时，系统将明确显示数据不足。</p><pre id="guidance">加载中</pre></div></main>
+<div class="card"><h2>今日指引</h2><p class="muted">未提供经核验的本地上下文时，系统将明确显示数据不足。</p><pre id="guidance">加载中</pre></div>
+<div class="card"><h2>模型治理</h2><p class="muted">挑战者仅影子运行；满足门槛后仍需人工批准，系统不会自动晋级。</p><div id="governance">当前冠军：加载中；挑战者：无；状态：影子运行。</div><p class="warn">等待人工批准 · 可审计回滚 · 仅供研究和人工复核</p></div></main>
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function zhState(v){const s=String(v??'');if(s==='B'+'UY_CANDIDATE')return '候选买入';if(s==='A'+'DD_CANDIDATE')return '候选加仓';if(s==='H'+'OLD')return '持有观察';if(s==='W'+'ATCH')return '观察';if(s==='R'+'EDUCE')return '减仓';if(s==='E'+'XIT')return '退出';if(s==='B'+'LOCKED')return '暂不操作';if(s==='I'+'NSUFFICIENT_DATA')return '数据不足';return s||'未知'}
- function holdingsText(h){const positions=(h.positions||[]).map(p=>(p.name||p.code)+'（'+p.code+'） '+p.total_quantity+'股，成本 '+p.average_cost+'元').join('\n')||'暂无人工登记持仓';const imported=h.imported_account_snapshot;const importedText=imported?'\n\n券商导入快照（独立口径）：\n'+imported.positions.map(p=>(p.name||p.code)+'（'+p.code+'） '+p.total_quantity+'股，成本 '+p.average_cost+'元').join('\n')+'\n来源：'+imported.source_name+'，日期：'+imported.as_of:'\n\n尚未确认导入券商持仓快照';return '截至：'+h.as_of+'\n本机账本现金：'+h.cash+' 元\n已实现盈亏：'+h.realized_pnl+' 元\n本机账本持仓：\n'+positions+importedText+'\n\n'+(h.notice_zh||'')}
+function holdingsText(h){const positions=(h.positions||[]).map(p=>(p.name||p.code)+'（'+p.code+'） '+p.total_quantity+'股，成本 '+p.average_cost+'元').join('\n')||'暂无人工登记持仓';const imported=h.imported_account_snapshot;const importedText=imported?'\n\n券商导入快照（独立口径）：\n'+imported.positions.map(p=>(p.name||p.code)+'（'+p.code+'） '+p.total_quantity+'股，成本 '+p.average_cost+'元').join('\n')+'\n来源：'+imported.source_name+'，日期：'+imported.as_of:'\n\n尚未确认导入券商持仓快照';return '截至：'+h.as_of+'\n本机账本现金：'+h.cash+' 元\n已实现盈亏：'+h.realized_pnl+' 元\n本机账本持仓：\n'+positions+importedText+'\n\n'+(h.notice_zh||'')}
+function holdingGuidanceText(h){const rows=h.price_guidance||[];if(!rows.length)return '暂无持仓价格指导计划';return rows.map(x=>x.symbol+'：状态 '+(x.state||'暂无')+'，保护价 '+(x.protection_price||'暂无')+'，减仓区间 '+((x.reduce_lower&&x.reduce_upper)?x.reduce_lower+' - '+x.reduce_upper:'暂无')+'，建议卖出 '+(x.suggested_sell_quantity??0)+'股').join('\n')+'\n仅供人工复核；系统不会提交委托。'}
 function healthText(h){const modelLabels={'FORECAST_RECORDS_PRESENT':'已有预测记录','RANKING_CANDIDATES_PRESENT':'已有日选排名','NO_FORECAST_RECORDS':'暂无预测记录'};const dataLabels={'NO_LIVE_MARKET_VALIDATION':'尚未完成实时行情核验','CALLER_PROVIDED_CONTEXT':'已提供调用方行情上下文'};return '模型状态：'+(modelLabels[h.model_status]||h.model_status||'未知')+'\n数据状态：'+(dataLabels[h.data_status]||h.data_status||'未知')+'\n仅限人工执行：是'}
 function guidanceText(g){return '结论：'+zhState(g.state||'INSUFFICIENT_DATA')+'（'+(g.action_zh||'数据不足')+'）\n原因：'+(g.explanation_zh||((g.reason_codes||[]).join('、')||'无'))+'\n建议数量：'+(g.suggested_quantity??0)+'\n数据截止：'+(g.evidence_cutoff||'无')+'\n人工执行：是\n'+(g.notice_zh||'')}
 async function getJson(path){const r=await fetch(path,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error('本地服务暂不可用');return d}
- async function load(){try{const h=await getJson('/api/advisory/holdings');document.getElementById('holdings').innerHTML='<pre>'+esc(holdingsText(h))+'</pre>';const health=await getJson('/api/advisory/health');document.getElementById('health').textContent=healthText(health);const guidance=await getJson('/api/advisory/guidance');document.getElementById('guidance').textContent=guidanceText(guidance);await scanImports()}catch(e){document.getElementById('message').textContent='本地人工投顾服务暂不可用'}}
+async function load(){try{const h=await getJson('/api/advisory/holdings');document.getElementById('holdings').innerHTML='<pre>'+esc(holdingsText(h))+'</pre>';document.getElementById('holding-guidance').innerHTML='<pre>'+esc(holdingGuidanceText(h))+'</pre>';const health=await getJson('/api/advisory/health');document.getElementById('health').textContent=healthText(health);const guidance=await getJson('/api/advisory/guidance');document.getElementById('guidance').textContent=guidanceText(guidance);await scanImports()}catch(e){document.getElementById('message').textContent='本地人工投顾服务暂不可用'}}
 async function previewBuy(){const payload={name:document.getElementById('name').value,code:document.getElementById('code').value,quantity:Number(document.getElementById('quantity').value),price:document.getElementById('price').value};try{const r=await fetch('/api/advisory/buy-preview',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Quant-Workbench-Request':'manual-advisory'},body:JSON.stringify(payload)});const d=await r.json();if(!r.ok)throw new Error();document.getElementById('token').value=d.confirmation_token;document.getElementById('message').textContent=d.notice_zh+' 预估总成本：'+d.estimated_total_cost}catch(e){document.getElementById('message').textContent='预览失败，请检查四个输入字段'}}
  async function confirmBuy(){const token=document.getElementById('token').value;try{const r=await fetch('/api/advisory/buy-confirm',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Quant-Workbench-Request':'manual-advisory'},body:JSON.stringify({confirmation_token:token})});const d=await r.json();if(!r.ok)throw new Error();document.getElementById('message').textContent=d.notice_zh;await load()}catch(e){document.getElementById('message').textContent='确认失败，请重新预览并人工核对'}}
  let accountImportToken='';

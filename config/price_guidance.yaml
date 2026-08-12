@@ -1,0 +1,30 @@
+version: price-guidance-rule-v1
+features:
+  minimum_history_days: 252
+  atr_period: 14
+  ma_short_period: 20
+  ma_long_period: 60
+  support_period: 20
+  liquidity_period: 20
+  minimum_average_amount: 10000000
+entry:
+  anchor_atr: 0.50
+  lower_atr: 0.50
+  upper_atr: 0.25
+  maximum_close_multiplier: 1.01
+  minimum_risk_distance: 0.02
+  maximum_risk_distance: 0.12
+risk:
+  single_trade_fraction: 0.005
+  single_position_fraction: 0.05
+  industry_fraction: 0.20
+  lot_size: 100
+calibration:
+  target_coverage: 0.80
+  rolling_trading_days: 252
+  minimum_interval_samples: 500
+  minimum_isotonic_samples: 1000
+promotion:
+  minimum_shadow_days: 60
+  minimum_matured_samples: 1000
+  minimum_oos_windows: 3
