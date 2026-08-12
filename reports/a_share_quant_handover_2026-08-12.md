@@ -2,7 +2,7 @@
 
 日期：2026-08-12  
 当前分支：`codex/phase1-data-foundation`  
-合并提交：`de327c8 merge: complete price guidance and controlled evolution`
+合并提交：`de327c8 merge: complete price guidance and controlled evolution`；后续接线修复：`84dab17 fix: wire canonical daily closes into price guidance`
 
 ## 一、交付结论
 
@@ -29,6 +29,7 @@
 - `src/a_share_quant/features/price_guidance.py`：ATR、均线、波动率、支撑位等只使用截止日及以前数据。
 - `src/a_share_quant/advisory/price_engine.py`：保守买入区间、最高可接受价、失效价和研究级数量为 0。
 - `src/a_share_quant/runtime/price_guidance.py`：按证券生成日选与持仓计划，历史不足或规则不支持时生成 `NO_RELIABLE_GUIDANCE`。
+- 运行时兼容标准 BaoStock 日线湖的 `close` 字段：在没有显式 `raw_close` 时按未复权边界复制，保留已有显式原始收盘价；对应回归测试防止真实数据接入后整页误报“无可靠指导”。
 - `src/a_share_quant/storage/price_guidance_store.py`：原子写入、摘要校验、未知字段拒绝、篡改/截断/未来日期 fail-closed。
 - `src/a_share_quant/advisory/price_overlay.py`：盘中只读叠加，支持等待价格、价格过高、跌破失效价和数据不可靠状态。
 
@@ -55,7 +56,7 @@
 D:\量化交易\.venv\Scripts\python.exe -m pytest -q
 ```
 
-结果：`535 passed, 3 skipped`。
+结果：`536 passed, 3 skipped`。
 
 3 个跳过均为当前 Windows 账户没有创建符号链接权限（WinError 1314）的能力型测试，不是业务失败。测试过程中有 2 个第三方库警告（Pandas 弃用提示、Qlib 链式赋值提示），不影响退出码。
 
@@ -68,7 +69,9 @@ git diff --check
 
 结果：均为 0 错误。
 
-价格指导聚焦验收：`73 passed`。纸面验收报告见 `reports/price_guidance_acceptance_2026-08-12.md`。
+价格指导聚焦验收：`24 passed`（运行时、引擎、工作台和验收组合）；此前纸面验收记录为 `73 passed`。验收报告见 `reports/price_guidance_acceptance_2026-08-12.md`。
+
+本机真实数据核对（2026-08-12）：`.runtime/signals/official-daily.json` 含 10 条 BaoStock 日选候选，`.runtime/advisory/price-guidance.json` 已能读取对应日线。当前保守规则对其中 1 条生成研究参考价格边界，另外 9 条因边界一致性或风险距离门槛不满足而明确返回 `NO_RELIABLE_GUIDANCE`；页面显示“暂无可靠指导价”，建议数量仍为 0。这是故障关闭行为，不是用估算值填充价格。盘中快照已能覆盖这些候选，但免费 AKShare 端点存在延迟和部分过期，数据质量为 `DEGRADED` 时不会显示为可执行信号。
 
 ## 四、当前发布状态
 

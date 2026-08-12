@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from a_share_quant.advisory.price_contracts import PricePlanType
-from a_share_quant.runtime.price_guidance import PriceGuidanceRuntime
+from a_share_quant.runtime.price_guidance import PriceGuidanceRuntime, load_bars
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 
 
@@ -89,3 +89,15 @@ def test_adjustment_factor_change_recalculates_old_protection(tmp_path) -> None:
     )
     result = runtime.generate(date(2026, 4, 15), date(2026, 4, 16))
     assert "CORPORATE_ACTION_RECALCULATED" in result.plans[0].reason_codes
+
+
+def test_load_bars_marks_standard_unadjusted_close_as_raw_close(tmp_path) -> None:
+    path = tmp_path / "lake" / "daily_bars"
+    path.mkdir(parents=True)
+    frame = _bars("000001").drop(columns=["raw_close"])
+    frame.to_parquet(path / "000001.parquet", index=False)
+
+    loaded = load_bars(tmp_path, ("000001",))
+
+    assert "raw_close" in loaded["000001"]
+    assert loaded["000001"]["raw_close"].equals(loaded["000001"]["close"])

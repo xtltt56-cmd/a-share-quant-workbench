@@ -169,7 +169,14 @@ def load_bars(data_root: Path, symbols: tuple[str, ...]) -> dict[str, pd.DataFra
     for symbol in symbols:
         path = (data_root / "lake" / "daily_bars" / f"{symbol}.parquet").resolve()
         if path.exists() and path.is_file():
-            result[symbol] = pd.read_parquet(path)
+            frame = pd.read_parquet(path)
+            # Canonical BaoStock daily bars are unadjusted at this boundary.
+            # Preserve an explicit raw-close column for the causal feature layer;
+            # providers that supply adjusted and raw prices keep their values.
+            if "raw_close" not in frame.columns and "close" in frame.columns:
+                frame = frame.copy()
+                frame["raw_close"] = frame["close"]
+            result[symbol] = frame
     return result
 
 
