@@ -542,14 +542,22 @@ button{background:#1d5fd1;color:white;border:0;border-radius:6px;padding:9px 14p
 table{width:100%;border-collapse:collapse;background:white;margin-top:14px}
 .card table{margin-top:8px}
 .table-scroll{overflow-x:auto;max-width:100%}
-.monitor-table{min-width:1500px;table-layout:fixed}
-.monitor-table th,.monitor-table td{padding:10px 12px;line-height:1.45}
-.monitor-table th:first-child,.monitor-table td:first-child{width:155px;min-width:155px}
-.monitor-table th:nth-child(2),.monitor-table td:nth-child(2){width:78px;white-space:nowrap}
-.monitor-table th:nth-child(3),.monitor-table td:nth-child(3){width:82px;white-space:nowrap}
-.monitor-table th:nth-child(4),.monitor-table td:nth-child(4){width:82px;white-space:nowrap}
+.monitor-table{width:100%;min-width:0;table-layout:fixed}
+.monitor-table th,.monitor-table td{padding:9px 8px;line-height:1.4;overflow-wrap:anywhere}
+.monitor-table th:first-child,.monitor-table td:first-child{width:13%;min-width:112px}
+.monitor-table th:nth-child(2),.monitor-table td:nth-child(2){width:6%;white-space:nowrap}
+.monitor-table th:nth-child(3),.monitor-table td:nth-child(3){width:6%;white-space:nowrap}
+.monitor-table th:nth-child(4),.monitor-table td:nth-child(4){width:7%;white-space:nowrap}
+.monitor-table th:nth-child(5),.monitor-table td:nth-child(5){width:10%}
+.monitor-table th:nth-child(6),.monitor-table td:nth-child(6){width:9%}
+.monitor-table th:nth-child(7),.monitor-table td:nth-child(7){width:7%}
+.monitor-table th:nth-child(8),.monitor-table td:nth-child(8){width:14%}
+.monitor-table th:nth-child(9),.monitor-table td:nth-child(9){width:12%}
+.monitor-table th:nth-child(10),.monitor-table td:nth-child(10){width:7%}
+.monitor-table th:nth-child(11),.monitor-table td:nth-child(11){width:9%}
 .monitor-symbol{white-space:nowrap;font-weight:600;color:#172033}
- th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px;vertical-align:top}th{color:#667085}
+@media (max-width:1100px){.monitor-table{min-width:1120px}}
+th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px;vertical-align:top}th{color:#667085}
 .muted{color:#667085}.safe{color:#147a46}.warn{color:#a15c00}.danger{color:#b42318}
 </style></head>
 <body><header><h1>A股量化交易工作台</h1>

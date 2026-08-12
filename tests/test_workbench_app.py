@@ -69,6 +69,9 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "股票名称（代码）" in html
         assert "monitor-symbol" in html
         assert "table-scroll" in html
+        assert ".monitor-table{width:100%;min-width:0;table-layout:fixed}" in html
+        assert "overflow-wrap:anywhere" in html
+        assert "@media (max-width:1100px){.monitor-table{min-width:1120px}}" in html
         assert "参考买入区间" in html
         assert "最高可接受价" in html
         assert "失效价" in html
