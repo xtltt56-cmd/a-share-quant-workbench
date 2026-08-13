@@ -404,7 +404,7 @@ class RealTimeScheduler:
                 error="DATA_STALE",
             )
         usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
-        self.store.put_quotes(usable_quotes)
+        self.store.replace_quote_snapshot(usable_quotes)
         bars = (
             tuple(
                 self._retry(
@@ -464,6 +464,9 @@ class RealTimeScheduler:
         thread = self._full_market_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.1)
+        close_provider = getattr(self.provider, "close", None)
+        if close_provider is not None:
+            close_provider()
 
     def _check_quotes(
         self,

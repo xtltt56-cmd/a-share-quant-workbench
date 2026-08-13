@@ -427,7 +427,8 @@ def test_workbench_keeps_monitor_non_ready_when_scheduler_quarantines_partial_sn
 
     assert second["data_quality"] == "DEGRADED"
     assert second["continuous_updates"] is False
-    assert second["intraday_monitor"][0]["state"] == "STALE_DATA"
+    assert second["intraday_monitor"][0]["state"] != "STALE_DATA"
+    assert second["intraday_monitor"][0]["data_quality"] == "GOOD"
 
 
 def test_workbench_reports_the_actual_akshare_snapshot_endpoint() -> None:
@@ -714,3 +715,43 @@ def test_workbench_exposes_specific_reason_for_unavailable_plan(tmp_path) -> Non
     assert row["state"] == "NO_RELIABLE_GUIDANCE"
     assert row["reason_codes"] == ["INVALIDATION_NOT_BELOW_ENTRY"]
     assert "失效价不低于入场下限" in row["notice_zh"]
+
+
+def test_workbench_applies_realtime_quality_per_symbol() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    good = _live_provider(now).snapshot.quotes[0]
+    stale = replace(
+        good,
+        symbol="000002",
+        timestamp_exchange=now - timedelta(seconds=120),
+        is_stale=True,
+        quality_flag=DataQualityStatus.STALE,
+    )
+    service = WorkbenchService(allow_network=False, clock=lambda: now)
+
+    service._apply_quote_state(
+        (good, stale),
+        now=now,
+        data_quality=DataQualityStatus.DEGRADED,
+    )
+
+    rows = {row["symbol"]: row for row in service.snapshot()["intraday_monitor"]}
+    assert rows["000001"]["state"] != "STALE_DATA"
+    assert rows["000001"]["data_quality"] == "GOOD"
+    assert rows["000002"]["state"] == "STALE_DATA"
+    assert rows["000002"]["data_quality"] == "STALE"
+
+
+def test_health_distinguishes_process_ready_from_realtime_data_ready() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    service = WorkbenchService(
+        provider=_live_provider(now), allow_network=True, clock=lambda: now
+    )
+    service.state.data_quality = "DEGRADED"
+    service.state.schema_pass = False
+
+    health = service.health()
+
+    assert health["status"] == "DATA_DEGRADED"
+    assert health["process_ready"] is True
+    assert health["data_ready"] is False

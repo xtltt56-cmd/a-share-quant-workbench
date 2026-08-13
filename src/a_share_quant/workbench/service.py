@@ -271,12 +271,25 @@ class WorkbenchService:
 
     def health(self) -> dict[str, Any]:
         with self._state_lock:
+            data_ready = (
+                self.allow_network
+                and self._provider is not None
+                and self.state.data_quality == DataQualityStatus.GOOD.value
+                and self.state.schema_pass
+                and self.state.continuous_updates
+            )
+            if not self.allow_network:
+                status = "OFFLINE"
+            elif self._provider is None:
+                status = "DATA_UNAVAILABLE"
+            elif data_ready:
+                status = "OK"
+            else:
+                status = "DATA_DEGRADED"
             return {
-                "status": (
-                    "OFFLINE"
-                    if not self.allow_network
-                    else "OK" if self._provider is not None else "DATA_UNAVAILABLE"
-                ),
+                "status": status,
+                "process_ready": True,
+                "data_ready": data_ready,
                 "active_provider": self.state.active_provider,
                 "active_source": self.state.active_source,
                 "source_class": self.state.source_class,
@@ -516,16 +529,22 @@ class WorkbenchService:
         overlays: list[RealtimeOverlay] = []
         for quote in ordered_quotes[:100]:
             official = official_signals.get(quote.symbol)
+            quote_quality = _quote_effective_quality(
+                quote,
+                batch_quality=data_quality,
+                now=now,
+                stale_after_seconds=self.live_quality_gate.stale_after_seconds,
+            )
             signal = _monitor_signal(
                 quote,
                 official=official,
-                data_quality=data_quality,
+                data_quality=quote_quality,
                 now=now,
             )
             overlay = _overlay_from_quote(
                 quote,
                 signal=signal,
-                data_quality=data_quality,
+                data_quality=quote_quality,
             )
             monitor_rows.append(
                 _monitor_payload(
@@ -537,7 +556,7 @@ class WorkbenchService:
                 )
             )
             monitor_rows[-1]["price_guidance"] = self._quote_guidance_payload(
-                guidance_plans.get(quote.symbol), quote=quote, data_quality=data_quality, now=now
+                guidance_plans.get(quote.symbol), quote=quote, data_quality=quote_quality, now=now
             )
             overlays.append(overlay)
         self.realtime_overlay_store.put_overlays(overlays)
@@ -741,6 +760,20 @@ def _monitor_signal(
         },
         now=now,
     )
+
+
+def _quote_effective_quality(
+    quote: RealTimeQuote,
+    *,
+    batch_quality: DataQualityStatus,
+    now: datetime,
+    stale_after_seconds: float,
+) -> DataQualityStatus:
+    if batch_quality in {DataQualityStatus.FAILED, DataQualityStatus.STALE}:
+        return batch_quality
+    if quote.is_stale or quote.data_age_seconds(now=now) > stale_after_seconds:
+        return DataQualityStatus.STALE
+    return quote.quality_flag
 
 
 def _monitor_payload(

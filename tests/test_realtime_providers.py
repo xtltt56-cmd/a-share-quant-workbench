@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from datetime import datetime, timezone
 
@@ -496,3 +497,77 @@ def test_replay_provider_returns_bars_in_chronological_order() -> None:
     assert first is not None and second is not None
     assert first.timestamp < second.timestamp
     assert provider.replay_next() is None
+
+
+def test_akshare_priority_quotes_prefer_timestamped_cached_market_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def stock_zh_a_spot() -> pd.DataFrame:
+        calls.append("full")
+        return pd.DataFrame(
+            [
+                {"代码": "sz000001", "名称": "平安银行", "最新价": 10.5,
+                 "昨收": 10.2, "成交量": 100_000, "成交额": 1_050_000,
+                 "时间戳": "10:00:00"},
+                {"代码": "sz000002", "名称": "万科A", "最新价": 8.2,
+                 "昨收": 8.0, "成交量": 80_000, "成交额": 656_000,
+                 "时间戳": "10:00:00"},
+            ]
+        )
+
+    def stock_bid_ask_em(symbol: str) -> pd.DataFrame:
+        calls.append(f"single:{symbol}")
+        raise AssertionError("cached timestamped snapshot must be authoritative")
+
+    monkeypatch.setitem(sys.modules, "akshare", types.SimpleNamespace(
+        stock_zh_a_spot=stock_zh_a_spot, stock_bid_ask_em=stock_bid_ask_em
+    ))
+    provider = AKShareRealTimeProvider(
+        retry_count=0, delay_seconds=0,
+        wall_clock=lambda: datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc),
+    )
+
+    provider.get_market_snapshot()
+    quotes = provider.get_priority_quotes(["000002"])
+
+    assert calls == ["full"]
+    assert [quote.symbol for quote in quotes] == ["000002"]
+    assert quotes[0].quality_flag.value == "GOOD"
+
+
+def test_akshare_timeouts_do_not_create_unbounded_worker_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocked_endpoint() -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=2)
+        return pd.DataFrame()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(blocked_endpoint=blocked_endpoint),
+    )
+    provider = AKShareRealTimeProvider(
+        timeout_seconds=0.1,
+        retry_count=0,
+        delay_seconds=0,
+    )
+
+    with pytest.raises(ProviderRequestError):
+        provider._call("blocked_endpoint", retry_on_timeout=False)
+    assert started.wait(timeout=1)
+    with pytest.raises(ProviderRequestError):
+        provider._call("blocked_endpoint", retry_on_timeout=False)
+
+    assert calls == 1
+    release.set()
+    provider.close()

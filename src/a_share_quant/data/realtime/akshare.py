@@ -71,6 +71,11 @@ class AKShareRealTimeProvider:
         self._last_snapshot: MarketSnapshot | None = None
         self._endpoint_retry_after: dict[str, float] = {}
         self.active_endpoint: str | None = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="akshare-transport",
+        )
+        self._closed = False
 
     @property
     def active_source_name(self) -> str:
@@ -106,8 +111,9 @@ class AKShareRealTimeProvider:
         attempts = self.retry_count if retry_count is None else max(0, retry_count)
         for attempt in range(attempts + 1):
             self._wait_for_rate_limit()
-            executor = ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(function, **kwargs)
+            if self._closed:
+                raise ProviderRequestError("AKShare provider is closed")
+            future = self._executor.submit(function, **kwargs)
             try:
                 return future.result(timeout=call_timeout)
             except FutureTimeoutError as exc:
@@ -117,13 +123,17 @@ class AKShareRealTimeProvider:
                     break
             except Exception as exc:
                 last_error = exc
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
             if attempt < attempts:
                 time.sleep(self.delay_seconds * (2**attempt))
         raise ProviderRequestError(
             f"AKShare real-time request failed: {function_name}"
         ) from last_error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _wait_for_rate_limit(self) -> None:
         if self._last_call_at is not None:
@@ -264,6 +274,19 @@ class AKShareRealTimeProvider:
         is skipped so one bad response cannot block the other priority rows.
         """
 
+        requested = {normalize_symbol(symbol) for symbol in symbols}
+        cache_is_current = (
+            self._last_snapshot is not None
+            and self._last_snapshot_started_at is not None
+            and self._monotonic_clock() - self._last_snapshot_started_at
+            < self.full_market_min_interval_seconds
+        )
+        if cache_is_current:
+            cached = tuple(
+                quote for quote in self._last_snapshot.quotes if quote.symbol in requested
+            )
+            if {quote.symbol for quote in cached} == requested:
+                return cached
         if getattr(self._client(), "stock_bid_ask_em", None) is None:
             raise ProviderRequestError("AKShare single-stock quote endpoint unavailable")
         received = datetime.now(timezone.utc)

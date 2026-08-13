@@ -473,6 +473,19 @@ def test_scheduler_does_not_wait_for_slow_full_market_when_priority_quotes_exist
     scheduler.close()
 
 
+def test_full_market_snapshot_replaces_previous_generation() -> None:
+    first_time = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    second_time = first_time + timedelta(seconds=60)
+    first = _snapshot(first_time).quotes[0]
+    second_symbol = replace(first, symbol="000002", last=20.0)
+    store = RealTimeStore()
+
+    store.replace_quote_snapshot((first, second_symbol))
+    store.replace_quote_snapshot((replace(first, timestamp_received=second_time),))
+
+    assert [quote.symbol for quote in store.quotes()] == ["000001"]
+
+
 def test_market_hours_mapping_and_calendar_validation_are_explicit() -> None:
     hours = MarketHours.from_mapping(
         {

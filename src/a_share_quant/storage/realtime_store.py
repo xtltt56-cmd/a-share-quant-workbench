@@ -33,6 +33,12 @@ class RealTimeStore:
             if previous is None or quote.timestamp_received >= previous.timestamp_received:
                 self._quotes[quote.symbol] = quote
 
+    def replace_quote_snapshot(self, quotes: Iterable[RealTimeQuote]) -> None:
+        """Replace the complete market generation without retaining vanished rows."""
+
+        materialized = tuple(quotes)
+        self._quotes = {quote.symbol: quote for quote in materialized}
+
     def quotes(self, symbols: Iterable[str] | None = None) -> tuple[RealTimeQuote, ...]:
         if symbols is None:
             values = self._quotes.values()
