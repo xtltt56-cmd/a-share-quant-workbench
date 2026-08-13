@@ -103,8 +103,13 @@ def build_default_registry(
         "akshare": lambda: AKShareRealTimeProvider(
             market_snapshot_timeout_seconds=_environment_positive_float(
                 "A_SHARE_QUANT_AKSHARE_MARKET_SNAPSHOT_TIMEOUT_SECONDS",
-                default=120.0,
-                maximum=300.0,
+                default=30.0,
+                maximum=120.0,
+            ),
+            priority_timeout_seconds=_environment_positive_float(
+                "A_SHARE_QUANT_AKSHARE_PRIORITY_TIMEOUT_SECONDS",
+                default=8.0,
+                maximum=30.0,
             ),
             full_market_min_interval_seconds=_environment_positive_float(
                 "A_SHARE_QUANT_AKSHARE_FULL_MARKET_MIN_INTERVAL_SECONDS",
@@ -208,6 +213,31 @@ class FailoverRealTimeProvider:
 
     def get_quotes(self, symbols):
         return self._call("get_quotes", symbols)
+
+    def get_priority_quotes(self, symbols):
+        last_error: Exception | None = None
+        for index in range(self._active_index, len(self._providers)):
+            provider = self._providers[index]
+            method = getattr(provider, "get_priority_quotes", None)
+            if method is None:
+                method = provider.get_quotes
+            try:
+                result = method(symbols)
+                self._active_index = index
+                return result
+            except Exception as exc:
+                last_error = exc
+                if index + 1 < len(self._providers):
+                    next_provider = self._providers[index + 1]
+                    self._switch_events.append(
+                        ProviderSwitchEvent(
+                            source_from=provider.name,
+                            source_to=next_provider.name,
+                            reason=type(exc).__name__,
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                    )
+        raise ProviderRequestError("all real-time providers failed") from last_error
 
     def get_minute_bars(self, symbols, frequency):
         return self._call("get_minute_bars", symbols, frequency)

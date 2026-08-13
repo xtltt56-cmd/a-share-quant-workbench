@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time as time_module
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
@@ -123,6 +124,7 @@ class SchedulerTick:
     quality_status: DataQualityStatus | None = None
     skip_reason: str = ""
     error: str = ""
+    priority_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -196,24 +198,45 @@ class RealTimeScheduler:
         store: RealTimeStore,
         resolver: SessionResolver | None = None,
         symbols: Sequence[str] = (),
+        priority_symbols: Sequence[str] = (),
+        expected_symbols: Sequence[str] | None = None,
         frequency: str = "1m",
         clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        full_market_interval_seconds: float = 60.0,
         stale_after_seconds: float = 60.0,
         circuit_breaker: RealtimeCircuitBreaker | None = None,
         retry_policy: RetryPolicy | None = None,
+        full_market_retry_policy: RetryPolicy | None = None,
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
         self.resolver = resolver or SessionResolver()
         self.symbols = tuple(symbols)
+        self.priority_symbols = tuple(dict.fromkeys(priority_symbols))
+        self.expected_symbols = tuple(
+            dict.fromkeys(self.symbols if expected_symbols is None else expected_symbols)
+        )
         self.frequency = frequency
         self.clock = clock or (lambda: datetime.now(self.resolver.timezone))
+        self.monotonic_clock = monotonic_clock or time_module.monotonic
+        if full_market_interval_seconds < 60:
+            raise ValueError("full_market_interval_seconds must be at least 60")
+        self.full_market_interval_seconds = float(full_market_interval_seconds)
+        self._last_full_market_at: float | None = (
+            self.monotonic_clock() if self.priority_symbols else None
+        )
+        self._full_market_lock = threading.Lock()
+        self._pending_full_snapshot: Any | None = None
+        self._pending_full_error: str | None = None
+        self._full_market_thread: threading.Thread | None = None
         self.circuit_breaker = circuit_breaker or RealtimeCircuitBreaker(
             stale_after_seconds=stale_after_seconds
         )
         self.timestamp_tracker = TimestampTracker()
         self.retry_policy = retry_policy or RetryPolicy()
+        self.full_market_retry_policy = full_market_retry_policy or self.retry_policy
         self.sleeper = sleeper or time_module.sleep
 
     def run_once(self) -> SchedulerTick:
@@ -227,70 +250,119 @@ class RealTimeScheduler:
                 updated=False,
                 skip_reason=_NON_OPEN_REASON[session],
             )
-        try:
-            snapshot = self._retry(self.provider.get_market_snapshot)
-            quotes = tuple(snapshot.quotes)
-            timestamp_checked: list[Any] = []
-            timestamp_quarantined = False
-            for quote in quotes:
-                try:
-                    self.timestamp_tracker.observe(
-                        quote.symbol,
-                        quote.timestamp_exchange,
-                        now=now,
+        priority_report = None
+        priority_count = 0
+        priority_error: Exception | None = None
+        if self.priority_symbols:
+            try:
+                priority_method = getattr(self.provider, "get_priority_quotes", None)
+                if priority_method is None:
+                    priority_method = self.provider.get_quotes
+                priority_quotes = tuple(
+                    self._retry(
+                        lambda: priority_method(self.priority_symbols),
+                        policy=self.retry_policy,
                     )
-                except ValueError:
-                    # Full-market feeds can contain one symbol whose exchange
-                    # timestamp lags the previous snapshot.  Quarantine only
-                    # that row; rejecting the whole snapshot would discard
-                    # thousands of otherwise usable quotes.
-                    timestamp_quarantined = True
-                    timestamp_checked.append(
-                        replace(
-                            quote,
-                            is_stale=True,
-                            quality_flag=DataQualityStatus.STALE,
-                        )
+                )
+                priority_report, priority_quarantined = self._check_quotes(
+                    priority_quotes, now=now
+                )
+                if priority_report.is_usable:
+                    usable_priority = tuple(
+                        quote for quote in priority_report.quotes if not quote.is_stale
                     )
+                    self.store.put_quotes(usable_priority)
+                    priority_count = len(usable_priority)
                 else:
-                    timestamp_checked.append(quote)
-            report = self.circuit_breaker.evaluate(
-                timestamp_checked,
-                expected_symbols=self.symbols,
-                now=now,
-            )
-            if not report.is_usable:
+                    priority_error = RuntimeError("priority data is stale")
+            except Exception as exc:  # provider boundary: do not leak payloads
+                priority_error = exc
+
+        pending_snapshot, pending_error = self._take_pending_full_result()
+        if pending_snapshot is not None or pending_error is not None:
+            if pending_snapshot is not None:
+                try:
+                    return self._process_full_snapshot(
+                        pending_snapshot,
+                        now=now,
+                        priority_report=priority_report,
+                        priority_count=priority_count,
+                    )
+                except Exception as exc:
+                    pending_error = type(exc).__name__
+            if priority_report is not None and priority_report.is_usable:
                 return SchedulerTick(
                     timestamp=now,
                     session=session,
                     requested=True,
-                    updated=False,
-                    quality_status=report.status,
-                    error="DATA_STALE",
+                    updated=True,
+                    quote_count=priority_count,
+                    quality_status=priority_report.status,
+                    error="FULL_MARKET_UNAVAILABLE",
                 )
-            usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
-            self.store.put_quotes(usable_quotes)
-            bars = (
-                tuple(
-                    self._retry(
-                        lambda: self.provider.get_minute_bars(self.symbols, self.frequency)
-                    )
+
+        current_monotonic = self.monotonic_clock()
+        full_market_due = (
+            self._last_full_market_at is None
+            or current_monotonic - self._last_full_market_at
+            >= self.full_market_interval_seconds
+        )
+        if self.priority_symbols and not full_market_due:
+            if priority_report is not None and priority_report.is_usable:
+                return SchedulerTick(
+                    timestamp=now,
+                    session=session,
+                    requested=True,
+                    updated=True,
+                    quote_count=priority_count,
+                    quality_status=priority_report.status,
+                    priority_only=True,
                 )
-                if self.symbols
-                else ()
+            return SchedulerTick(
+                timestamp=now,
+                session=session,
+                requested=True,
+                updated=False,
+                quality_status=DataQualityStatus.FAILED,
+                error=type(priority_error).__name__ if priority_error else "DATA_STALE",
             )
-            self.store.put_minute_bars(bars)
+
+        # Reserve the next full-market slot before calling the public endpoint:
+        # a slow or failed endpoint must not be retried on every 15-second tick.
+        self._last_full_market_at = current_monotonic
+        if self.priority_symbols and priority_report is not None and priority_report.is_usable:
+            self._start_async_full_market_refresh()
             return SchedulerTick(
                 timestamp=now,
                 session=session,
                 requested=True,
                 updated=True,
-                quote_count=len(usable_quotes),
-                bar_count=len(bars),
-                quality_status=report.status,
-                error="PARTIAL_DATA_STALE" if timestamp_quarantined else "",
+                quote_count=priority_count,
+                quality_status=priority_report.status,
+                priority_only=True,
+            )
+        try:
+            snapshot = self._retry(
+                self.provider.get_market_snapshot,
+                policy=self.full_market_retry_policy,
+            )
+            return self._process_full_snapshot(
+                snapshot,
+                now=now,
+                priority_report=priority_report,
+                priority_count=priority_count,
             )
         except Exception as exc:  # provider boundary: do not leak payloads
+            if priority_report is not None and priority_report.is_usable:
+                return SchedulerTick(
+                    timestamp=now,
+                    session=session,
+                    requested=True,
+                    updated=True,
+                    quote_count=priority_count,
+                    quality_status=priority_report.status,
+                    error="FULL_MARKET_UNAVAILABLE",
+                )
             self.circuit_breaker.state = "OPEN"
             return SchedulerTick(
                 timestamp=now,
@@ -301,20 +373,146 @@ class RealTimeScheduler:
                 error=type(exc).__name__,
             )
 
-    def _retry(self, operation: Callable[[], Any]) -> Any:
-        delay = self.retry_policy.initial_backoff_seconds
+    def _process_full_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        now: datetime,
+        priority_report: Any | None,
+        priority_count: int,
+    ) -> SchedulerTick:
+        report, timestamp_quarantined = self._check_quotes(
+            tuple(snapshot.quotes), now=now
+        )
+        if not report.is_usable:
+            if priority_report is not None and priority_report.is_usable:
+                return SchedulerTick(
+                    timestamp=now,
+                    session=self.resolver.resolve(now),
+                    requested=True,
+                    updated=True,
+                    quote_count=priority_count,
+                    quality_status=priority_report.status,
+                    error="FULL_MARKET_DATA_STALE",
+                )
+            return SchedulerTick(
+                timestamp=now,
+                session=self.resolver.resolve(now),
+                requested=True,
+                updated=False,
+                quality_status=report.status,
+                error="DATA_STALE",
+            )
+        usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
+        self.store.put_quotes(usable_quotes)
+        bars = (
+            tuple(
+                self._retry(
+                    lambda: self.provider.get_minute_bars(self.symbols, self.frequency)
+                )
+            )
+            if self.symbols
+            else ()
+        )
+        self.store.put_minute_bars(bars)
+        return SchedulerTick(
+            timestamp=now,
+            session=self.resolver.resolve(now),
+            requested=True,
+            updated=True,
+            quote_count=len(usable_quotes),
+            bar_count=len(bars),
+            quality_status=report.status,
+            error="PARTIAL_DATA_STALE" if timestamp_quarantined else "",
+        )
+
+    def _start_async_full_market_refresh(self) -> None:
+        with self._full_market_lock:
+            if self._full_market_thread is not None and self._full_market_thread.is_alive():
+                return
+
+            def worker() -> None:
+                snapshot = None
+                error: str | None = None
+                try:
+                    snapshot = self._retry(
+                        self.provider.get_market_snapshot,
+                        policy=self.full_market_retry_policy,
+                    )
+                except Exception as exc:
+                    error = type(exc).__name__
+                with self._full_market_lock:
+                    self._pending_full_snapshot = snapshot
+                    self._pending_full_error = error
+
+            self._full_market_thread = threading.Thread(
+                target=worker,
+                name="quant-full-market-refresh",
+                daemon=True,
+            )
+            self._full_market_thread.start()
+
+    def _take_pending_full_result(self) -> tuple[Any | None, str | None]:
+        with self._full_market_lock:
+            snapshot = self._pending_full_snapshot
+            error = self._pending_full_error
+            self._pending_full_snapshot = None
+            self._pending_full_error = None
+            return snapshot, error
+
+    def close(self) -> None:
+        thread = self._full_market_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.1)
+
+    def _check_quotes(
+        self,
+        quotes: tuple[Any, ...],
+        *,
+        now: datetime,
+    ) -> tuple[Any, bool]:
+        timestamp_checked: list[Any] = []
+        timestamp_quarantined = False
+        for quote in quotes:
+            try:
+                self.timestamp_tracker.observe(
+                    quote.symbol,
+                    quote.timestamp_exchange,
+                    now=now,
+                )
+            except ValueError:
+                timestamp_quarantined = True
+                timestamp_checked.append(
+                    replace(
+                        quote,
+                        is_stale=True,
+                        quality_flag=DataQualityStatus.STALE,
+                    )
+                )
+            else:
+                timestamp_checked.append(quote)
+        report = self.circuit_breaker.evaluate(
+            timestamp_checked,
+            expected_symbols=self.expected_symbols,
+            now=now,
+        )
+        return report, timestamp_quarantined
+
+    def _retry(self, operation: Callable[[], Any], *, policy: RetryPolicy | None = None) -> Any:
+        active_policy = policy or self.retry_policy
+        delay = active_policy.initial_backoff_seconds
         last_error: Exception | None = None
-        for attempt in range(self.retry_policy.max_attempts):
+        for attempt in range(active_policy.max_attempts):
             try:
                 return operation()
             except Exception as exc:  # retry provider boundary without exposing payloads
                 last_error = exc
-                if attempt + 1 >= self.retry_policy.max_attempts:
+                if attempt + 1 >= active_policy.max_attempts:
                     break
                 self.sleeper(delay)
                 delay = min(
-                    self.retry_policy.max_backoff_seconds,
-                    delay * self.retry_policy.multiplier,
+                    active_policy.max_backoff_seconds,
+                    delay * active_policy.multiplier,
                 )
         assert last_error is not None
         raise last_error
@@ -324,7 +522,7 @@ class RealTimeScheduler:
 
         return assess_quote_quality(
             self.store.quotes(),
-            expected_symbols=self.symbols,
+            expected_symbols=self.expected_symbols,
             now=self.clock(),
             stale_after_seconds=self.circuit_breaker.stale_after_seconds,
         )

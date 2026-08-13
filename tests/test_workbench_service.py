@@ -1,3 +1,4 @@
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -26,6 +27,14 @@ class FakeProvider:
 
     def get_minute_bars(self, symbols, frequency):
         return ()
+
+
+class PriorityFailureProvider(FakeProvider):
+    def get_priority_quotes(self, symbols):
+        return self.snapshot.quotes
+
+    def get_market_snapshot(self):
+        raise ConnectionError("full market unavailable")
 
 
 def _provider(now: datetime) -> FakeProvider:
@@ -125,6 +134,182 @@ def test_workbench_service_exposes_paper_only_state_and_sanitized_snapshot() -> 
     assert state["intraday_monitor"][0]["quote_timestamp"] == now.isoformat()
     assert "BUY" not in str(state["intraday_monitor"][0])
     assert state["intraday_monitor"][0]["data_age_seconds"] == 0.0
+    assert state["quote_count"] == 1
+    assert state["stale_quote_count"] == 0
+    assert state["latest_quote_at"] == now.isoformat()
+    assert state["oldest_quote_at"] == now.isoformat()
+    assert state["daily_data_status"] == "UNKNOWN"
+
+
+def test_workbench_exposes_daily_refresh_metadata_and_quote_age_counters() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=80.0,
+                strategy_version="test-v1",
+                source="baostock",
+            )
+        ]
+    )
+    official_store.set_refresh_status(
+        "STALE_DATA", "日线数据截止 2026-08-07，预计至少需要 2026-08-10"
+    )
+    stale = replace(
+        _provider(now).snapshot.quotes[0],
+        timestamp_exchange=now - timedelta(seconds=120),
+    )
+    provider = FakeProvider(
+        MarketSnapshot(
+            timestamp_exchange=now,
+            timestamp_received=now,
+            quotes=(stale,),
+            source="akshare",
+        )
+    )
+    provider.name = "akshare"
+    service = WorkbenchService(
+        provider=provider,
+        official_signal_store=official_store,
+        allow_network=True,
+        resolver=SessionResolver(
+            hours=MarketHours(), calendar=StaticTradingCalendar({now.date()})
+        ),
+        clock=lambda: now,
+        stale_after_seconds=60,
+    )
+
+    state = service.refresh().to_dict()
+
+    assert state["daily_data_status"] == "STALE_DATA"
+    assert "日线数据截止" in state["daily_data_notice_zh"]
+    assert state["daily_data_cutoff"] == now.date().isoformat()
+    assert state["quote_count"] == 0
+    service._apply_quote_state((stale,), now=now, data_quality=DataQualityStatus.STALE)
+    state = service.snapshot()
+    assert state["quote_count"] == 1
+    assert state["stale_quote_count"] == 1
+
+
+def test_workbench_keeps_priority_monitor_fresh_when_full_market_fails() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    provider = PriorityFailureProvider(_live_provider(now).snapshot)
+    provider.name = "akshare"
+    monotonic = [100.0]
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=80.0,
+                strategy_version="test-v1",
+            )
+        ]
+    )
+    service = WorkbenchService(
+        provider=provider,
+        official_signal_store=official_store,
+        allow_network=True,
+        resolver=SessionResolver(
+            hours=MarketHours(), calendar=StaticTradingCalendar({now.date()})
+        ),
+        clock=lambda: now,
+        monotonic_clock=lambda: monotonic[0],
+    )
+
+    service.refresh()
+    monotonic[0] = 160.0
+    state = service.refresh().to_dict()
+
+    assert state["quote_count"] == 1
+    assert state["stale_quote_count"] == 0
+    assert state["intraday_monitor"][0]["data_age_seconds"] == 0.0
+    assert state["last_error"] is None
+
+
+def test_workbench_snapshot_does_not_wait_for_blocked_priority_refresh() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowPriorityProvider(FakeProvider):
+        name = "akshare"
+
+        def get_priority_quotes(self, symbols):
+            started.set()
+            release.wait(timeout=3)
+            return self.snapshot.quotes
+
+    provider = SlowPriorityProvider(_live_provider(now).snapshot)
+    official_store = OfficialSignalStore()
+    official_store.put_signals(
+        [
+            OfficialModelSignal(
+                signal_date=now.date(),
+                symbol="000001",
+                normalized_score=80.0,
+                strategy_version="test-v1",
+            )
+        ]
+    )
+    service = WorkbenchService(
+        provider=provider,
+        official_signal_store=official_store,
+        allow_network=True,
+        resolver=SessionResolver(
+            hours=MarketHours(), calendar=StaticTradingCalendar({now.date()})
+        ),
+        clock=lambda: now,
+    )
+
+    refresh_thread = threading.Thread(target=service.refresh, daemon=True)
+    refresh_thread.start()
+    assert started.wait(timeout=1)
+
+    snapshot_done = threading.Event()
+
+    def read_snapshot() -> None:
+        service.snapshot()
+        snapshot_done.set()
+
+    snapshot_thread = threading.Thread(target=read_snapshot, daemon=True)
+    snapshot_thread.start()
+    assert snapshot_done.wait(timeout=0.5)
+
+    release.set()
+    refresh_thread.join(timeout=2)
+    snapshot_thread.join(timeout=1)
+
+
+def test_workbench_can_publish_new_daily_signals_after_background_refresh() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    service = WorkbenchService(
+        provider=_provider(now),
+        allow_network=False,
+        clock=lambda: now,
+    )
+    signal = OfficialModelSignal(
+        signal_date=now.date(),
+        symbol="600519",
+        normalized_score=90.0,
+        strategy_version="test-v2",
+        source="baostock",
+    )
+
+    service.publish_official_daily(
+        (signal,),
+        status="FRESH",
+        notice_zh="日线已更新至 2026-08-10，来源：BaoStock。",
+    )
+
+    state = service.snapshot()
+    assert state["daily_data_status"] == "FRESH"
+    assert state["daily_data_cutoff"] == "2026-08-10"
+    assert state["official_daily_candidates"][0]["symbol"] == "600519"
 
 
 def test_workbench_blocks_ready_when_global_quality_is_not_good() -> None:

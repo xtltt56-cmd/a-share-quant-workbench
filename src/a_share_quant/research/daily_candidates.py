@@ -8,8 +8,9 @@ cross-section before any row can be exposed as an official daily candidate.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -31,6 +32,17 @@ _REQUIRED_COLUMNS = frozenset(
 )
 
 
+class DailyDataStaleError(ValueError):
+    """Raised when local daily bars are behind the latest expected session."""
+
+    def __init__(self, available: date, expected: date) -> None:
+        self.available = available
+        self.expected = expected
+        super().__init__(
+            f"日线数据截止 {available.isoformat()}，预计至少需要 {expected.isoformat()}"
+        )
+
+
 def generate_official_signals(
     daily_bars: pd.DataFrame,
     *,
@@ -43,6 +55,8 @@ def generate_official_signals(
     engine: RuleFactorEngine | None = None,
     name_map: Mapping[str, str] | None = None,
     now: datetime | None = None,
+    require_fresh: bool = False,
+    max_business_day_lag: int = 1,
 ) -> tuple[OfficialModelSignal, ...]:
     """Generate the latest causal daily ranking from canonical bars.
 
@@ -65,6 +79,12 @@ def generate_official_signals(
         if requested_as_of > common_as_of:
             raise ValueError("requested as_of is later than available common history")
         common_as_of = requested_as_of
+    if require_fresh:
+        validate_daily_data_freshness(
+            common_as_of,
+            now=now or datetime.now(ZoneInfo("Asia/Shanghai")),
+            max_business_day_lag=max_business_day_lag,
+        )
 
     prepared_groups: list[pd.DataFrame] = []
     eligible_symbols: list[str] = []
@@ -149,6 +169,45 @@ def generate_from_data_root(
     return generate_official_signals(frame, benchmark=benchmark, **kwargs)
 
 
+def validate_daily_data_freshness(
+    available_cutoff: date,
+    *,
+    now: datetime,
+    max_business_day_lag: int = 1,
+) -> None:
+    """Reject a local cutoff that is too far behind the latest expected day.
+
+    The free-data path has no guaranteed exchange-holiday calendar, so this
+    uses weekdays conservatively and leaves a one-business-day grace period.
+    """
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if max_business_day_lag < 0:
+        raise ValueError("max_business_day_lag must be non-negative")
+    local = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    candidate = local.date()
+    if local.timetz().replace(tzinfo=None) < time(15, 0):
+        candidate -= timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    lag = _business_day_distance(available_cutoff, candidate)
+    if lag > max_business_day_lag:
+        raise DailyDataStaleError(available_cutoff, candidate)
+
+
+def _business_day_distance(available: date, expected: date) -> int:
+    if available >= expected:
+        return 0
+    current = available
+    distance = 0
+    while current < expected:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            distance += 1
+    return distance
+
+
 def load_name_map(data_root: str | Path) -> dict[str, str]:
     root = Path(data_root).resolve()
     paths = sorted((root / "lake" / "instruments").glob("*.parquet"))
@@ -231,7 +290,9 @@ def _validate_parameters(
 
 
 __all__ = [
+    "DailyDataStaleError",
     "generate_from_data_root",
     "generate_official_signals",
     "load_name_map",
+    "validate_daily_data_freshness",
 ]

@@ -15,6 +15,7 @@ from a_share_quant.data.realtime.diagnostics import (
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
 from a_share_quant.research.evolution import EvolutionRegistry
+from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import (
     PriceGuidanceRuntime,
@@ -146,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("reports/official_daily_generation.md"),
     )
     daily.add_argument("--top-k", type=int, default=10)
+    daily.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="允许生成研究用途的过期日线候选；默认拒绝并保持上次结果",
+    )
     price_guidance = subcommands.add_parser("price-guidance", help="生成或查看冻结价格指导")
     price_guidance_sub = price_guidance.add_subparsers(dest="price_guidance_command", required=True)
     generate = price_guidance_sub.add_parser("generate")
@@ -175,6 +181,13 @@ def main(argv: list[str] | None = None) -> int:
         research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
         research_supervisor = ResearchJobSupervisor(research_checkpoint_path.parent)
         governance = EvolutionRegistry()
+        if args.network and not args.offline:
+            try:
+                refresh_daily_data_if_due(repo_root / "data")
+            except Exception:
+                # The durable signal artifact remains authoritative; the
+                # bootstrap status reports the failed refresh explicitly.
+                pass
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
             repo_root=repo_root,
@@ -241,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             data_root,
             top_k=args.top_k,
             name_map=load_name_map(data_root),
+            require_fresh=not args.allow_stale,
         )
         OfficialSignalStore(path=output).put_signals(signals)
         report.parent.mkdir(parents=True, exist_ok=True)

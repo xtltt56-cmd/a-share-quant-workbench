@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.research.evolution import EvolutionRegistry
+from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
@@ -463,11 +464,47 @@ def run_server(
         if repo_root is not None
         else None
     )
+    if repo_root is not None and allow_network:
+        try:
+            refresh_daily_data_if_due(repo_root.resolve() / "data")
+        except Exception:
+            # The existing artifact remains authoritative; the service will
+            # expose its previous cutoff and failed-refresh notice.
+            pass
+        refreshed_store = load_or_generate_official_store(
+            official_store.path if official_store is not None and official_store.path else (
+                repo_root / ".runtime" / "signals" / "official-daily.json"
+            ),
+            repo_root=repo_root,
+        )
+        if official_store is not None:
+            official_store = refreshed_store
+    priority_symbols: list[str] = []
+    if official_store is not None:
+        priority_symbols.extend(signal.symbol for signal in official_store.latest())
+    if advisory_service is not None:
+        try:
+            holdings = advisory_service.holdings()
+            priority_symbols.extend(
+                str(position.get("code"))
+                for position in holdings.get("positions", [])
+                if isinstance(position, dict) and position.get("code")
+            )
+            imported = holdings.get("imported_account_snapshot")
+            if isinstance(imported, dict):
+                priority_symbols.extend(
+                    str(position.get("code"))
+                    for position in imported.get("positions", [])
+                    if isinstance(position, dict) and position.get("code")
+                )
+        except (AttributeError, TypeError, ValueError):
+            pass
     service = WorkbenchService(
         allow_network=allow_network,
         quote_cache=quote_cache,
         official_signal_store=official_store,
         price_guidance_store=price_guidance_store,
+        priority_symbols=tuple(dict.fromkeys(priority_symbols)),
     )
     service.start_background()
     server = create_server(
@@ -572,12 +609,15 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <div class="card"><div class="label">延迟</div><div id="latency" class="value">加载中</div></div>
 <div class="card"><div class="label">故障切换次数</div><div id="fallback-count" class="value">加载中</div></div>
 <div class="card"><div class="label">连续更新</div><div id="continuous" class="value">加载中</div></div>
+<div class="card"><div class="label">行情总数</div><div id="quote-count" class="value">加载中</div></div>
+<div class="card"><div class="label">过期行情数</div><div id="stale-count" class="value">加载中</div></div>
+<div class="card"><div class="label">日线数据状态</div><div id="daily-status" class="value">加载中</div></div>
 </div>
 <div class="card" style="margin-top:14px"><button onclick="refresh()">刷新后台数据</button>
 <span class="muted">浏览器只请求未缓存的本地状态；下方行情时间由后台提供。</span>
 <p id="error" class="warn"></p></div>
 <div class="card"><h2>官方日线候选</h2>
-<p class="muted">日线模型分数与盘中观察分开显示。</p>
+<p class="muted" id="daily-meta">日线模型分数与盘中观察分开显示。</p>
 <table><thead><tr><th>证券代码</th><th>分数</th><th>参考买入区间</th><th>最高可接受价</th><th>失效价</th><th>价格指导</th><th>策略版本</th><th>信号日期</th><th>模式</th></tr></thead>
 <tbody id="daily"></tbody></table></div>
 <div class="card"><h2>盘中监控</h2><div class="table-scroll"><table class="monitor-table"><thead><tr>
@@ -590,7 +630,7 @@ const labels={
   'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','AKShare / Sina':'AKShare / 新浪','AKShare / Eastmoney':'AKShare / 东方财富','AKShare / Tencent':'AKShare / 腾讯','Tushare':'Tushare数据','tushare':'Tushare数据',
   'BaoStock':'BaoStock数据','baostock':'BaoStock数据','Replay / Test Data':'回放/测试数据',
   'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',
-  'GOOD':'良好','DEGRADED':'降级','STALE':'过期','FAILED':'失败','UNKNOWN':'未知','OFFLINE':'离线','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
+  'GOOD':'良好','DEGRADED':'降级','STALE':'过期','FRESH':'最新','UPDATE_FAILED':'更新失败','UNKNOWN':'未知','OFFLINE':'离线','REPLAY':'回放','READY':'就绪','WATCH':'观察','WAIT':'等待',
   'OVERHEATED':'过热','RISK':'风险','STALE_DATA':'数据过期','BLOCKED':'已阻断','OPEN':'交易时段','CLOSED':'已收盘','NON_TRADING':'非交易日','PRE_MARKET':'盘前时段','LUNCH_BREAK':'午间休市','MARKET_CLOSED':'市场已收盘','MARKET_NOT_OPEN':'尚未开盘','MARKET_LUNCH_BREAK':'午间休市','historical':'历史数据','paper':'纸面数据','fixture':'测试数据'
    ,'ProviderRequestError':'数据源请求失败','ProviderConfigurationError':'数据源未配置','ProviderError':'数据源错误',
    'INVALIDATION_NOT_BELOW_ENTRY':'失效价不低于入场下限',
@@ -625,6 +665,10 @@ async function load(){
     document.getElementById('latency').textContent=millis(d.latency_ms);
     document.getElementById('fallback-count').textContent=display(d.fallback_count,0);
     document.getElementById('continuous').textContent=d.continuous_updates?'是':'否';
+    document.getElementById('quote-count').textContent=display(d.quote_count,0);
+    document.getElementById('stale-count').textContent=display(d.stale_quote_count,0);
+    document.getElementById('daily-status').textContent=display(d.daily_data_status);
+    document.getElementById('daily-meta').textContent=(d.daily_data_notice_zh||'日线模型分数与盘中观察分开显示。')+(d.daily_data_cutoff?'；数据截止：'+d.daily_data_cutoff:'');
     document.getElementById('error').textContent=d.last_error?('状态：'+zh(d.last_error)):'';
     const daily=(d.official_daily_candidates||[]).slice(0,20);
     document.getElementById('daily').innerHTML=rows(daily,function(x){const g=x.price_guidance||{};return '<tr><td>'+esc((x.name?x.name+'（':'')+x.symbol+(x.name?'）':''))+'</td><td>'+esc(Number(x.normalized_score).toFixed(2))+'</td><td>'+esc((g.entry_lower&&g.entry_upper)?(g.entry_lower+' - '+g.entry_upper):'暂无')+'</td><td>'+esc(g.maximum_acceptable_price||'暂无')+'</td><td>'+esc(g.invalidation_price||'暂无')+'</td><td>'+esc(priceGuidance(g))+'</td><td>'+esc(x.strategy_version)+'</td><td>'+esc(x.signal_date)+'</td><td>'+esc(display(x.data_mode,'历史数据'))+(x.signal_stale?'，待更新':'，可观察')+'</td></tr>'},'暂无官方日线候选',9);

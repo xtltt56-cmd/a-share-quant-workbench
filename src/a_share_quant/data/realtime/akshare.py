@@ -34,7 +34,8 @@ class AKShareRealTimeProvider:
         self,
         *,
         timeout_seconds: float = 20.0,
-        market_snapshot_timeout_seconds: float = 120.0,
+        market_snapshot_timeout_seconds: float = 30.0,
+        priority_timeout_seconds: float = 8.0,
         retry_count: int = 3,
         delay_seconds: float = 0.5,
         full_market_min_interval_seconds: float = 60.0,
@@ -49,6 +50,7 @@ class AKShareRealTimeProvider:
             0.1,
             float(market_snapshot_timeout_seconds),
         )
+        self.priority_timeout_seconds = max(0.1, float(priority_timeout_seconds))
         self.retry_count = max(0, int(retry_count))
         self.delay_seconds = max(0.0, float(delay_seconds))
         self.full_market_min_interval_seconds = float(full_market_min_interval_seconds)
@@ -248,11 +250,35 @@ class AKShareRealTimeProvider:
 
     def get_quotes(self, symbols: list[str] | tuple[str, ...]) -> tuple:
         if getattr(self._client(), "stock_bid_ask_em", None) is not None:
-            received = datetime.now(timezone.utc)
-            quotes = []
-            for symbol in symbols:
-                normalized = normalize_symbol(symbol)
-                raw = self._call("stock_bid_ask_em", symbol=normalized)
+            return self.get_priority_quotes(symbols)
+        requested = {normalize_symbol(symbol) for symbol in symbols}
+        return tuple(
+            quote for quote in self.get_market_snapshot().quotes if quote.symbol in requested
+        )
+
+    def get_priority_quotes(self, symbols: list[str] | tuple[str, ...]) -> tuple:
+        """Fetch only requested symbols without falling back to a full snapshot.
+
+        The public single-stock endpoint is intentionally isolated from the
+        slower all-market endpoints.  A malformed/unavailable one-symbol row
+        is skipped so one bad response cannot block the other priority rows.
+        """
+
+        if getattr(self._client(), "stock_bid_ask_em", None) is None:
+            raise ProviderRequestError("AKShare single-stock quote endpoint unavailable")
+        received = datetime.now(timezone.utc)
+        quotes = []
+        failures = 0
+        for symbol in symbols:
+            normalized = normalize_symbol(symbol)
+            try:
+                raw = self._call(
+                    "stock_bid_ask_em",
+                    symbol=normalized,
+                    timeout_seconds=self.priority_timeout_seconds,
+                    retry_count=0,
+                    retry_on_timeout=False,
+                )
                 frame = _single_stock_quote_frame(raw, symbol=normalized)
                 quotes.extend(
                     normalize_realtime_quotes(
@@ -261,11 +287,11 @@ class AKShareRealTimeProvider:
                         received_at=received,
                     )
                 )
-            return tuple(quotes)
-        requested = {normalize_symbol(symbol) for symbol in symbols}
-        return tuple(
-            quote for quote in self.get_market_snapshot().quotes if quote.symbol in requested
-        )
+            except ProviderRequestError:
+                failures += 1
+        if not quotes and symbols:
+            raise ProviderRequestError("AKShare single-stock quote requests failed")
+        return tuple(quotes)
 
     def get_index_snapshot(self, symbols: list[str] | tuple[str, ...]) -> tuple:
         if getattr(self._client(), "stock_zh_index_spot_em", None) is None:

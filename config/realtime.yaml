@@ -47,7 +47,8 @@ realtime:
     # Runtime override: A_SHARE_QUANT_AKSHARE_MARKET_SNAPSHOT_TIMEOUT_SECONDS.
     # Keep this bounded; the provider never disables TLS verification or bypasses
     # the system proxy without a saved diagnostic approval.
-    akshare_market_snapshot_timeout_seconds: 120
+    akshare_market_snapshot_timeout_seconds: 30
+    akshare_priority_timeout_seconds: 8
   live_validation:
     minimum_distinct_updates: 2
     telemetry_latency_samples: 256

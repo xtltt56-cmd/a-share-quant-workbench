@@ -1,3 +1,5 @@
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import time as datetime_time
@@ -59,6 +61,13 @@ class FakeProvider:
     def get_minute_bars(self, symbols, frequency):
         self.calls.append("bars")
         return ()
+
+
+class PriorityProvider(FakeProvider):
+    def get_priority_quotes(self, symbols):
+        self.calls.append("priority")
+        requested = set(symbols)
+        return tuple(quote for quote in self.snapshot.quotes if quote.symbol in requested)
 
 
 def test_scheduler_calls_provider_only_during_open_session() -> None:
@@ -328,6 +337,140 @@ def test_scheduler_retries_provider_with_bounded_backoff() -> None:
     assert tick.updated is True
     assert attempts == 3
     assert sleeps == [0.1, 0.2]
+
+
+def test_scheduler_updates_priority_symbols_without_repeating_full_market_snapshot() -> None:
+    first_time = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    later_time = first_time + timedelta(seconds=15)
+    provider = PriorityProvider(_snapshot(first_time))
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({first_time.date()}),
+    )
+    current_time = [first_time]
+    monotonic = [100.0]
+    scheduler = RealTimeScheduler(
+        provider=provider,
+        store=RealTimeStore(),
+        resolver=resolver,
+        priority_symbols=("000001",),
+        expected_symbols=("000001",),
+        full_market_interval_seconds=60.0,
+        clock=lambda: current_time[0],
+        monotonic_clock=lambda: monotonic[0],
+    )
+
+    first = scheduler.run_once()
+    current_time[0] = later_time
+    monotonic[0] = 115.0
+    second = scheduler.run_once()
+    current_time[0] = first_time + timedelta(seconds=60)
+    monotonic[0] = 160.0
+    third = scheduler.run_once()
+
+    assert first.updated is True
+    assert second.updated is True
+    assert provider.calls == ["priority", "priority", "priority", "snapshot"]
+    assert second.quote_count == 1
+    assert third.quote_count == 1
+
+
+def test_scheduler_uses_single_full_market_attempt_when_configured() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    provider = FakeProvider(_snapshot(now))
+    attempts = 0
+
+    def failing_snapshot():
+        nonlocal attempts
+        attempts += 1
+        raise ConnectionError("provider unavailable")
+
+    provider.get_market_snapshot = failing_snapshot
+    scheduler = RealTimeScheduler(
+        provider=provider,
+        store=RealTimeStore(),
+        resolver=resolver,
+        clock=lambda: now,
+        full_market_retry_policy=RetryPolicy(max_attempts=1),
+    )
+
+    tick = scheduler.run_once()
+
+    assert tick.updated is False
+    assert attempts == 1
+
+
+def test_scheduler_keeps_priority_data_usable_when_full_market_fails() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    provider = PriorityProvider(_snapshot(now))
+    provider.get_market_snapshot = lambda: (_ for _ in ()).throw(ConnectionError("slow"))
+    monotonic = [100.0]
+    scheduler = RealTimeScheduler(
+        provider=provider,
+        store=RealTimeStore(),
+        resolver=resolver,
+        priority_symbols=("000001",),
+        expected_symbols=("000001",),
+        full_market_interval_seconds=60,
+        clock=lambda: now,
+        monotonic_clock=lambda: monotonic[0],
+    )
+    scheduler.run_once()
+    monotonic[0] = 160.0
+
+    tick = scheduler.run_once()
+
+    assert tick.updated is True
+    assert tick.error == ""
+    assert scheduler.circuit_breaker.state == "CLOSED"
+
+
+def test_scheduler_does_not_wait_for_slow_full_market_when_priority_quotes_exist() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    resolver = SessionResolver(
+        hours=MarketHours(),
+        calendar=StaticTradingCalendar({now.date()}),
+    )
+    provider = PriorityProvider(_snapshot(now))
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_snapshot():
+        started.set()
+        release.wait(timeout=2)
+        return provider.snapshot
+
+    provider.get_market_snapshot = slow_snapshot
+    monotonic = [100.0]
+    scheduler = RealTimeScheduler(
+        provider=provider,
+        store=RealTimeStore(),
+        resolver=resolver,
+        priority_symbols=("000001",),
+        expected_symbols=("000001",),
+        full_market_interval_seconds=60,
+        clock=lambda: now,
+        monotonic_clock=lambda: monotonic[0],
+    )
+    monotonic[0] = 160.0
+
+    started_at = time.monotonic()
+    tick = scheduler.run_once()
+    elapsed = time.monotonic() - started_at
+
+    assert started.wait(timeout=1)
+    assert tick.updated is True
+    assert elapsed < 0.8
+    release.set()
+    scheduler.close()
 
 
 def test_market_hours_mapping_and_calendar_validation_are_explicit() -> None:

@@ -8,6 +8,7 @@ import tempfile
 from collections.abc import Iterable
 from datetime import date, datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from a_share_quant.signals.realtime import OfficialModelSignal
@@ -45,26 +46,31 @@ class OfficialSignalStore:
 
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else None
+        self._lock = RLock()
         self._signals: dict[tuple[date, str, str], OfficialModelSignal] = {}
+        self._refresh_status = "UNKNOWN"
+        self._refresh_notice_zh = "尚未执行日线刷新。"
         if self.path is not None and self.path.exists():
             self._load()
 
     def put_signals(self, signals: Iterable[OfficialModelSignal]) -> None:
         incoming = tuple(signals)
-        for signal in incoming:
-            if not isinstance(signal, OfficialModelSignal):
-                raise TypeError("official signal store accepts only OfficialModelSignal")
-            key = (signal.signal_date, signal.symbol, signal.strategy_version)
-            self._signals[key] = signal
-        if incoming and self.path is not None:
-            self._persist()
+        with self._lock:
+            for signal in incoming:
+                if not isinstance(signal, OfficialModelSignal):
+                    raise TypeError("official signal store accepts only OfficialModelSignal")
+                key = (signal.signal_date, signal.symbol, signal.strategy_version)
+                self._signals[key] = signal
+            if incoming and self.path is not None:
+                self._persist()
 
     def signals(self, *, signal_date: date | None = None) -> tuple[OfficialModelSignal, ...]:
-        selected = tuple(
-            signal
-            for signal in self._signals.values()
-            if signal_date is None or signal.signal_date == signal_date
-        )
+        with self._lock:
+            selected = tuple(
+                signal
+                for signal in self._signals.values()
+                if signal_date is None or signal.signal_date == signal_date
+            )
         return tuple(
             sorted(
                 sorted(
@@ -81,23 +87,37 @@ class OfficialSignalStore:
         )
 
     def latest(self) -> tuple[OfficialModelSignal, ...]:
-        if not self._signals:
-            return ()
-        latest_date = max(signal.signal_date for signal in self._signals.values())
-        return tuple(
-            sorted(
-                (
-                    signal
-                    for signal in self._signals.values()
-                    if signal.signal_date == latest_date
-                ),
-                key=lambda item: (
-                    -float(item.normalized_score),
-                    item.symbol,
-                    item.strategy_version,
-                ),
+        with self._lock:
+            if not self._signals:
+                return ()
+            latest_date = max(signal.signal_date for signal in self._signals.values())
+            return tuple(
+                sorted(
+                    (
+                        signal
+                        for signal in self._signals.values()
+                        if signal.signal_date == latest_date
+                    ),
+                    key=lambda item: (
+                        -float(item.normalized_score),
+                        item.symbol,
+                        item.strategy_version,
+                    ),
+                )
             )
-        )
+
+    @property
+    def refresh_status(self) -> str:
+        return self._refresh_status
+
+    @property
+    def refresh_notice_zh(self) -> str:
+        return self._refresh_notice_zh
+
+    def set_refresh_status(self, status: str, notice_zh: str) -> None:
+        with self._lock:
+            self._refresh_status = str(status)
+            self._refresh_notice_zh = str(notice_zh)
 
     def _load(self) -> None:
         assert self.path is not None

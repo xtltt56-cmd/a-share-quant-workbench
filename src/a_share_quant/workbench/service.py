@@ -22,7 +22,12 @@ from a_share_quant.data.realtime.registry import (
     build_default_registry,
 )
 from a_share_quant.runtime.realtime_telemetry import LiveDataQualityGate, ProviderTelemetry
-from a_share_quant.runtime.scheduler import RealTimeScheduler, SchedulerTick, SessionResolver
+from a_share_quant.runtime.scheduler import (
+    RealTimeScheduler,
+    RetryPolicy,
+    SchedulerTick,
+    SessionResolver,
+)
 from a_share_quant.signals.realtime import (
     OfficialModelSignal,
     RealtimeMonitorSignal,
@@ -51,6 +56,10 @@ class WorkbenchState:
     distinct_update_count: int = 0
     circuit_breaker_state: str = "UNKNOWN"
     last_update: str | None = None
+    latest_quote_at: str | None = None
+    oldest_quote_at: str | None = None
+    quote_count: int = 0
+    stale_quote_count: int = 0
     data_age_seconds: float | None = None
     latency_ms: float | None = None
     fallback_count: int = 0
@@ -60,6 +69,10 @@ class WorkbenchState:
     breadth: dict[str, Any] = field(default_factory=dict)
     intraday_monitor: list[dict[str, Any]] = field(default_factory=list)
     official_daily_candidates: list[dict[str, Any]] = field(default_factory=list)
+    daily_data_status: str = "UNKNOWN"
+    daily_data_notice_zh: str = "尚未执行日线刷新。"
+    daily_data_cutoff: str | None = None
+    daily_generated_at: str | None = None
     price_guidance_plans: list[dict[str, Any]] = field(default_factory=list)
     paper_only: bool = True
     live_trading_enabled: bool = False
@@ -86,6 +99,7 @@ class WorkbenchService:
         price_guidance_store: PriceGuidanceStore | None = None,
         realtime_overlay_store: RealtimeOverlayStore | None = None,
         symbols: Sequence[str] = (),
+        priority_symbols: Sequence[str] = (),
         allow_network: bool = False,
         resolver: SessionResolver | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -94,6 +108,7 @@ class WorkbenchService:
         stale_after_seconds: float = 60.0,
         minimum_distinct_updates: int = 2,
         telemetry_latency_samples: int = 256,
+        full_market_retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.store = store or RealTimeStore()
         self.quote_cache = quote_cache
@@ -112,11 +127,16 @@ class WorkbenchService:
         self.telemetry = ProviderTelemetry(max_latency_samples=telemetry_latency_samples)
         self._last_switch_event_count = 0
         self.state = WorkbenchState()
+        self._state_lock = threading.RLock()
+        # Serialize provider polls without holding the state lock.  HTTP
+        # readers must remain responsive while a public endpoint is slow.
+        self._refresh_lock = threading.Lock()
         self._cached_snapshot: CachedQuoteSnapshot | None = None
         self._cache_error: str | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._poll_interval_seconds = max(1.0, float(poll_interval_seconds))
+        self._requested_priority_symbols = tuple(dict.fromkeys(priority_symbols))
 
         if self.quote_cache is not None:
             try:
@@ -171,6 +191,19 @@ class WorkbenchService:
         # the first refresh has not completed yet.  These rows are explicitly
         # marked stale/monitoring-only until a fresh quote is observed.
         self._apply_stored_signal_state(now=self.clock())
+        supports_priority = getattr(self._provider, "get_priority_quotes", None) is not None
+        self._priority_symbols = (
+            tuple(
+                dict.fromkeys(
+                    (
+                        *self._requested_priority_symbols,
+                        *(signal.symbol for signal in self.official_signal_store.latest()),
+                    )
+                )
+            )
+            if supports_priority
+            else ()
+        )
         if self._cached_snapshot is not None:
             self._apply_cached_state(now=self.clock(), error=self._cache_error or "CACHED_DATA")
         self.scheduler = (
@@ -179,8 +212,12 @@ class WorkbenchService:
                 store=self.store,
                 resolver=resolver,
                 symbols=tuple(symbols),
+                priority_symbols=self._priority_symbols,
+                expected_symbols=self._priority_symbols,
                 clock=self.clock,
+                monotonic_clock=self._monotonic_clock,
                 stale_after_seconds=stale_after_seconds,
+                full_market_retry_policy=full_market_retry_policy or RetryPolicy(max_attempts=1),
             )
             if self._provider is not None
             else None
@@ -191,19 +228,27 @@ class WorkbenchService:
         return self._provider
 
     def refresh(self) -> WorkbenchState:
-        now = self.clock()
-        if not self.allow_network:
-            self._apply_unavailable_state(now, error="OFFLINE_MODE", evidence_mode="OFFLINE")
-            return self.state
-        if self.scheduler is None:
-            self._apply_unavailable_state(now, error="NO_PROVIDER", evidence_mode="OFFLINE")
-            return self.state
+        with self._refresh_lock:
+            now = self.clock()
+            if not self.allow_network:
+                with self._state_lock:
+                    self._apply_unavailable_state(
+                        now, error="OFFLINE_MODE", evidence_mode="OFFLINE"
+                    )
+                return self.state
+            if self.scheduler is None:
+                with self._state_lock:
+                    self._apply_unavailable_state(
+                        now, error="NO_PROVIDER", evidence_mode="OFFLINE"
+                    )
+                return self.state
 
-        started = self._monotonic_clock()
-        tick = self.scheduler.run_once()
-        latency_ms = max(0.0, (self._monotonic_clock() - started) * 1000)
-        self._apply_tick(tick, latency_ms=latency_ms)
-        return self.state
+            started = self._monotonic_clock()
+            tick = self.scheduler.run_once()
+            latency_ms = max(0.0, (self._monotonic_clock() - started) * 1000)
+            with self._state_lock:
+                self._apply_tick(tick, latency_ms=latency_ms)
+            return self.state
 
     def start_background(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -221,27 +266,53 @@ class WorkbenchService:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._thread = None
+        if self.scheduler is not None:
+            self.scheduler.close()
 
     def health(self) -> dict[str, Any]:
-        return {
-            "status": (
-                "OFFLINE"
-                if not self.allow_network
-                else "OK" if self._provider is not None else "DATA_UNAVAILABLE"
-            ),
-            "active_provider": self.state.active_provider,
-            "active_source": self.state.active_source,
-            "source_class": self.state.source_class,
-            "evidence_mode": self.state.evidence_mode,
-            "provider_capabilities": self.state.provider_capabilities,
-            "allow_network": self.allow_network,
-            "provider_telemetry": self.telemetry.snapshot().to_dict(),
-            "paper_only": True,
-            "live_trading_enabled": False,
-        }
+        with self._state_lock:
+            return {
+                "status": (
+                    "OFFLINE"
+                    if not self.allow_network
+                    else "OK" if self._provider is not None else "DATA_UNAVAILABLE"
+                ),
+                "active_provider": self.state.active_provider,
+                "active_source": self.state.active_source,
+                "source_class": self.state.source_class,
+                "evidence_mode": self.state.evidence_mode,
+                "provider_capabilities": self.state.provider_capabilities,
+                "allow_network": self.allow_network,
+                "provider_telemetry": self.telemetry.snapshot().to_dict(),
+                "paper_only": True,
+                "live_trading_enabled": False,
+            }
 
     def snapshot(self) -> dict[str, Any]:
-        return self.state.to_dict()
+        with self._state_lock:
+            return self.state.to_dict()
+
+    def publish_official_daily(
+        self,
+        signals: Sequence[OfficialModelSignal],
+        *,
+        status: str,
+        notice_zh: str,
+    ) -> None:
+        """Apply a validated daily refresh to the running dashboard."""
+
+        with self._state_lock:
+            self.official_signal_store.put_signals(signals)
+            self.official_signal_store.set_refresh_status(status, notice_zh)
+            self._priority_symbols = tuple(
+                dict.fromkeys(
+                    (*self._requested_priority_symbols, *(signal.symbol for signal in signals))
+                )
+            )
+            if self.scheduler is not None:
+                self.scheduler.priority_symbols = self._priority_symbols
+                self.scheduler.expected_symbols = self._priority_symbols
+            self._apply_stored_signal_state(now=self.clock())
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -315,11 +386,16 @@ class WorkbenchService:
             latency_ms=latency_ms,
             observed_at=tick.timestamp,
         )
+        quality_quotes = (
+            self.store.quotes(self.scheduler.expected_symbols)
+            if tick.priority_only
+            else quotes
+        )
         report = self.live_quality_gate.evaluate(
-            quotes,
+            quality_quotes,
             provider_connected=True,
             circuit_breaker_open=self.scheduler.circuit_breaker.state == "OPEN",
-            expected_symbols=self.scheduler.symbols,
+            expected_symbols=self.scheduler.expected_symbols,
             now=tick.timestamp,
         )
         replay = _is_replay_provider(active_provider, quotes)
@@ -329,6 +405,8 @@ class WorkbenchService:
             replay=replay,
             status=effective_quality,
         )
+        if tick.priority_only:
+            self.state.last_error = None
         self.state.circuit_breaker_state = self.scheduler.circuit_breaker.state
         # Replay fixtures are explicitly separated in the state evidence mode;
         # keep their deterministic monitor behavior while applying the live
@@ -431,6 +509,7 @@ class WorkbenchService:
             )
         )
         self.state.quotes = [_quote_payload(quote, now=now) for quote in ordered_quotes[:100]]
+        self._apply_quote_metrics(quotes, now=now)
         breadth = calculate_market_breadth(ordered_quotes)
         self.state.breadth = _breadth_payload(breadth)
         monitor_rows: list[dict[str, Any]] = []
@@ -475,10 +554,44 @@ class WorkbenchService:
             item.to_dict() for item in self._guidance_plans()
         ]
 
+    def _apply_quote_metrics(
+        self,
+        quotes: Sequence[RealTimeQuote],
+        *,
+        now: datetime,
+    ) -> None:
+        ordered = tuple(sorted(quotes, key=lambda quote: quote.timestamp_exchange))
+        self.state.quote_count = len(ordered)
+        self.state.stale_quote_count = sum(
+            1
+            for quote in ordered
+            if quote.is_stale
+            or quote.data_age_seconds(now=now)
+            > self.live_quality_gate.stale_after_seconds
+        )
+        self.state.oldest_quote_at = (
+            ordered[0].timestamp_exchange.isoformat() if ordered else None
+        )
+        self.state.latest_quote_at = (
+            ordered[-1].timestamp_exchange.isoformat() if ordered else None
+        )
+
     def _apply_stored_signal_state(self, *, now: datetime) -> None:
         """Expose durable candidates while live quotes are unavailable."""
 
         signals = self.official_signal_store.latest()
+        self.state.daily_data_status = self.official_signal_store.refresh_status
+        self.state.daily_data_notice_zh = self.official_signal_store.refresh_notice_zh
+        self.state.daily_data_cutoff = (
+            max((signal.data_cutoff for signal in signals), default=None).isoformat()
+            if signals
+            else None
+        )
+        self.state.daily_generated_at = (
+            max((signal.generated_at for signal in signals), default=None).isoformat()
+            if signals
+            else None
+        )
         self.state.official_daily_candidates = [
             _official_signal_payload(
                 signal, now=now, price_guidance=self._guidance_plans_by_symbol().get(signal.symbol)

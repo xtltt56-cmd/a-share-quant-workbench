@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from a_share_quant.research.daily_candidates import (
+    DailyDataStaleError,
     generate_from_data_root,
     load_name_map,
 )
@@ -45,13 +46,19 @@ def load_or_generate_official_store(
                 top_k=top_k,
                 name_map=load_name_map(data_root),
                 now=datetime.now(timezone.utc),
+                require_fresh=True,
             )
 
     try:
         generated = tuple(generator())
+    except DailyDataStaleError as exc:
+        store.set_refresh_status("STALE_DATA", str(exc))
+        return store
     except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        store.set_refresh_status("UPDATE_FAILED", "日线数据刷新失败，保留上次经过核验的候选。")
         return store
     if not generated:
+        store.set_refresh_status("UPDATE_FAILED", "日线刷新未生成候选，保留上次经过核验的候选。")
         return store
 
     existing = store.latest()
@@ -59,6 +66,11 @@ def load_or_generate_official_store(
         signal.signal_date for signal in existing
     ):
         store.put_signals(generated)
+    cutoff = max(signal.data_cutoff for signal in generated)
+    store.set_refresh_status(
+        "FRESH",
+        f"日线已更新至 {cutoff.isoformat()}，来源：BaoStock。",
+    )
     return store
 
 

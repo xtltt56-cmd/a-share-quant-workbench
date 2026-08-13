@@ -54,3 +54,23 @@ def test_bootstrap_keeps_existing_signal_when_generation_fails(monkeypatch, tmp_
 
     assert store.latest() == expected
 
+
+def test_bootstrap_exposes_stale_data_status_when_refresh_is_rejected(
+    monkeypatch, tmp_path
+) -> None:
+    path = tmp_path / "signals.json"
+    expected = (_signal(signal_date=date(2026, 8, 9)),)
+    load_or_generate_official_store(path, repo_root=tmp_path, generator=lambda: expected)
+    monkeypatch.setattr(
+        "a_share_quant.runtime.official_daily.generate_from_data_root",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("a_share_quant.research.daily_candidates", fromlist=["DailyDataStaleError"])
+            .DailyDataStaleError(date(2026, 8, 10), date(2026, 8, 12))
+        ),
+    )
+
+    store = load_or_generate_official_store(path, repo_root=tmp_path)
+
+    assert store.latest() == expected
+    assert store.refresh_status == "STALE_DATA"
+    assert "日线数据截止" in store.refresh_notice_zh

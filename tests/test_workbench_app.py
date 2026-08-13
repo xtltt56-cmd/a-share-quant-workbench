@@ -65,6 +65,9 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
         assert "仅供纸面监控" in html
         assert "当前数据源" in html
         assert "数据源类别" in html
+        assert "行情总数" in html
+        assert "过期行情数" in html
+        assert "日线数据状态" in html
         assert "后端行情时间戳" in html
         assert "股票名称（代码）" in html
         assert "monitor-symbol" in html

@@ -3,7 +3,11 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from a_share_quant.research.daily_candidates import generate_official_signals
+from a_share_quant.research.daily_candidates import (
+    DailyDataStaleError,
+    generate_official_signals,
+    validate_daily_data_freshness,
+)
 
 
 def _bars(*, symbols: int = 31, source: str = "baostock") -> pd.DataFrame:
@@ -60,3 +64,18 @@ def test_daily_candidates_do_not_use_inverse_price_as_valuation() -> None:
     # The initial free-data model has no fundamental valuation factor; a price
     # scale change alone must not turn into a valuation preference.
     assert changed.symbol == first.symbol
+
+
+def test_daily_data_freshness_rejects_two_business_day_lag_before_close() -> None:
+    with pytest.raises(DailyDataStaleError, match="日线数据截止"):
+        validate_daily_data_freshness(
+            date(2026, 8, 10),
+            now=pd.Timestamp("2026-08-13 10:00", tz="Asia/Shanghai").to_pydatetime(),
+        )
+
+
+def test_daily_data_freshness_accepts_previous_complete_day_before_close() -> None:
+    validate_daily_data_freshness(
+        date(2026, 8, 12),
+        now=pd.Timestamp("2026-08-13 10:00", tz="Asia/Shanghai").to_pydatetime(),
+    )
