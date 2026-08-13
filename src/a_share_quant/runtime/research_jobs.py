@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,7 +46,9 @@ class ResearchJobSupervisor:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.root / "research-checkpoint.json"
-        self._launcher = launcher or _default_launcher
+        self._launcher = launcher or (
+            lambda command: _default_launcher(command, repo_root=self.root.parents[1])
+        )
         self._jobs: dict[str, ResearchJob] = {}
         self._children: dict[str, Any] = {}
         self._accepting = True
@@ -164,8 +168,32 @@ def _unsafe_argument(value: str) -> bool:
     return any(token in value for token in ("..", "/", "\\", "--"))
 
 
-def _default_launcher(command: tuple[str, ...]) -> Any:
-    raise RuntimeError(f"no research launcher configured for {command!r}")
+def _default_launcher(command: tuple[str, ...], *, repo_root: Path) -> Any:
+    if command not in _ALLOWED_COMMANDS:
+        raise ValueError("job is not allowlisted")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "a_share_quant.runtime.research_worker", command[1]],
+        cwd=str(repo_root),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+    )
+    return _OwnedProcess(process)
+
+
+class _OwnedProcess:
+    def __init__(self, process: Any) -> None:
+        self.process = process
+
+    def is_running(self) -> bool:
+        return self.process.poll() is None
+
+    def terminate(self) -> None:
+        self.process.terminate()
+
+    def wait(self, timeout: float | None = None) -> None:
+        self.process.wait(timeout=timeout)
 
 
 __all__ = ["ResearchJob", "ResearchJobSupervisor", "ShutdownResult"]

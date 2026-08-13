@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import secrets
-from dataclasses import dataclass
+import tempfile
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -82,16 +87,27 @@ class EvolutionEvaluator:
 
 
 class EvolutionRegistry:
-    """In-memory control plane; production callers persist its audit records."""
+    """Human-controlled model registry with optional integrity-checked storage."""
 
-    def __init__(self, *, champion_id: str | None = "champion-v1") -> None:
+    def __init__(
+        self,
+        *,
+        champion_id: str | None = "champion-v1",
+        state_path: str | Path | None = None,
+    ) -> None:
+        self.state_path = Path(state_path).resolve() if state_path is not None else None
         self.champion_id = champion_id
         self._reports: dict[str, EvolutionReport] = {}
         self._tokens: dict[str, str] = {}
         self._audit: list[PromotionRecord] = []
+        if self.state_path is not None and self.state_path.exists():
+            self._load()
+        elif self.state_path is not None:
+            self._persist()
 
     def register_report(self, report: EvolutionReport) -> None:
         self._reports[report.report_id] = report
+        self._persist()
 
     def report(self, report_id: str) -> EvolutionReport:
         report = self._reports.get(report_id)
@@ -128,6 +144,7 @@ class EvolutionRegistry:
             approved_at=datetime.now(timezone.utc),
         )
         self._audit.append(record)
+        self._persist()
         return record
 
     def rollback(self, record_id: str, *, confirmation_token: str) -> PromotionRecord:
@@ -147,6 +164,7 @@ class EvolutionRegistry:
             approved_at=datetime.now(timezone.utc),
         )
         self._audit.append(record)
+        self._persist()
         return record
 
     def audit_log(self) -> tuple[PromotionRecord, ...]:
@@ -162,6 +180,98 @@ class EvolutionRegistry:
 
     def invalidate_confirmation_token(self, subject_id: str) -> None:
         self._tokens.pop(subject_id, None)
+
+    def _persist(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        body: dict[str, Any] = {
+            "format_version": 1,
+            "champion_id": self.champion_id,
+            "reports": [_json_record(item) for item in self._reports.values()],
+            "audit": [_json_record(item) for item in self._audit],
+        }
+        encoded = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        payload = json.dumps(
+            {**body, "sha256": hashlib.sha256(encoded).hexdigest()},
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        ).encode()
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self.state_path.name}.", dir=self.state_path.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.state_path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _load(self) -> None:
+        assert self.state_path is not None
+        try:
+            raw = self.state_path.read_bytes()
+            if not raw or len(raw) > 4_194_304:
+                raise ValueError("evolution registry integrity check failed")
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict) or payload.get("format_version") != 1:
+                raise ValueError("evolution registry integrity check failed")
+            digest = payload.pop("sha256", None)
+            encoded = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+            if not isinstance(digest, str) or not secrets.compare_digest(
+                digest, hashlib.sha256(encoded).hexdigest()
+            ):
+                raise ValueError("evolution registry integrity check failed")
+            reports = payload.get("reports")
+            audit = payload.get("audit")
+            if not isinstance(reports, list) or not isinstance(audit, list):
+                raise ValueError("evolution registry integrity check failed")
+            restored_reports = {
+                item["report_id"]: EvolutionReport(
+                    report_id=item["report_id"],
+                    candidate_id=item["candidate_id"],
+                    status=item["status"],
+                    checks=dict(item["checks"]),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                )
+                for item in reports
+            }
+            restored_audit = [
+                PromotionRecord(
+                    record_id=item["record_id"],
+                    report_id=item["report_id"],
+                    candidate_id=item["candidate_id"],
+                    previous_champion_id=item.get("previous_champion_id"),
+                    champion_id=item.get("champion_id"),
+                    action=item["action"],
+                    approved_at=datetime.fromisoformat(item["approved_at"]),
+                )
+                for item in audit
+            ]
+            self.champion_id = payload.get("champion_id")
+            self._reports = restored_reports
+            self._audit = restored_audit
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError("evolution registry integrity check failed") from exc
+
+
+def _json_record(value: EvolutionReport | PromotionRecord) -> dict[str, Any]:
+    payload = asdict(value)
+    for key, item in tuple(payload.items()):
+        if isinstance(item, datetime):
+            payload[key] = item.isoformat()
+    return payload
 
 
 __all__ = [

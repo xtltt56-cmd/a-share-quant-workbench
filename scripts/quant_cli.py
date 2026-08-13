@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from a_share_quant.account.import_inbox import AccountImportInbox
@@ -88,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     workbench.add_argument(
         "--research-checkpoint",
         type=Path,
-        default=Path(".runtime/research-checkpoint.json"),
+        default=Path(".runtime/research/research-checkpoint.json"),
         help="研究任务的可校验检查点路径",
     )
     mode = workbench.add_mutually_exclusive_group()
@@ -180,7 +181,15 @@ def main(argv: list[str] | None = None) -> int:
         price_guidance_path = _inside(repo_root, args.price_guidance_path)
         research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
         research_supervisor = ResearchJobSupervisor(research_checkpoint_path.parent)
-        governance = EvolutionRegistry()
+        governance = EvolutionRegistry(
+            state_path=repo_root / ".runtime" / "research" / "evolution-registry.json"
+        )
+        research_supervisor.register_job(
+            "forecast-on-launch",
+            ("research", "forecast"),
+            due_at=datetime.now(timezone.utc),
+        )
+        research_supervisor.start_due_jobs(now=datetime.now(timezone.utc))
         if args.network and not args.offline:
             try:
                 refresh_daily_data_if_due(repo_root / "data")

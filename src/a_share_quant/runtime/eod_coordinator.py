@@ -24,6 +24,7 @@ class EODCoordinator:
         self.calendar = calendar or AShareTradingCalendar()
         self.close_time = close_time
         self._completed: set[date] = set()
+        self.last_error: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -38,7 +39,12 @@ class EODCoordinator:
             or current.timetz().replace(tzinfo=None) < self.close_time
         ):
             return False
-        self.refresh(day)
+        try:
+            self.refresh(day)
+        except Exception as exc:
+            self.last_error = str(exc)[:500]
+            return False
+        self.last_error = None
         self._completed.add(day)
         return True
 

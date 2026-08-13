@@ -19,6 +19,7 @@ from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
 from a_share_quant.runtime.eod_coordinator import EODCoordinator
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
+from a_share_quant.runtime.price_guidance import load_or_generate_price_guidance_store
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
@@ -500,22 +501,12 @@ def run_server(
     eod_coordinator = None
     if repo_root is not None and allow_network and official_store is not None:
         def refresh_eod(day: date) -> None:
-            summary = refresh_daily_data_if_due(repo_root.resolve() / "data", end_date=day)
-            if summary.symbols_failed:
-                official_store.set_refresh_status(
-                    "UPDATE_FAILED",
-                    f"日线刷新有 {summary.symbols_failed} 只股票失败，保留上次候选。",
-                )
-                return
-            refreshed = load_or_generate_official_store(
-                official_store.path
-                or repo_root.resolve() / ".runtime" / "signals" / "official-daily.json",
+            refresh_eod_state(
+                day=day,
                 repo_root=repo_root,
-            )
-            service.publish_official_daily(
-                refreshed.latest(),
-                status=refreshed.refresh_status,
-                notice_zh=refreshed.refresh_notice_zh,
+                official_store=official_store,
+                guidance_store=price_guidance_store,
+                service=service,
             )
 
         eod_coordinator = EODCoordinator(refresh=refresh_eod)
@@ -541,6 +532,42 @@ def run_server(
             eod_coordinator.stop()
         if supervisor is not None:
             supervisor.shutdown(timeout_seconds=5.0)
+
+
+def refresh_eod_state(
+    *,
+    day: date,
+    repo_root: Path,
+    official_store: OfficialSignalStore,
+    guidance_store: PriceGuidanceStore | None,
+    service: WorkbenchService,
+) -> None:
+    """Refresh durable daily artifacts before publishing one coherent state."""
+
+    root = repo_root.resolve()
+    summary = refresh_daily_data_if_due(root / "data", end_date=day)
+    if summary.symbols_failed:
+        official_store.set_refresh_status(
+            "UPDATE_FAILED",
+            f"日线刷新有 {summary.symbols_failed} 只股票失败，保留上次候选。",
+        )
+        return
+    refreshed = load_or_generate_official_store(
+        official_store.path or root / ".runtime" / "signals" / "official-daily.json",
+        repo_root=root,
+    )
+    if guidance_store is not None:
+        refreshed_guidance = load_or_generate_price_guidance_store(
+            guidance_store.path,
+            repo_root=root,
+            official_signal_store=refreshed,
+        )
+        guidance_store.replace_plans(refreshed_guidance.plans())
+    service.publish_official_daily(
+        refreshed.latest(),
+        status=refreshed.refresh_status,
+        notice_zh=refreshed.refresh_notice_zh,
+    )
 
 
 def _governance_digest(value: Any) -> str:

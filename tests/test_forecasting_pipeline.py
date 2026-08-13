@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pandas as pd
+import pytest
 
-from a_share_quant.research.forecasting import build_forecast_labels, train_challengers
+from a_share_quant.research.forecasting import (
+    build_forecast_labels,
+    load_challenger_model,
+    train_challengers,
+)
 
 
 def prices(count: int = 1400) -> pd.DataFrame:
@@ -56,3 +61,22 @@ def test_research_artifact_metadata_is_deterministic(tmp_path) -> None:
     assert first.feature_schema == second.feature_schema
     assert first.random_seed == 20260812
     assert first.formal_eligible is False
+
+
+def test_fitted_logistic_model_is_integrity_checked_and_loadable(tmp_path) -> None:
+    frame = prices()
+    frame["close"] = 20 + ((frame.index % 19) - 9) * 0.08 + frame.index * 0.0002
+    result = train_challengers(frame, benchmark(), artifact_root=tmp_path)
+
+    model_paths = [path for path in result.artifacts if path.endswith("logistic-model.json")]
+    assert model_paths
+    model = load_challenger_model(model_paths[0])
+    probabilities = model.predict_proba([[0.01], [-0.02]])
+    assert probabilities.shape == (2, 2)
+    assert ((probabilities >= 0) & (probabilities <= 1)).all()
+
+    model_path = tmp_path / "models" / "challengers" / "forecasting-v1" / "logistic-model.json"
+    tampered = model_path.read_text(encoding="utf-8").replace("0.0", "9.9", 1)
+    model_path.write_text(tampered, encoding="utf-8")
+    with pytest.raises(ValueError, match="integrity"):
+        load_challenger_model(model_path)

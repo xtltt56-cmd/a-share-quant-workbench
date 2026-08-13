@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from a_share_quant.research.evolution import (
@@ -108,3 +110,30 @@ def test_blocked_report_cannot_issue_an_approval_token() -> None:
     )
     with pytest.raises(ValueError, match="awaiting"):
         registry.issue_confirmation_token(report.report_id)
+
+
+def test_registry_restores_champion_reports_and_audit_after_restart(tmp_path) -> None:
+    state_path = tmp_path / "evolution-registry.json"
+    registry = EvolutionRegistry(champion_id="champion-v1", state_path=state_path)
+    report = EvolutionEvaluator(registry).evaluate(passing_metrics())
+    token = registry.issue_confirmation_token(report.report_id)
+    record = registry.approve(report.report_id, confirmation_token=token)
+
+    restored = EvolutionRegistry(state_path=state_path)
+
+    assert restored.champion_id == "challenger-v2"
+    assert restored.report(report.report_id) == report
+    assert restored.audit_log() == (record,)
+    with pytest.raises(ValueError, match="confirmation"):
+        restored.approve(report.report_id, confirmation_token=token)
+
+
+def test_registry_rejects_tampered_persistent_state(tmp_path) -> None:
+    state_path = tmp_path / "evolution-registry.json"
+    EvolutionRegistry(champion_id="champion-v1", state_path=state_path)
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["champion_id"] = "attacker-model"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integrity"):
+        EvolutionRegistry(state_path=state_path)

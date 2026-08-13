@@ -20,6 +20,9 @@ class FakeChild:
     def wait(self, timeout: float | None = None) -> None:
         self.running = False
 
+    def poll(self):
+        return None if self.running else 0
+
 
 class FakeLauncher:
     def __init__(self) -> None:
@@ -71,3 +74,30 @@ def test_checkpoint_rejects_unknown_commands_and_path_like_arguments(tmp_path) -
     text = checkpoint.read_text(encoding="utf-8").replace("research", "..\\unsafe")
     checkpoint.write_text(text, encoding="utf-8")
     assert ResearchJobSupervisor(tmp_path).resume_eligible_jobs() == ()
+
+
+def test_default_launcher_runs_allowlisted_worker_and_shutdown_owns_it(
+    tmp_path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+    child = FakeChild()
+
+    def popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return child
+
+    monkeypatch.setattr("a_share_quant.runtime.research_jobs.subprocess.Popen", popen)
+    supervisor = ResearchJobSupervisor(tmp_path / ".runtime" / "research")
+    supervisor.register_job(
+        "forecast-on-launch",
+        ("research", "forecast"),
+        due_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+
+    supervisor.start_due_jobs(now=datetime.now(timezone.utc))
+    result = supervisor.shutdown()
+
+    assert captured["argv"][1:4] == ["-m", "a_share_quant.runtime.research_worker", "forecast"]
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+    assert result.children_stopped is True

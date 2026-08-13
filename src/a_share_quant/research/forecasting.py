@@ -42,6 +42,21 @@ class ChallengerTrainingResult:
     artifacts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PortableLogisticModel:
+    feature_schema: tuple[str, ...]
+    coefficients: tuple[float, ...]
+    intercept: float
+
+    def predict_proba(self, values: Any) -> np.ndarray:
+        matrix = np.asarray(values, dtype="float64")
+        if matrix.ndim != 2 or matrix.shape[1] != len(self.coefficients):
+            raise ValueError("model input does not match feature schema")
+        logits = matrix @ np.asarray(self.coefficients) + self.intercept
+        positive = 1.0 / (1.0 + np.exp(-np.clip(logits, -709, 709)))
+        return np.column_stack((1.0 - positive, positive))
+
+
 def build_forecast_labels(
     prices: pd.DataFrame,
     benchmark: pd.DataFrame,
@@ -126,7 +141,7 @@ def train_challengers(
         feature_schema = ("feature_return_5",)
     dates = [value for value in sorted(labels["date"].dropna().unique())]
     folds = _walk_forward_folds(dates)
-    model_status = _fit_research_challengers(
+    model_status, fitted_models = _fit_research_challengers(
         labels,
         feature_schema=feature_schema,
         folds=folds,
@@ -135,6 +150,16 @@ def train_challengers(
     )
     artifacts: list[str] = []
     if artifact_root is not None:
+        logistic = fitted_models.get("logistic-baseline")
+        if logistic is not None:
+            artifacts.append(
+                _write_logistic_model(
+                    Path(artifact_root),
+                    logistic,
+                    feature_schema=feature_schema,
+                    random_seed=int(random_seed),
+                )
+            )
         artifacts.append(
             _write_metadata(
                 Path(artifact_root),
@@ -208,14 +233,15 @@ def _fit_research_challengers(
     folds: tuple[WalkForwardFold, ...],
     random_seed: int,
     n_jobs: int,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, Any]]:
     statuses = {
         "logistic-baseline": "UNAVAILABLE",
         "lightgbm-challenger": "UNAVAILABLE",
         "qlib-double-ensemble": "METADATA_ONLY",
     }
     if not folds:
-        return statuses
+        return statuses, {}
+    fitted_models: dict[str, Any] = {}
     try:
         from sklearn.linear_model import LogisticRegression
     except ImportError:
@@ -240,26 +266,98 @@ def _fit_research_challengers(
         y = train["positive_edge_5"].astype(int)
         if LogisticRegression is not None:
             try:
-                LogisticRegression(
+                model = LogisticRegression(
                     random_state=random_seed,
                     max_iter=2000,
-                    n_jobs=max(1, n_jobs),
                 ).fit(x, y)
                 statuses["logistic-baseline"] = "FITTED"
+                fitted_models["logistic-baseline"] = model
             except (ValueError, TypeError):
                 pass
         if LGBMClassifier is not None:
             try:
-                LGBMClassifier(
+                model = LGBMClassifier(
                     random_state=random_seed,
                     n_jobs=max(1, n_jobs),
                     n_estimators=100,
                     verbosity=-1,
                 ).fit(x, y)
                 statuses["lightgbm-challenger"] = "FITTED"
+                fitted_models["lightgbm-challenger"] = model
             except (ValueError, TypeError):
                 pass
-    return statuses
+    return statuses, fitted_models
+
+
+def _write_logistic_model(
+    root: Path,
+    model: Any,
+    *,
+    feature_schema: tuple[str, ...],
+    random_seed: int,
+) -> str:
+    body = {
+        "format_version": 1,
+        "model_type": "portable-logistic",
+        "candidate_id": "forecasting-v1",
+        "status": "RESEARCH_ONLY",
+        "feature_schema": list(feature_schema),
+        "coefficients": [float(value) for value in model.coef_[0]],
+        "intercept": float(model.intercept_[0]),
+        "random_seed": random_seed,
+    }
+    destination = root / "models" / "challengers" / "forecasting-v1" / "logistic-model.json"
+    _write_hashed_json(destination, body)
+    return str(destination)
+
+
+def load_challenger_model(path: str | Path) -> PortableLogisticModel:
+    destination = Path(path)
+    try:
+        raw = destination.read_bytes()
+        if not raw or len(raw) > 16_777_216:
+            raise ValueError("model artifact integrity check failed")
+        payload = json.loads(raw.decode("utf-8"))
+        digest = payload.pop("sha256", None)
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if not isinstance(digest, str) or digest != hashlib.sha256(encoded).hexdigest():
+            raise ValueError("model artifact integrity check failed")
+        if payload.get("format_version") != 1 or payload.get("model_type") != "portable-logistic":
+            raise ValueError("model artifact integrity check failed")
+        schema = tuple(str(item) for item in payload["feature_schema"])
+        coefficients = tuple(float(item) for item in payload["coefficients"])
+        intercept = float(payload["intercept"])
+        if not schema or len(schema) != len(coefficients):
+            raise ValueError("model artifact integrity check failed")
+        return PortableLogisticModel(schema, coefficients, intercept)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError("model artifact integrity check failed") from exc
+
+
+def _write_hashed_json(destination: Path, body: dict[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    payload = json.dumps(
+        {**body, "sha256": hashlib.sha256(encoded).hexdigest()},
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode()
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _write_metadata(
@@ -314,5 +412,6 @@ __all__ = [
     "ChallengerTrainingResult",
     "WalkForwardFold",
     "build_forecast_labels",
+    "load_challenger_model",
     "train_challengers",
 ]

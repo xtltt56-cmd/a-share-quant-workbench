@@ -258,3 +258,67 @@ def test_run_server_starts_and_stops_eod_coordinator(monkeypatch, tmp_path) -> N
     )
 
     assert calls == ["created", "started", "stopped"]
+
+
+def test_eod_refresh_publishes_candidates_and_replaces_guidance_together(
+    monkeypatch, tmp_path
+) -> None:
+    from types import SimpleNamespace
+
+    from a_share_quant.workbench import app
+
+    calls: list[object] = []
+
+    class OfficialStore:
+        path = tmp_path / "signals.json"
+
+        def set_refresh_status(self, status, notice):
+            calls.append((status, notice))
+
+    class RefreshedOfficial:
+        refresh_status = "FRESH"
+        refresh_notice_zh = "日线候选已更新。"
+
+        def latest(self):
+            return (SimpleNamespace(symbol="000001"),)
+
+    class Guidance:
+        def plans(self):
+            return ("new-guidance",)
+
+    class GuidanceStore:
+        path = tmp_path / "guidance.json"
+
+        def replace_plans(self, plans):
+            calls.append(("guidance", plans))
+
+    class Service:
+        def publish_official_daily(self, signals, *, status, notice_zh):
+            calls.append(("signals", signals, status, notice_zh))
+
+    monkeypatch.setattr(
+        app,
+        "refresh_daily_data_if_due",
+        lambda *args, **kwargs: SimpleNamespace(symbols_failed=0),
+    )
+    monkeypatch.setattr(
+        app,
+        "load_or_generate_official_store",
+        lambda *args, **kwargs: RefreshedOfficial(),
+    )
+    monkeypatch.setattr(
+        app,
+        "load_or_generate_price_guidance_store",
+        lambda *args, **kwargs: Guidance(),
+    )
+
+    app.refresh_eod_state(
+        day=app.date(2026, 8, 13),
+        repo_root=tmp_path,
+        official_store=OfficialStore(),
+        guidance_store=GuidanceStore(),
+        service=Service(),
+    )
+
+    assert ("guidance", ("new-guidance",)) in calls
+    assert any(item[0] == "signals" for item in calls)
