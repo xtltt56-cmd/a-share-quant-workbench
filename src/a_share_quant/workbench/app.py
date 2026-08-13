@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from datetime import date
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
+from a_share_quant.runtime.eod_coordinator import EODCoordinator
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
@@ -464,21 +466,6 @@ def run_server(
         if repo_root is not None
         else None
     )
-    if repo_root is not None and allow_network:
-        try:
-            refresh_daily_data_if_due(repo_root.resolve() / "data")
-        except Exception:
-            # The existing artifact remains authoritative; the service will
-            # expose its previous cutoff and failed-refresh notice.
-            pass
-        refreshed_store = load_or_generate_official_store(
-            official_store.path if official_store is not None and official_store.path else (
-                repo_root / ".runtime" / "signals" / "official-daily.json"
-            ),
-            repo_root=repo_root,
-        )
-        if official_store is not None:
-            official_store = refreshed_store
     priority_symbols: list[str] = []
     if official_store is not None:
         priority_symbols.extend(signal.symbol for signal in official_store.latest())
@@ -506,6 +493,33 @@ def run_server(
         price_guidance_store=price_guidance_store,
         priority_symbols=tuple(dict.fromkeys(priority_symbols)),
     )
+    if advisory_service is not None:
+        set_quote_provider = getattr(advisory_service, "set_quote_provider", None)
+        if set_quote_provider is not None:
+            set_quote_provider(service.validated_quote)
+    eod_coordinator = None
+    if repo_root is not None and allow_network and official_store is not None:
+        def refresh_eod(day: date) -> None:
+            summary = refresh_daily_data_if_due(repo_root.resolve() / "data", end_date=day)
+            if summary.symbols_failed:
+                official_store.set_refresh_status(
+                    "UPDATE_FAILED",
+                    f"日线刷新有 {summary.symbols_failed} 只股票失败，保留上次候选。",
+                )
+                return
+            refreshed = load_or_generate_official_store(
+                official_store.path
+                or repo_root.resolve() / ".runtime" / "signals" / "official-daily.json",
+                repo_root=repo_root,
+            )
+            service.publish_official_daily(
+                refreshed.latest(),
+                status=refreshed.refresh_status,
+                notice_zh=refreshed.refresh_notice_zh,
+            )
+
+        eod_coordinator = EODCoordinator(refresh=refresh_eod)
+        eod_coordinator.start()
     service.start_background()
     server = create_server(
         service=service,
@@ -523,6 +537,8 @@ def run_server(
         server.shutdown()
         server.server_close()
         service.stop_background()
+        if eod_coordinator is not None:
+            eod_coordinator.stop()
         if supervisor is not None:
             supervisor.shutdown(timeout_seconds=5.0)
 

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.signals.realtime import OfficialModelSignal
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 
@@ -92,3 +93,21 @@ def test_official_signal_store_rejects_unknown_fields(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="official signal artifact"):
         OfficialSignalStore(path=path)
+
+
+def test_older_generated_signals_cannot_report_fresh_over_newer_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "official-daily.json"
+    newer = _signal()
+    newer = OfficialModelSignal(
+        **{
+            **newer.__dict__,
+            "signal_date": date(2026, 8, 12),
+            "data_cutoff": date(2026, 8, 12),
+        }
+    )
+    OfficialSignalStore(path).put_signals((newer,))
+
+    store = load_or_generate_official_store(path, generator=lambda: (_signal(),))
+
+    assert store.latest() == (newer,)
+    assert store.refresh_status == "UPDATE_REJECTED"

@@ -66,6 +66,12 @@ def load_or_generate_official_store(
         signal.signal_date for signal in existing
     ):
         store.put_signals(generated)
+    else:
+        store.set_refresh_status(
+            "UPDATE_REJECTED",
+            "新生成候选早于当前版本，已保留较新的经过核验候选。",
+        )
+        return store
     cutoff = max(signal.data_cutoff for signal in generated)
     store.set_refresh_status(
         "FRESH",

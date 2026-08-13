@@ -172,3 +172,89 @@ def test_safe_exit_requires_guarded_loopback_post() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_run_server_does_not_repeat_cli_owned_daily_refresh(monkeypatch, tmp_path) -> None:
+    from a_share_quant.storage.official_signal_store import OfficialSignalStore
+    from a_share_quant.workbench import app
+
+    calls = 0
+
+    def refresh(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+    class StopServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    monkeypatch.setattr(app, "refresh_daily_data_if_due", refresh)
+    monkeypatch.setattr(app, "create_server", lambda **kwargs: StopServer())
+
+    app.run_server(
+        repo_root=tmp_path,
+        allow_network=True,
+        official_signal_store=OfficialSignalStore(),
+    )
+
+    assert calls == 0
+
+
+def test_run_server_wires_validated_quotes_into_advisory(monkeypatch) -> None:
+    from a_share_quant.workbench import app
+
+    captured = {}
+
+    class Advisory:
+        def holdings(self):
+            return {"positions": [], "imported_account_snapshot": None}
+
+        def set_quote_provider(self, provider):
+            captured["provider"] = provider
+
+    class StopServer:
+        server_address = ("127.0.0.1", 8765)
+        def serve_forever(self): raise KeyboardInterrupt
+        def shutdown(self): return None
+        def server_close(self): return None
+
+    monkeypatch.setattr(app, "create_server", lambda **kwargs: StopServer())
+    app.run_server(allow_network=False, advisory_service=Advisory())
+
+    assert callable(captured["provider"])
+
+
+def test_run_server_starts_and_stops_eod_coordinator(monkeypatch, tmp_path) -> None:
+    from a_share_quant.storage.official_signal_store import OfficialSignalStore
+    from a_share_quant.workbench import app
+
+    calls: list[str] = []
+
+    class Coordinator:
+        def __init__(self, **kwargs): calls.append("created")
+        def start(self): calls.append("started")
+        def stop(self): calls.append("stopped")
+
+    class StopServer:
+        server_address = ("127.0.0.1", 8765)
+        def serve_forever(self): raise KeyboardInterrupt
+        def shutdown(self): return None
+        def server_close(self): return None
+
+    monkeypatch.setattr(app, "EODCoordinator", Coordinator)
+    monkeypatch.setattr(app, "create_server", lambda **kwargs: StopServer())
+    app.run_server(
+        repo_root=tmp_path,
+        allow_network=True,
+        official_signal_store=OfficialSignalStore(tmp_path / "signals.json"),
+    )
+
+    assert calls == ["created", "started", "stopped"]

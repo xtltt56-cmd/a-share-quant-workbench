@@ -755,3 +755,25 @@ def test_health_distinguishes_process_ready_from_realtime_data_ready() -> None:
     assert health["status"] == "DATA_DEGRADED"
     assert health["process_ready"] is True
     assert health["data_ready"] is False
+
+
+def test_validated_quote_exposes_only_fresh_good_rows() -> None:
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+    good = _live_provider(now).snapshot.quotes[0]
+    stale = replace(good, symbol="000002", is_stale=True)
+    degraded = replace(
+        good,
+        symbol="000003",
+        quality_flag=DataQualityStatus.DEGRADED,
+    )
+    service = WorkbenchService(allow_network=False, clock=lambda: now)
+    service.store.put_quotes((good, stale, degraded))
+
+    assert service.validated_quote("000001") == {
+        "symbol": "000001",
+        "current_price": good.last,
+        "quote_timestamp": good.timestamp_exchange,
+        "data_quality": "GOOD",
+    }
+    assert service.validated_quote("000002") is None
+    assert service.validated_quote("000003") is None

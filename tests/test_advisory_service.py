@@ -566,3 +566,53 @@ def test_workbench_cli_wires_context_and_instrument_artifacts(tmp_path, monkeypa
     assert captured["known_instruments"] == {"000001": "平安银行"}
     assert callable(captured["context_provider"])
     assert captured["run_server"]["advisory_service"] is not None
+
+
+def test_imported_only_holding_uses_validated_quote_for_guidance(tmp_path) -> None:
+    from a_share_quant.account.import_inbox import AccountImportInbox, ImportedPosition
+    from a_share_quant.account.snapshot_store import (
+        AccountSnapshotStore,
+        ImportedAccountSnapshot,
+    )
+    from a_share_quant.advisory.price_contracts import (
+        GuidanceLevel,
+        GuidanceState,
+        PriceGuidancePlan,
+        PricePlanType,
+    )
+    from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
+
+    snapshot_store = AccountSnapshotStore(tmp_path / "account-snapshot.json")
+    snapshot_store.save(ImportedAccountSnapshot(
+        snapshot_id="snapshot-1", source_sha256="a" * 64,
+        source_name="positions.csv", as_of=date(2026, 8, 10),
+        imported_at=datetime(2026, 8, 10, 8, tzinfo=timezone.utc), cash=Decimal("1000"),
+        positions=(ImportedPosition("000001", "平安银行", 100, 100, 0, Decimal("10")),),
+    ))
+    guidance_store = PriceGuidanceStore(tmp_path / "guidance.json")
+    guidance_store.replace_plans((PriceGuidancePlan(
+        plan_id="holding-000001", symbol="000001", plan_type=PricePlanType.HOLDING,
+        guidance_level=GuidanceLevel.RESEARCH_REFERENCE,
+        state=GuidanceState.RESEARCH_REFERENCE, calculation_date=date(2026, 8, 9),
+        valid_for=date(2026, 8, 10), entry_lower="9.50", entry_upper="10.50",
+        maximum_acceptable_price="10.50", invalidation_price="9.00",
+        protection_price="9.20", reduce_lower="12.00", reduce_upper="13.00",
+        suggested_quantity=0, evidence_cutoff=datetime(2026, 8, 9, 8, tzinfo=timezone.utc),
+        model_version="rule-v1", feature_version="price-v1", config_version="config-v1",
+        data_version="data-v1", reason_codes=("RESEARCH_ONLY",),
+    ),))
+    service = AdvisoryWorkbenchService(
+        initial_cash=0, ledger_path=tmp_path / "ledger.jsonl",
+        official_signal_store=OfficialSignalStore(), price_guidance_store=guidance_store,
+        account_import_inbox=AccountImportInbox(tmp_path / "inbox"),
+        account_snapshot_store=snapshot_store,
+        quote_provider=lambda symbol: {"symbol": symbol, "current_price": "9.10"},
+        today=lambda: date(2026, 8, 10),
+    )
+
+    holdings = service.holdings()
+
+    assert holdings["positions"] == []
+    assert holdings["price_guidance"][0]["symbol"] == "000001"
+    assert holdings["price_guidance"][0]["state"] == "RISK_ALERT"
+    assert holdings["price_guidance"][0]["suggested_sell_quantity"] == 100

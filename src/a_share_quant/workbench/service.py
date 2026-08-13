@@ -305,6 +305,25 @@ class WorkbenchService:
         with self._state_lock:
             return self.state.to_dict()
 
+    def validated_quote(self, symbol: str) -> dict[str, Any] | None:
+        quotes = self.store.quotes((symbol,))
+        if len(quotes) != 1:
+            return None
+        quote = quotes[0]
+        now = self.clock()
+        if (
+            quote.is_stale
+            or quote.quality_flag is not DataQualityStatus.GOOD
+            or quote.data_age_seconds(now=now) > self.live_quality_gate.stale_after_seconds
+        ):
+            return None
+        return {
+            "symbol": quote.symbol,
+            "current_price": quote.last,
+            "quote_timestamp": quote.timestamp_exchange,
+            "data_quality": quote.quality_flag.value,
+        }
+
     def publish_official_daily(
         self,
         signals: Sequence[OfficialModelSignal],

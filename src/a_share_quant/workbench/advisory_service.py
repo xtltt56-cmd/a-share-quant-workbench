@@ -68,6 +68,7 @@ class AdvisoryWorkbenchService:
         today: Callable[[], date] | None = None,
         account_import_inbox: AccountImportInbox | None = None,
         account_snapshot_store: AccountSnapshotStore | None = None,
+        quote_provider: Callable[[str], Mapping[str, object] | None] | None = None,
     ) -> None:
         if (account_import_inbox is None) != (account_snapshot_store is None):
             raise ValueError("account import inbox and snapshot store must be provided together")
@@ -113,10 +114,17 @@ class AdvisoryWorkbenchService:
         self._today = today or date.today
         self._account_import_inbox = account_import_inbox
         self._account_snapshot_store = account_snapshot_store
+        self._quote_provider = quote_provider
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
         self._account_import_confirmations: dict[str, _AccountImportConfirmation] = {}
         self._manual_buy_lock = RLock()
         self._holding_guidance_engine = HoldingPriceGuidanceEngine()
+
+    def set_quote_provider(
+        self,
+        provider: Callable[[str], Mapping[str, object] | None],
+    ) -> None:
+        self._quote_provider = provider
 
     def list_account_imports(self) -> dict[str, object]:
         """List safe file identifiers without exposing filesystem paths."""
@@ -368,10 +376,22 @@ class AdvisoryWorkbenchService:
             if self._price_guidance_store is not None
             else {}
         )
+        positions_by_symbol = {str(item["code"]): dict(item) for item in local_positions}
+        for symbol, imported_position in imported_positions.items():
+            positions_by_symbol.setdefault(
+                symbol,
+                {
+                    "name": imported_position.name,
+                    "code": symbol,
+                    "total_quantity": imported_position.total_quantity,
+                    "available_quantity": imported_position.available_quantity,
+                    "frozen_quantity": imported_position.frozen_quantity,
+                    "average_cost": f"{imported_position.average_cost:.4f}",
+                },
+            )
         result: list[dict[str, object]] = []
-        for item in local_positions:
+        for item in positions_by_symbol.values():
             plan = plans.get(str(item["code"]))
-            source = imported_positions.get(str(item["code"]))
             if plan is None:
                 result.append(
                     {
@@ -382,11 +402,12 @@ class AdvisoryWorkbenchService:
                 )
                 continue
             try:
-                if (
-                    source is None
-                    or not isinstance(source, Mapping)
-                    or "current_price" not in source
-                ):
+                quote = (
+                    self._quote_provider(str(item["code"]))
+                    if self._quote_provider is not None
+                    else None
+                )
+                if quote is None or "current_price" not in quote:
                     result.append(
                         {
                             **plan.to_dict(),
@@ -398,9 +419,9 @@ class AdvisoryWorkbenchService:
                     )
                     continue
                 guidance = self._holding_guidance_engine.evaluate(
-                    source,
+                    item,
                     plan,
-                    current_price=source["current_price"],
+                    current_price=quote["current_price"],
                 )
                 result.append(guidance.to_dict())
             except (TypeError, ValueError):
