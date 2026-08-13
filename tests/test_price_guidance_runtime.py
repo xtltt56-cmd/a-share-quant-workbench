@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 import pandas as pd
 
 from a_share_quant.advisory.price_contracts import PricePlanType
+from a_share_quant.market.trading_calendar import AShareTradingCalendar
 from a_share_quant.runtime.price_guidance import (
     PriceGuidanceRuntime,
     load_bars,
@@ -167,3 +168,12 @@ def test_startup_loader_refreshes_daily_plans_from_official_signals(tmp_path) ->
 
     assert len(store.plans()) == 1
     assert store.plans()[0].symbol == "000001"
+
+
+def test_next_trading_day_skips_weekend_and_exchange_holiday() -> None:
+    calendar = AShareTradingCalendar(
+        closed_dates={date(2026, 5, 1), date(2026, 5, 4), date(2026, 5, 5)}
+    )
+
+    assert calendar.next_session(date(2026, 4, 30)) == date(2026, 5, 6)
+    assert calendar.next_session(date(2026, 8, 14)) == date(2026, 8, 17)

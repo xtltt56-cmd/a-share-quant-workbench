@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from a_share_quant.advisory.price_engine import (
     PriceGuidanceValidationError,
 )
 from a_share_quant.features.price_guidance import build_price_features
+from a_share_quant.market.trading_calendar import AShareTradingCalendar
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 
@@ -216,7 +217,7 @@ def load_or_generate_price_guidance_store(
         return store
     symbols = tuple(signal.symbol for signal in signals)
     calculation = max(signal.data_cutoff or signal.signal_date for signal in signals)
-    valid_for = calculation + timedelta(days=1)
+    valid_for = AShareTradingCalendar().next_session(calculation)
     existing_holding_plans = tuple(
         item for item in store.plans() if item.plan_type is PricePlanType.HOLDING
     )

@@ -17,6 +17,7 @@ import pandas as pd
 from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.experiments.pipeline import build_rule_features
 from a_share_quant.features.rule_factors import RuleFactorEngine
+from a_share_quant.features.universe import HistoricalUniverse
 from a_share_quant.signals.realtime import OfficialModelSignal
 
 DEFAULT_STRATEGY_VERSION = "initial-free-data-v1"
@@ -54,6 +55,7 @@ def generate_official_signals(
     min_average_amount: float = DEFAULT_MIN_AVERAGE_AMOUNT,
     engine: RuleFactorEngine | None = None,
     name_map: Mapping[str, str] | None = None,
+    instruments: pd.DataFrame | None = None,
     now: datetime | None = None,
     require_fresh: bool = False,
     max_business_day_lag: int = 1,
@@ -73,6 +75,16 @@ def generate_official_signals(
         raise ValueError(f"benchmark is missing from daily bars: {benchmark_symbol}")
 
     requested_as_of = _parse_date(as_of) if as_of is not None else None
+    eligibility_date = requested_as_of or max(frame["date"])
+    if instruments is not None:
+        tradable = HistoricalUniverse(
+            instruments,
+            exclude_new_days=60,
+            min_average_amount=None,
+            min_average_turnover_pct=None,
+        ).tradable_universe(eligibility_date)
+        allowed = set(tradable["symbol"].astype(str)) | {benchmark_symbol}
+        frame = frame.loc[frame["symbol"].isin(allowed)].copy()
     latest_by_symbol = frame.groupby("symbol", sort=True)["date"].max()
     common_as_of = min(latest_by_symbol.tolist())
     if requested_as_of is not None:
@@ -166,7 +178,14 @@ def generate_from_data_root(
         raise FileNotFoundError(f"no daily bars under {root / 'lake' / 'daily_bars'}")
     frames = [pd.read_parquet(path) for path in paths]
     frame = pd.concat(frames, ignore_index=True)
-    return generate_official_signals(frame, benchmark=benchmark, **kwargs)
+    instrument_paths = sorted((root / "lake" / "instruments").glob("*.parquet"))
+    instruments = pd.read_parquet(instrument_paths[-1]) if instrument_paths else None
+    return generate_official_signals(
+        frame,
+        benchmark=benchmark,
+        instruments=instruments,
+        **kwargs,
+    )
 
 
 def validate_daily_data_freshness(

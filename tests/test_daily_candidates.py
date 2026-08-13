@@ -79,3 +79,34 @@ def test_daily_data_freshness_accepts_previous_complete_day_before_close() -> No
         date(2026, 8, 12),
         now=pd.Timestamp("2026-08-13 10:00", tz="Asia/Shanghai").to_pydatetime(),
     )
+
+
+def test_daily_candidates_filter_point_in_time_universe_before_common_date() -> None:
+    bars = _bars(symbols=32)
+    lagging_symbol = "000032"
+    bars = bars.loc[
+        ~((bars["symbol"] == lagging_symbol) & (bars["date"] > date(2026, 1, 9)))
+    ]
+    instruments = pd.DataFrame(
+        {
+            "symbol": [f"{index:06d}" for index in range(1, 33)],
+            "name": [f"股票{index}" for index in range(1, 33)],
+            "listed_date": [date(2000, 1, 1)] * 32,
+            "as_of": [date(2026, 1, 14)] * 32,
+            "is_st": [True, False] + [False] * 30,
+            "is_delisting_risk": [False] * 32,
+            "is_suspended": [False, True] + [False] * 29 + [True],
+        }
+    )
+
+    signals = generate_official_signals(
+        bars,
+        instruments=instruments,
+        top_k=10,
+        min_cross_section=29,
+    )
+
+    assert all(signal.signal_date == date(2026, 1, 14) for signal in signals)
+    assert {"000001", "000002", lagging_symbol}.isdisjoint(
+        signal.symbol for signal in signals
+    )
