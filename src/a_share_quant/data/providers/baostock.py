@@ -27,10 +27,15 @@ class BaoStockDataProvider:
     name = "baostock"
     _daily_fields = "date,code,open,high,low,close,volume,amount,pctChg"
 
-    def __init__(self, *, adjustflag: str = "2") -> None:
+    def __init__(self, *, adjustflag: str = "3") -> None:
         if adjustflag not in {"1", "2", "3"}:
             raise ValueError("adjustflag must be 1, 2, or 3")
         self.adjustflag = adjustflag
+        self.daily_data_version = {
+            "1": "baostock-back-adjusted-v1",
+            "2": "baostock-forward-adjusted-v1",
+            "3": "baostock-unadjusted-v1",
+        }[adjustflag]
         self._module: Any | None = None
         self._logged_in = False
 
@@ -144,7 +149,12 @@ class BaoStockDataProvider:
             raise ProviderRequestError(
                 "BaoStock request failed: query_history_k_data_plus"
             ) from exc
-        return normalize_daily_bars(raw, symbol=normalized, source=self.name)
+        return normalize_daily_bars(
+            raw,
+            symbol=normalized,
+            source=self.name,
+            data_version=self.daily_data_version,
+        )
 
 
 def _result_frame(result: Any) -> pd.DataFrame:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from a_share_quant.data.pipeline import IncrementalUpdater, UpdateSummary
@@ -30,6 +31,7 @@ def refresh_daily_data_if_due(
     end_date: date | None = None,
     provider: Any | None = None,
     lookback_days: int = 370,
+    minimum_history_rows: int = 252,
 ) -> DailyRefreshSummary:
     """Incrementally update BaoStock bars only when the lake is behind.
 
@@ -40,14 +42,31 @@ def refresh_daily_data_if_due(
 
     if lookback_days < 60:
         raise ValueError("lookback_days must be at least 60")
+    if minimum_history_rows < 1:
+        raise ValueError("minimum_history_rows must be positive")
     root = Path(data_root).resolve()
     target = end_date or _latest_complete_weekday()
     daily_dir = root / "lake" / "daily_bars"
     paths = tuple(daily_dir.glob("*.parquet"))
-    latest_dates = tuple(_latest_date(path) for path in paths)
-    latest_dates = tuple(value for value in latest_dates if value is not None)
-    if paths and latest_dates and min(latest_dates) >= target:
+    profiles = tuple(_daily_file_profile(path) for path in paths)
+    valid_profiles = tuple(profile for profile in profiles if profile is not None)
+    required_version = getattr(provider, "daily_data_version", None)
+    complete = (
+        bool(paths)
+        and len(valid_profiles) == len(paths)
+        and all(
+            latest >= target
+            and rows >= minimum_history_rows
+            and (required_version is None or version == required_version)
+            for latest, rows, version in valid_profiles
+        )
+    )
+    if complete:
         return DailyRefreshSummary(skipped=True)
+
+    for path, profile in zip(paths, profiles, strict=True):
+        if profile is None:
+            path.replace(path.with_name(f"{path.name}.corrupt-{uuid4().hex}"))
 
     owned_provider = provider is None
     active_provider = provider or BaoStockDataProvider()
@@ -73,6 +92,8 @@ def refresh_daily_data_if_due(
                 summary = IncrementalUpdater(
                     provider=active_provider,
                     store=store,
+                    required_data_version=getattr(active_provider, "daily_data_version", None),
+                    minimum_history_rows=minimum_history_rows,
                 ).run(start_date=target - timedelta(days=lookback_days), end_date=target)
             finally:
                 active_provider.list_instruments = original_list
@@ -89,6 +110,8 @@ def refresh_daily_data_if_due(
         summary: UpdateSummary = IncrementalUpdater(
             provider=active_provider,
             store=store,
+            required_data_version=getattr(active_provider, "daily_data_version", None),
+            minimum_history_rows=minimum_history_rows,
         ).run(start_date=start, end_date=target)
         return DailyRefreshSummary(
             skipped=False,
@@ -106,16 +129,25 @@ def refresh_daily_data_if_due(
                 close()
 
 
-def _latest_date(path: Path) -> date | None:
+def _daily_file_profile(path: Path) -> tuple[date, int, str] | None:
     try:
         import pandas as pd
 
-        frame = pd.read_parquet(path, columns=["date"])
+        frame = pd.read_parquet(path, columns=["date", "data_version"])
         if frame.empty:
             return None
-        return pd.to_datetime(frame["date"], errors="coerce").dt.date.max()
+        latest = pd.to_datetime(frame["date"], errors="coerce").dt.date.max()
+        versions = frame["data_version"].dropna().astype(str).unique().tolist()
+        if latest is None or len(versions) != 1:
+            return None
+        return latest, len(frame), versions[0]
     except (OSError, ValueError, KeyError, ImportError):
         return None
+
+
+def _latest_date(path: Path) -> date | None:
+    profile = _daily_file_profile(path)
+    return profile[0] if profile is not None else None
 
 
 def _latest_complete_weekday(now: datetime | None = None) -> date:

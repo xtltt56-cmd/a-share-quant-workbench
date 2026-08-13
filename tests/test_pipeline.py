@@ -107,3 +107,26 @@ def test_incremental_updater_keeps_other_symbols_when_one_fails(tmp_path) -> Non
     assert summary.symbols_updated == 1
     assert store.latest_date("000002") == date(2026, 8, 8)
     assert store.latest_date("000001") is None
+
+
+def test_updater_replaces_incompatible_adjustment_history(tmp_path) -> None:
+    store = MarketDataStore(root=tmp_path)
+    legacy = _bars("000001", [("2026-08-07", 10.0), ("2026-08-08", 11.0)])
+    legacy["data_version"] = "baostock-forward-adjusted-v1"
+    store.write_daily_bars(legacy)
+    provider = FakeProvider()
+    provider.daily_data_version = "baostock-unadjusted-v1"
+    provider.get_daily_bars = lambda symbol, start_date, end_date: (
+        _bars(symbol, [("2026-08-07", 5.0), ("2026-08-08", 5.5)])
+        .assign(data_version="baostock-unadjusted-v1")
+    )
+
+    IncrementalUpdater(
+        provider=provider,
+        store=store,
+        required_data_version="baostock-unadjusted-v1",
+    ).run(start_date=date(2026, 8, 1), end_date=date(2026, 8, 8))
+
+    stored = store.read_daily_bars(symbol="000001")
+    assert stored["close"].tolist() == [5.0, 5.5]
+    assert stored["data_version"].unique().tolist() == ["baostock-unadjusted-v1"]

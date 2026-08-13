@@ -84,7 +84,51 @@ def test_daily_refresh_if_due_skips_when_all_files_are_current(tmp_path) -> None
         tmp_path,
         end_date=date(2026, 8, 12),
         provider=provider,
+        minimum_history_rows=1,
     )
 
     assert summary.skipped is True
     assert provider.list_calls == 0
+
+
+def test_daily_refresh_backfills_current_but_short_history(tmp_path) -> None:
+    provider = FakeProvider()
+    from a_share_quant.storage.market_store import MarketDataStore
+
+    MarketDataStore(tmp_path).write_daily_bars(
+        pd.DataFrame([
+            {"symbol": "000001", "date": date(2026, 8, 12), "open": 10,
+             "high": 11, "low": 9, "close": 10.5, "volume": 100,
+             "amount": 1000, "source": "baostock",
+             "data_version": "baostock-unadjusted-v1"}
+        ])
+    )
+
+    summary = refresh_daily_data_if_due(
+        tmp_path,
+        end_date=date(2026, 8, 12),
+        provider=provider,
+        minimum_history_rows=2,
+    )
+
+    assert summary.skipped is False
+    assert provider.list_calls == 1
+
+
+def test_daily_refresh_repairs_corrupt_current_file(tmp_path) -> None:
+    provider = FakeProvider()
+    daily_dir = tmp_path / "lake" / "daily_bars"
+    daily_dir.mkdir(parents=True)
+    (daily_dir / "000001.parquet").write_bytes(b"not parquet")
+
+    summary = refresh_daily_data_if_due(
+        tmp_path,
+        end_date=date(2026, 8, 12),
+        provider=provider,
+        minimum_history_rows=1,
+    )
+
+    assert summary.skipped is False
+    assert provider.list_calls == 1
+    assert pd.read_parquet(daily_dir / "000001.parquet").iloc[-1]["close"] == 10.5
+    assert tuple(daily_dir.glob("000001.parquet.corrupt-*"))

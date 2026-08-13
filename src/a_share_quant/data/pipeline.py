@@ -20,9 +20,20 @@ class UpdateSummary:
 
 
 class IncrementalUpdater:
-    def __init__(self, *, provider: MarketDataProvider, store: MarketDataStore) -> None:
+    def __init__(
+        self,
+        *,
+        provider: MarketDataProvider,
+        store: MarketDataStore,
+        required_data_version: str | None = None,
+        minimum_history_rows: int = 0,
+    ) -> None:
         self.provider = provider
         self.store = store
+        self.required_data_version = required_data_version or getattr(
+            provider, "daily_data_version", None
+        )
+        self.minimum_history_rows = max(0, int(minimum_history_rows))
 
     def run(
         self,
@@ -41,14 +52,27 @@ class IncrementalUpdater:
         summary = UpdateSummary(symbols_seen=len(instruments))
         for row in instruments.itertuples(index=False):
             symbol = str(row.symbol)
-            latest = self.store.latest_date(symbol)
-            requested_start = latest + timedelta(days=1) if latest is not None else start_date
+            latest, row_count, stored_version = self.store.daily_profile(symbol)
+            replace_history = bool(
+                self.required_data_version
+                and stored_version is not None
+                and stored_version != self.required_data_version
+            )
+            needs_backfill = row_count < self.minimum_history_rows
+            requested_start = (
+                start_date
+                if replace_history or needs_backfill or latest is None
+                else latest + timedelta(days=1)
+            )
             if requested_start > end_date:
                 summary.symbols_skipped += 1
                 continue
             try:
                 bars = self.provider.get_daily_bars(symbol, requested_start, end_date)
-                self.store.write_daily_bars(bars)
+                if replace_history:
+                    self.store.replace_daily_bars(bars)
+                else:
+                    self.store.write_daily_bars(bars)
                 summary.symbols_updated += 1
                 summary.rows_written += len(bars)
             except Exception as exc:  # one bad endpoint must not corrupt other symbols

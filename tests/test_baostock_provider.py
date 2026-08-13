@@ -85,7 +85,8 @@ def test_baostock_provider_logs_in_once_and_normalizes_universe_and_daily(
     assert daily.loc[0, "close"] == pytest.approx(10.5)
     assert fake.daily_calls[0]["code"] == "sh.600000"
     assert fake.daily_calls[0]["frequency"] == "d"
-    assert fake.daily_calls[0]["adjustflag"] == "2"
+    assert fake.daily_calls[0]["adjustflag"] == "3"
+    assert daily.loc[0, "data_version"] == "baostock-unadjusted-v1"
 
 
 def test_baostock_provider_excludes_indexes_and_inactive_securities(

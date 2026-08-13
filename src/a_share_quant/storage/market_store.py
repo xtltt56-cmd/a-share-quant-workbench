@@ -57,6 +57,14 @@ class MarketDataStore:
             )
 
     def write_daily_bars(self, frame: pd.DataFrame) -> None:
+        self._write_daily_bars(frame, replace_existing=False)
+
+    def replace_daily_bars(self, frame: pd.DataFrame) -> None:
+        """Atomically replace complete symbol histories after a data-version change."""
+
+        self._write_daily_bars(frame, replace_existing=True)
+
+    def _write_daily_bars(self, frame: pd.DataFrame, *, replace_existing: bool) -> None:
         self.initialize()
         if frame.empty:
             return
@@ -73,7 +81,11 @@ class MarketDataStore:
                 else "canonical-v1"
             )
             path = self.daily_dir / f"{normalized_symbol}.parquet"
-            existing = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+            existing = (
+                pd.DataFrame()
+                if replace_existing
+                else pd.read_parquet(path) if path.exists() else pd.DataFrame()
+            )
             merged = (
                 pd.concat([existing, group], ignore_index=True)
                 if not existing.empty
@@ -193,6 +205,19 @@ class MarketDataStore:
         if value is None:
             return None
         return value.date() if hasattr(value, "date") else value
+
+    def daily_profile(self, symbol: str) -> tuple[date | None, int, str | None]:
+        normalized_symbol = normalize_symbol(symbol)
+        path = self.daily_dir / f"{normalized_symbol}.parquet"
+        if not path.exists():
+            return None, 0, None
+        frame = pd.read_parquet(path, columns=["date", "data_version"])
+        if frame.empty:
+            return None, 0, None
+        versions = frame["data_version"].dropna().astype(str).unique().tolist()
+        version = versions[0] if len(versions) == 1 else "MIXED"
+        latest = pd.to_datetime(frame["date"], errors="raise").max().date()
+        return latest, len(frame), version
 
     def manifest_rows(self, *, dataset: str, symbol: str | None = None) -> list[dict[str, object]]:
         self.initialize()
