@@ -41,3 +41,14 @@ def test_failed_eod_refresh_is_retryable_without_killing_coordinator() -> None:
     assert coordinator.last_error == "temporary provider failure"
     assert coordinator.run_due() is True
     assert calls == 2
+
+
+def test_initial_refresh_uses_previous_session_before_close() -> None:
+    calls: list[date] = []
+    coordinator = EODCoordinator(
+        refresh=calls.append,
+        clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=TZ),
+    )
+
+    assert coordinator.run_initial() is True
+    assert calls == [date(2026, 8, 12)]

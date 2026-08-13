@@ -48,12 +48,37 @@ class EODCoordinator:
         self._completed.add(day)
         return True
 
+    def run_initial(self) -> bool:
+        """Refresh the latest completed session without delaying HTTP startup."""
+
+        if self._stop.is_set():
+            return False
+        current = self.clock().astimezone(ZoneInfo("Asia/Shanghai"))
+        day = current.date()
+        target = (
+            day
+            if self.calendar.is_session(day)
+            and current.timetz().replace(tzinfo=None) >= self.close_time
+            else self.calendar.previous_session(day)
+        )
+        if target in self._completed:
+            return False
+        try:
+            self.refresh(target)
+        except Exception as exc:
+            self.last_error = str(exc)[:500]
+            return False
+        self.last_error = None
+        self._completed.add(target)
+        return True
+
     def start(self, *, interval_seconds: float = 60.0) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
 
         def worker() -> None:
+            self.run_initial()
             while not self._stop.wait(interval_seconds):
                 self.run_due()
 

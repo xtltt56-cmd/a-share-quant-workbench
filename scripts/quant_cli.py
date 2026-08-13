@@ -16,7 +16,6 @@ from a_share_quant.data.realtime.diagnostics import (
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
 from a_share_quant.research.evolution import EvolutionRegistry
-from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import (
     PriceGuidanceRuntime,
@@ -190,13 +189,6 @@ def main(argv: list[str] | None = None) -> int:
             due_at=datetime.now(timezone.utc),
         )
         research_supervisor.start_due_jobs(now=datetime.now(timezone.utc))
-        if args.network and not args.offline:
-            try:
-                refresh_daily_data_if_due(repo_root / "data")
-            except Exception:
-                # The durable signal artifact remains authoritative; the
-                # bootstrap status reports the failed refresh explicitly.
-                pass
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
             repo_root=repo_root,

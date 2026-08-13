@@ -174,7 +174,7 @@ def test_safe_exit_requires_guarded_loopback_post() -> None:
         thread.join(timeout=3)
 
 
-def test_run_server_does_not_repeat_cli_owned_daily_refresh(monkeypatch, tmp_path) -> None:
+def test_run_server_owns_one_background_initial_daily_refresh(monkeypatch, tmp_path) -> None:
     from a_share_quant.storage.official_signal_store import OfficialSignalStore
     from a_share_quant.workbench import app
 
@@ -205,7 +205,7 @@ def test_run_server_does_not_repeat_cli_owned_daily_refresh(monkeypatch, tmp_pat
         official_signal_store=OfficialSignalStore(),
     )
 
-    assert calls == 0
+    assert calls == 1
 
 
 def test_run_server_wires_validated_quotes_into_advisory(monkeypatch) -> None:
