@@ -56,6 +56,7 @@ def test_launcher_validates_runtime_before_reuse_or_stop() -> None:
         "Get-CimInstance Win32_Process",
         "REUSE",
         "research-checkpoint",
+        "research\\research-checkpoint.json",
     ):
         assert required in launcher
 

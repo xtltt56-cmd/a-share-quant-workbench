@@ -44,7 +44,7 @@ if ([string]::IsNullOrWhiteSpace($AccountImportDirectory)) {
     $AccountImportDirectory = Join-Path $runtimeDir 'advisory\import-inbox'
 }
 $AccountSnapshotPath = Join-Path $runtimeDir 'advisory\imported-account-snapshot.json'
-$ResearchCheckpointPath = Join-Path $runtimeDir 'research-checkpoint.json'
+$ResearchCheckpointPath = Join-Path $runtimeDir 'research\research-checkpoint.json'
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python environment not found: $pythonPath"
