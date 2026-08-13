@@ -71,8 +71,15 @@ class BaoStockDataProvider:
     def list_instruments(self, as_of: date | str | None = None) -> pd.DataFrame:
         day = _format_date(as_of or date.today())
         try:
-            result = self._client().query_stock_basic()
+            client = self._client()
+            result = client.query_stock_basic()
             raw = _result_frame(result)
+            query_all_stock = getattr(client, "query_all_stock", None)
+            daily_status = (
+                _result_frame(query_all_stock(day))
+                if query_all_stock is not None
+                else pd.DataFrame()
+            )
         except (ProviderConfigurationError, ProviderRequestError):
             raise
         except Exception as exc:
@@ -93,6 +100,9 @@ class BaoStockDataProvider:
             renamed = renamed.loc[renamed["status"].astype(str).eq("1")].copy()
         if "trade_status" in renamed.columns:
             renamed["is_suspended"] = renamed["trade_status"].astype(str).ne("1")
+        if not daily_status.empty and {"code", "tradeStatus"}.issubset(daily_status.columns):
+            status_by_code = daily_status.set_index("code")["tradeStatus"].astype(str)
+            renamed["is_suspended"] = renamed["code"].map(status_by_code).fillna("0").ne("1")
         return normalize_instruments(renamed, source=self.name, as_of=day)
 
     def get_daily_bars(

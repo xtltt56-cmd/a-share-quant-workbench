@@ -21,9 +21,12 @@ class AShareTradingCalendar:
     """Resolve sessions without silently treating exchange holidays as open."""
 
     def __init__(self, *, closed_dates: set[date] | frozenset[date] | None = None) -> None:
-        self.closed_dates = frozenset(closed_dates) if closed_dates is not None else _CLOSED_2026
+        self._custom = closed_dates is not None
+        self.closed_dates = frozenset(closed_dates) if self._custom else _CLOSED_2026
 
     def is_session(self, day: date) -> bool:
+        if not self._custom and day.year != 2026:
+            raise ValueError("exchange-published calendar is unavailable for this year")
         return day.weekday() < 5 and day not in self.closed_dates
 
     def next_session(self, day: date) -> date:

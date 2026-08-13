@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
 from a_share_quant.advisory.price_contracts import PricePlanType
 from a_share_quant.market.trading_calendar import AShareTradingCalendar
@@ -177,3 +178,10 @@ def test_next_trading_day_skips_weekend_and_exchange_holiday() -> None:
 
     assert calendar.next_session(date(2026, 4, 30)) == date(2026, 5, 6)
     assert calendar.next_session(date(2026, 8, 14)) == date(2026, 8, 17)
+
+
+def test_default_calendar_fails_closed_outside_published_year() -> None:
+    calendar = AShareTradingCalendar()
+
+    with pytest.raises(ValueError, match="published"):
+        calendar.next_session(date(2026, 12, 31))

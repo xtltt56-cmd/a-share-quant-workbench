@@ -100,6 +100,26 @@ def test_baostock_provider_excludes_indexes_and_inactive_securities(
     assert instruments["symbol"].tolist() == ["600000"]
 
 
+def test_baostock_provider_uses_daily_trade_status_for_suspensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_baostock()
+
+    def query_all_stock(day: str) -> _FakeResult:
+        assert day == "2026-08-08"
+        return _FakeResult(
+            ["code", "tradeStatus", "code_name"],
+            [["sh.600000", "0", "浦发银行"]],
+        )
+
+    fake.query_all_stock = query_all_stock
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    instruments = BaoStockDataProvider().list_instruments(as_of="2026-08-08")
+
+    assert instruments.loc[0, "is_suspended"]
+
+
 def test_baostock_provider_sanitizes_result_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _fake_baostock(daily_error=True)
     monkeypatch.setitem(sys.modules, "baostock", fake)
