@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -26,6 +27,10 @@ from a_share_quant.storage.research_data_store import (
 
 class CheckpointIntegrityError(RuntimeError):
     """Raised when a historical-backfill checkpoint cannot be trusted."""
+
+
+class TransientProviderError(ProviderRequestError):
+    """Raised after bounded retries exhaust a confirmed transport failure."""
 
 
 class HistoricalHistoryProvider(Protocol):
@@ -101,6 +106,7 @@ class HistoricalBackfillCoordinator:
         retry_count: int = 3,
         delay_seconds: float = 0.25,
         disk_usage: Callable[[str | os.PathLike[str]], Any] | None = None,
+        directory_fsync: Callable[[Path], None] | None = None,
     ) -> None:
         if retry_count < 0 or delay_seconds < 0:
             raise ValueError("retry_count and delay_seconds must be non-negative")
@@ -111,6 +117,7 @@ class HistoricalBackfillCoordinator:
         self.retry_count = int(retry_count)
         self.delay_seconds = float(delay_seconds)
         self._disk_usage = disk_usage or getattr(store, "_disk_usage", shutil.disk_usage)
+        self._directory_fsync = directory_fsync or _fsync_directory
         self.data_root = store.root_directory
         self.checkpoint_path = store.policy.authorize(
             ".runtime/research/historical-backfill-checkpoint.json"
@@ -156,8 +163,9 @@ class HistoricalBackfillCoordinator:
         for instrument in instruments.itertuples(index=False):
             symbol = str(instrument.symbol)
             record = checkpoint["symbols"].get(symbol)
-            if record is not None:
-                self._verified_artifact(symbol, record)
+            record = self._reconcile_symbol(
+                checkpoint, symbol, record, start_day, end_day
+            )
             missing = self._missing_ranges(record, start_day, end_day)
             if not missing:
                 continue
@@ -174,38 +182,47 @@ class HistoricalBackfillCoordinator:
                     )
                     for missing_start, missing_end in missing
                 ]
-                new_rows = sum(len(piece) for piece in pieces)
-                if new_rows == 0:
-                    failures[symbol] = "NO_HISTORY"
-                    checkpoint["failures"][symbol] = "NO_HISTORY"
-                    self._write_checkpoint(checkpoint)
-                    continue
-                frame = self._merge_with_previous(symbol, record, pieces)
-                self._validate_history(frame, symbol, start_day, end_day)
-                artifact = self.store.replace_dataset(
-                    ResearchDataset.RESEARCH_RETURNS,
-                    symbol,
-                    frame,
-                    _artifact_version(frame, start_day, end_day),
-                )
-                checkpoint["symbols"][symbol] = self._symbol_record(
-                    frame, artifact, start_day, end_day
-                )
-                checkpoint["failures"].pop(symbol, None)
-                self._write_checkpoint(checkpoint)
-                symbols_updated += 1
-                rows_written += new_rows
-            except (CheckpointIntegrityError, StorageQuotaError):
-                raise
-            except Exception as exc:  # one failed symbol must not discard completed peers
+            except ProviderRequestError as exc:
                 reason = (
                     "TRANSIENT_PROVIDER_FAILURE"
-                    if isinstance(exc, _TRANSIENT_FAILURES)
+                    if isinstance(exc, TransientProviderError)
                     else "PERMANENT_PROVIDER_FAILURE"
                 )
                 failures[symbol] = reason
                 checkpoint["failures"][symbol] = reason
                 self._write_checkpoint(checkpoint)
+                continue
+
+            new_rows = sum(len(piece) for piece in pieces)
+            if new_rows == 0:
+                failures[symbol] = "NO_HISTORY"
+                checkpoint["failures"][symbol] = "NO_HISTORY"
+                self._write_checkpoint(checkpoint)
+                continue
+            try:
+                frame = self._merge_with_previous(symbol, record, pieces)
+                self._validate_history(frame, symbol, start_day, end_day)
+            except ProviderRequestError:
+                failures[symbol] = "PERMANENT_PROVIDER_FAILURE"
+                checkpoint["failures"][symbol] = "PERMANENT_PROVIDER_FAILURE"
+                self._write_checkpoint(checkpoint)
+                continue
+
+            # Storage, manifest, lock, path and checkpoint failures must escape;
+            # reporting them as provider failures would hide a local integrity issue.
+            artifact = self.store.replace_dataset(
+                ResearchDataset.RESEARCH_RETURNS,
+                symbol,
+                frame,
+                _artifact_version(frame, start_day, end_day),
+            )
+            checkpoint["symbols"][symbol] = self._symbol_record(
+                frame, artifact, start_day, end_day
+            )
+            checkpoint["failures"].pop(symbol, None)
+            self._write_checkpoint(checkpoint)
+            symbols_updated += 1
+            rows_written += new_rows
 
         return BackfillResult(symbols_updated, rows_written, failures)
 
@@ -269,6 +286,7 @@ class HistoricalBackfillCoordinator:
 
     def _ensure_download_capacity(self) -> None:
         self.store.policy.revalidate(self.data_root)
+        self.store.policy.revalidate(self.checkpoint_path)
         free_bytes = int(self._disk_usage(self.data_root).free)
         if free_bytes < self.store.minimum_free_bytes:
             raise StorageQuotaError(
@@ -279,13 +297,21 @@ class HistoricalBackfillCoordinator:
         if self._last_request_completed and self.delay_seconds:
             self._sleeper(self.delay_seconds)
         for attempt in range(self.retry_count + 1):
+            # Revalidate after rate/backoff sleeping and immediately before
+            # every external attempt so a falling disk or replaced path closes
+            # the gate before the provider can return more bytes.
+            self._ensure_download_capacity()
             try:
                 result = function(*args, **kwargs)
                 self._last_request_completed = True
                 return result
-            except _TRANSIENT_FAILURES:
-                if attempt >= self.retry_count:
+            except Exception as exc:
+                if not _is_transient_provider_failure(exc):
                     raise
+                if attempt >= self.retry_count:
+                    raise TransientProviderError(
+                        "provider transport retries exhausted"
+                    ) from exc
                 self._sleeper(self.delay_seconds * (2**attempt))
         raise RuntimeError("unreachable")
 
@@ -313,6 +339,52 @@ class HistoricalBackfillCoordinator:
             version,
         )
 
+    def _reconcile_symbol(
+        self,
+        checkpoint: dict[str, Any],
+        symbol: str,
+        record: Mapping[str, Any] | None,
+        start: date,
+        end: date,
+    ) -> Mapping[str, Any] | None:
+        """Repair only the known publish-before-checkpoint crash window."""
+
+        try:
+            active = self.store.active_artifact(
+                ResearchDataset.RESEARCH_RETURNS, symbol
+            )
+        except KeyError:
+            if record is None:
+                return None
+            raise CheckpointIntegrityError(
+                f"历史回填检查点引用的产物不存在: {symbol}"
+            ) from None
+
+        if record is not None and active.sha256 == record.get("artifact_sha256"):
+            self._verified_artifact(symbol, record)
+            return record
+
+        if not self.store.verify(active):
+            raise CheckpointIntegrityError(f"历史回填活跃产物校验失败: {symbol}")
+        frame = pd.read_parquet(active.path)
+        try:
+            self._validate_history(frame, symbol, start, end)
+        except ProviderRequestError as exc:
+            raise CheckpointIntegrityError(
+                f"历史回填活跃产物不符合目标: {symbol}"
+            ) from exc
+        expected_version = _artifact_version(frame, start, end)
+        if active.data_version != expected_version:
+            raise CheckpointIntegrityError(
+                f"历史回填活跃产物目标或版本不匹配: {symbol}"
+            )
+
+        repaired = self._symbol_record(frame, active, start, end)
+        checkpoint["symbols"][symbol] = repaired
+        checkpoint["failures"].pop(symbol, None)
+        self._write_checkpoint(checkpoint)
+        return repaired
+
     def _merge_with_previous(
         self,
         symbol: str,
@@ -337,16 +409,19 @@ class HistoricalBackfillCoordinator:
             artifact = self.store.active_artifact(
                 ResearchDataset.RESEARCH_RETURNS, symbol
             )
-            if (
-                artifact.sha256 != record.get("artifact_sha256")
-                or not self.store.verify(artifact)
-            ):
-                raise ValueError("artifact does not match checkpoint")
-            return artifact
-        except Exception as exc:
+        except KeyError as exc:
+            raise CheckpointIntegrityError(
+                f"历史回填检查点引用的产物不存在: {symbol}"
+            ) from exc
+        if (
+            artifact.sha256 != record.get("artifact_sha256")
+            or artifact.data_version != record.get("artifact_data_version")
+            or not self.store.verify(artifact)
+        ):
             raise CheckpointIntegrityError(
                 f"历史回填检查点引用的产物校验失败: {symbol}"
-            ) from exc
+            )
+        return artifact
 
     @staticmethod
     def _validate_history(frame: pd.DataFrame, symbol: str, start: date, end: date) -> None:
@@ -464,12 +539,41 @@ class HistoricalBackfillCoordinator:
             self.store.policy.revalidate(temporary)
             self.store.policy.revalidate(self.checkpoint_path)
             os.replace(temporary, self.checkpoint_path)
+            self.store.policy.revalidate(directory)
+            self._directory_fsync(directory)
         finally:
             self.store.policy.revalidate(temporary)
             temporary.unlink(missing_ok=True)
 
 
-_TRANSIENT_FAILURES = (TimeoutError, ConnectionError, ProviderRequestError)
+_TRANSPORT_FAILURES = (TimeoutError, ConnectionError, OSError)
+
+
+def _is_transient_provider_failure(exc: Exception) -> bool:
+    if isinstance(exc, _TRANSPORT_FAILURES):
+        return True
+    if not isinstance(exc, ProviderRequestError):
+        return False
+    cause = exc.__cause__
+    while cause is not None:
+        if isinstance(cause, _TRANSPORT_FAILURES):
+            return True
+        cause = cause.__cause__
+    return False
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory durability on platforms that expose it."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        if os.name != "nt":
+            raise
 
 
 def _as_date(value: date | str, field: str) -> date:
@@ -530,4 +634,5 @@ __all__ = [
     "CheckpointIntegrityError",
     "HistoricalBackfillCoordinator",
     "HistoricalCoverage",
+    "TransientProviderError",
 ]

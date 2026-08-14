@@ -8,13 +8,17 @@ from datetime import date, datetime, timezone
 import pandas as pd
 import pytest
 
-from a_share_quant.contracts.data import CANONICAL_DAILY_COLUMNS
+from a_share_quant.contracts.data import CANONICAL_DAILY_COLUMNS, ProviderRequestError
 from a_share_quant.runtime.historical_backfill import (
     CheckpointIntegrityError,
     HistoricalBackfillCoordinator,
 )
-from a_share_quant.storage.project_storage import ProjectStoragePolicy
-from a_share_quant.storage.research_data_store import ResearchDataStore, StorageQuotaError
+from a_share_quant.storage.project_storage import ProjectStoragePolicy, StorageBoundaryError
+from a_share_quant.storage.research_data_store import (
+    ManifestIntegrityError,
+    ResearchDataStore,
+    StorageQuotaError,
+)
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
 
@@ -98,7 +102,7 @@ class RecordingHistoryProvider:
         self.calls.append(("history", symbol, start_date, end_date))
         if symbol == self.fail_once_on:
             self.fail_once_on = None
-            raise ValueError("permanent fixture failure")
+            raise ProviderRequestError("permanent fixture failure")
         return _history(symbol, start_date, end_date)
 
 
@@ -193,13 +197,15 @@ def test_corrupt_checkpoint_fails_closed(tmp_path) -> None:
         coordinator.coverage()
 
 
-def test_checkpoint_that_references_a_damaged_artifact_fails_closed(tmp_path) -> None:
+def test_checkpoint_that_references_a_damaged_artifact_propagates_integrity_error(
+    tmp_path,
+) -> None:
     coordinator = _coordinator(tmp_path)
     coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
     artifact = coordinator.store.active_artifact("research_returns", "600001")
     artifact.path.write_bytes(b"damaged")
 
-    with pytest.raises(CheckpointIntegrityError, match="产物校验失败"):
+    with pytest.raises(ManifestIntegrityError, match="blob"):
         coordinator.coverage()
 
 
@@ -215,6 +221,31 @@ def test_storage_quota_error_during_publication_stops_the_batch(tmp_path, monkey
     monkeypatch.setattr(coordinator.store, "replace_dataset", replace)
 
     with pytest.raises(StorageQuotaError, match="超过配额"):
+        coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ManifestIntegrityError("manifest damaged"),
+        StorageBoundaryError("path escaped"),
+        OSError("checkpoint disk failure"),
+    ],
+)
+def test_storage_and_integrity_failures_are_never_reported_as_provider_failures(
+    tmp_path, monkeypatch, failure
+) -> None:
+    coordinator = _coordinator(tmp_path)
+    original = coordinator.store.replace_dataset
+
+    def replace(dataset, key, frame, data_version):
+        if str(dataset.value if hasattr(dataset, "value") else dataset) == "research_returns":
+            raise failure
+        return original(dataset, key, frame, data_version)
+
+    monkeypatch.setattr(coordinator.store, "replace_dataset", replace)
+
+    with pytest.raises(type(failure), match=str(failure)):
         coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
 
 
@@ -257,7 +288,10 @@ def test_retries_only_bounded_transient_failures_and_applies_configured_delays(
             self.calls.append(("history", symbol, start_date, end_date))
             if self.remaining_failures:
                 self.remaining_failures -= 1
-                raise TimeoutError("temporary")
+                try:
+                    raise TimeoutError("temporary")
+                except TimeoutError as exc:
+                    raise ProviderRequestError("transport failed") from exc
             return _history(symbol, start_date, end_date)
 
     provider = TransientProvider()
@@ -275,6 +309,117 @@ def test_retries_only_bounded_transient_failures_and_applies_configured_delays(
     assert result.symbols_updated == 1
     assert len([call for call in provider.calls if call[0] == "history"]) == 3
     assert sleeps == [0.25, 0.25, 0.5]
+
+
+def test_provider_validation_error_is_permanent_and_is_not_retried(tmp_path) -> None:
+    class InvalidProvider(RecordingHistoryProvider):
+        def get_research_history(self, symbol, start_date, end_date):
+            self.calls.append(("history", symbol, start_date, end_date))
+            raise ProviderRequestError("response validation failed")
+
+    provider = InvalidProvider()
+    coordinator = _coordinator(tmp_path, provider, retry_count=3)
+
+    result = coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+
+    assert result.failures == {"600001": "PERMANENT_PROVIDER_FAILURE"}
+    assert len([call for call in provider.calls if call[0] == "history"]) == 1
+
+
+def test_reconciles_manifest_after_interrupt_between_publish_and_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    provider = RecordingHistoryProvider()
+    provider.list_research_instruments = lambda as_of=None: _instrument_frame().iloc[:1].copy()
+    coordinator = _coordinator(tmp_path, provider)
+    coordinator.run(start=date(2019, 1, 2), end=date(2019, 1, 3), limit=1)
+    original_write = coordinator._write_checkpoint
+    monkeypatch.setattr(
+        coordinator,
+        "_write_checkpoint",
+        lambda _payload: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 4), limit=1)
+
+    monkeypatch.setattr(coordinator, "_write_checkpoint", original_write)
+    history_calls = [call for call in provider.calls if call[0] == "history"]
+    resumed = coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 4), limit=1)
+
+    assert resumed.rows_written == 0
+    assert [call for call in provider.calls if call[0] == "history"] == history_calls
+    assert coordinator.coverage().row_count == 4
+
+
+def test_checkpoint_replace_fsyncs_parent_directory(tmp_path) -> None:
+    fsynced = []
+    coordinator = HistoricalBackfillCoordinator(
+        _store(tmp_path),
+        RecordingHistoryProvider(),
+        sleeper=lambda _seconds: None,
+        delay_seconds=0,
+        directory_fsync=fsynced.append,
+    )
+
+    coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+
+    assert fsynced
+    assert set(fsynced) == {coordinator.checkpoint_path.parent}
+
+
+def test_space_is_rechecked_immediately_before_each_provider_attempt(tmp_path) -> None:
+    provider = RecordingHistoryProvider()
+    usage_calls = 0
+
+    def disk_usage(_path):
+        nonlocal usage_calls
+        usage_calls += 1
+        free = 100 * 1024**3 if usage_calls <= 2 else 1024
+        return DiskUsage(200 * 1024**3, 100 * 1024**3, free)
+
+    coordinator = HistoricalBackfillCoordinator(
+        _store(tmp_path),
+        provider,
+        sleeper=lambda _seconds: None,
+        delay_seconds=0,
+        disk_usage=disk_usage,
+    )
+
+    with pytest.raises(StorageQuotaError, match="D盘.*空间"):
+        coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+
+    assert [call[0] for call in provider.calls] == ["instruments"]
+
+
+def test_space_is_rechecked_before_a_provider_retry(tmp_path) -> None:
+    class TimeoutProvider(RecordingHistoryProvider):
+        def get_research_history(self, symbol, start_date, end_date):
+            self.calls.append(("history", symbol, start_date, end_date))
+            raise TimeoutError("temporary")
+
+    provider = TimeoutProvider()
+    usage_calls = 0
+
+    def disk_usage(_path):
+        nonlocal usage_calls
+        usage_calls += 1
+        free = 100 * 1024**3 if usage_calls <= 3 else 1024
+        return DiskUsage(200 * 1024**3, 100 * 1024**3, free)
+
+    coordinator = HistoricalBackfillCoordinator(
+        _store(tmp_path),
+        provider,
+        sleeper=lambda _seconds: None,
+        delay_seconds=0,
+        disk_usage=disk_usage,
+        retry_count=3,
+    )
+
+    with pytest.raises(StorageQuotaError, match="D盘.*空间"):
+        coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+
+    assert len([call for call in provider.calls if call[0] == "history"]) == 1
 
 
 def test_coverage_reports_rows_sessions_dates_status_bytes_and_exclusions(tmp_path) -> None:
