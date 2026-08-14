@@ -52,7 +52,6 @@ def _prediction(
         score=0.73,
         probability=0.68,
         guidance_price_bands=_bands(),
-        maturity_date=date(2026, 8, 26),
         evidence_mode="PROSPECTIVE",
     )
 
@@ -412,3 +411,27 @@ def test_valid_unterminated_tail_is_recovered_but_middle_corruption_fails(tmp_pa
         handle.write(b'\nnot-json\n')
     with pytest.raises(Exception, match="完整性"):
         ProspectiveLedgerStore(path)
+
+
+def test_explicit_maturity_requires_calendar_and_storage_rejects_early_settlement(
+    tmp_path: Path,
+) -> None:
+    store = ProspectiveLedgerStore(tmp_path / "ledger.jsonl")
+    competition = ProspectiveCompetition(store=store, now=NOW)
+    with pytest.raises(ValueError, match="calendar"):
+        competition.append_prediction(
+            model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+            symbol="600001", name="示例", prediction_at=NOW - timedelta(days=1),
+            as_of=date(2026, 8, 19), horizon=5, score=0.1, probability=0.5,
+            guidance_price_bands=_bands(), maturity_date=date(2026, 8, 26),
+        )
+    ledger = _ledger(tmp_path)
+    prediction = _prediction(ledger)
+    early = _valid_outcome(prediction)
+    early = OutcomeObservation(**{**early.to_dict(), "outcome_at": NOW.isoformat()})
+    with pytest.raises(ValueError, match="maturity"):
+        ledger.store.append_settlement(early)
+    _mature(ledger)
+    ledger.store.append_settlement(_valid_outcome(prediction))
+    with pytest.raises(ValueError, match="settlement"):
+        ledger.store.append_pending(_valid_outcome(prediction), "STALE")

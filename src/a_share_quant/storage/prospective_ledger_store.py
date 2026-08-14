@@ -82,7 +82,12 @@ class ProspectiveLedgerStore:
         self._settlements: dict[str, OutcomeObservation] = {}
         self._pending: dict[str, tuple[OutcomeObservation, str]] = {}
         if self.path.exists():
-            self._load()
+            with self.lock_path.open("a+b") as handle:
+                _lock_file(handle)
+                try:
+                    self._load()
+                finally:
+                    _unlock_file(handle)
 
     def append_prediction(self, prediction: ProspectivePrediction) -> ProspectivePrediction:
         """Append one prediction, returning the existing equal record idempotently."""
@@ -103,6 +108,8 @@ class ProspectiveLedgerStore:
 
         with self._locked_append():
             self._validate_outcome(outcome)
+            if outcome.outcome_at.date() < outcome.maturity_date:
+                raise ValueError("settlement outcome is before maturity")
             self._validate_settlement_quality(outcome)
             existing = self._settlements.get(outcome.prediction_id)
             if existing is not None:
@@ -128,6 +135,8 @@ class ProspectiveLedgerStore:
             raise ValueError("pending reason is required")
         with self._locked_append():
             self._validate_outcome(outcome)
+            if outcome.prediction_id in self._settlements:
+                raise ValueError("prediction already has a settlement")
             key = f"{outcome.id}:{reason_value}"
             if key not in self._pending:
                 self._append_record(
@@ -232,11 +241,22 @@ class ProspectiveLedgerStore:
                 if record.get("format_version") != self.FORMAT_VERSION:
                     raise ValueError
                 self._restore_record(record)
-            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+                KeyError,
+                IndexError,
+                OverflowError,
+                AttributeError,
+            ) as exc:
                 if index == len(raw_lines) - 1 and not raw_line.endswith((b"\n", b"\r")):
                     try:
                         with self.path.open("r+b") as handle:
                             handle.truncate(sum(len(item) for item in raw_lines[:index]))
+                            handle.flush()
+                            os.fsync(handle.fileno())
                         break
                     except OSError as truncate_error:
                         raise LedgerIntegrityError("前瞻预测账本尾部恢复失败") from truncate_error

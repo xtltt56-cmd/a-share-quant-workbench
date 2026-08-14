@@ -420,6 +420,12 @@ class ProspectiveCompetition:
                 raw_timestamp = datetime.fromisoformat(raw_timestamp)
             if _utc(raw_timestamp, field="prediction_at") > self.now:
                 raise FutureTimestampError("prediction timestamp is in the future")
+        if (
+            prediction is None
+            and fields.get("maturity_date") is not None
+            and self.session_calendar is None
+        ):
+            raise ValueError("explicit maturity_date requires a session calendar")
         candidate = prediction if prediction is not None else ProspectivePrediction(**fields)
         if not isinstance(candidate, ProspectivePrediction):
             raise TypeError("prediction must be ProspectivePrediction")
