@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -32,9 +34,21 @@ class ResearchArtifact:
     schema_fingerprint: str
 
     def __post_init__(self) -> None:
+        for field_name in ("dataset", "key", "data_version"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be non-empty")
         _require_digest(self.sha256, "sha256")
         _require_digest(self.schema_fingerprint, "schema_fingerprint")
         _require_utc(self.created_at, "created_at")
+        if not isinstance(self.path, Path):
+            raise TypeError("path must be a Path")
+        if not self.path.is_absolute():
+            raise ValueError("path must be absolute")
+        if Path(os.path.normpath(self.path)) != self.path:
+            raise ValueError("path must be normalized")
+        if self.path.name != f"{self.sha256}.parquet":
+            raise ValueError("path filename must match sha256")
         if self.row_count < 0 or self.size_bytes < 0:
             raise ValueError("row_count and size_bytes must be non-negative")
 
@@ -67,6 +81,8 @@ class PointInTimeInstrument:
     is_tradable: bool
 
     def __post_init__(self) -> None:
+        if not self.symbol.strip() or not self.name.strip():
+            raise ValueError("symbol and name must be non-empty")
         if self.delisted_on is not None and self.delisted_on < self.listed_on:
             raise ValueError("delisted_on must not precede listed_on")
 
@@ -84,5 +100,5 @@ class CorporateAction:
     def __post_init__(self) -> None:
         if not self.action_type or not self.data_version:
             raise ValueError("action_type and data_version are required")
-        if self.adjustment_factor < 0:
-            raise ValueError("adjustment_factor must be non-negative")
+        if not math.isfinite(self.adjustment_factor) or self.adjustment_factor <= 0:
+            raise ValueError("adjustment_factor must be finite and positive")

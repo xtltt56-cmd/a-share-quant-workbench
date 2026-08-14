@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
+import subprocess
+import sys
+import textwrap
+import time
 from collections import namedtuple
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +19,7 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 
+import a_share_quant.storage.research_data_store as research_store_module
 from a_share_quant.research.history_contracts import (
     CorporateAction,
     DatasetCoverage,
@@ -72,7 +78,7 @@ def test_history_contracts_are_frozen_and_validate_temporal_fields() -> None:
         key="000001",
         data_version="v1",
         sha256="a" * 64,
-        path=Path("blobs/a.parquet"),
+        path=Path("D:/contracts") / ("a" * 64 + ".parquet"),
         row_count=2,
         size_bytes=10,
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -269,17 +275,19 @@ def test_safe_cleanup_never_deletes_referenced_or_unknown_files(research_temp: P
     artifact = store.replace_dataset("research_returns", "000001", frame(), "v1")
     unknown = store.root_directory / "model.bin"
     unknown.write_bytes(b"must survive")
-    orphan = store.blob_directory / ("f" * 64 + ".parquet")
-    orphan.write_bytes(b"orphan")
-    stage = store.staging_directory / f".research-stage-{uuid4().hex}.parquet"
-    stage.write_bytes(b"partial")
+    unknown_digest = store.blob_directory / ("f" * 64 + ".parquet")
+    unknown_digest.write_bytes(b"foreign")
+    unknown_stage = store.blob_directory / f".research-stage-{uuid4().hex}.parquet"
+    unknown_stage.write_bytes(b"foreign-stage")
 
     dry = store.cleanup_rebuildable_temporary_files(grace_seconds=0, dry_run=True)
-    assert orphan in dry.candidates and stage in dry.candidates
-    assert orphan.exists() and stage.exists()
+    assert unknown_digest not in dry.candidates
+    assert unknown_stage not in dry.candidates
     report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
-    assert orphan in report.removed and stage in report.removed
+    assert unknown_digest not in report.removed
     assert artifact.path.exists() and store.manifest_path.exists() and unknown.exists()
+    assert unknown_digest.exists()
+    assert unknown_stage.exists()
 
 
 def test_outer_c_temp_does_not_redirect_store_or_test_artifacts(
@@ -298,3 +306,321 @@ def test_default_space_limits_are_conservative() -> None:
     assert ResearchDataStore.DEFAULT_MAXIMUM_SINGLE_FILE_BYTES == 536_870_912
     assert ResearchDataStore.DEFAULT_MAXIMUM_RESEARCH_DATA_BYTES == 21_474_836_480
     assert ResearchDataStore.DEFAULT_MINIMUM_FREE_BYTES == 21_474_836_480
+
+
+def test_windows_cross_process_lock_waits_instead_of_reading_locked_byte(
+    research_temp: Path,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows byte-range lock test")
+    repo = research_temp / "multiprocess-repo"
+    repo.mkdir()
+    ready = research_temp / "holder-ready"
+    child_temp = research_temp / "child-temp"
+    child_temp.mkdir()
+    environment = dict(os.environ)
+    environment["TEMP"] = str(child_temp)
+    environment["TMP"] = str(child_temp)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(ROOT / "src"), environment.get("PYTHONPATH")))
+    )
+    holder_code = textwrap.dedent(
+        f"""
+        import time
+        from pathlib import Path
+        from a_share_quant.storage.project_storage import ProjectStoragePolicy
+        from a_share_quant.storage.research_data_store import ResearchDataStore
+
+        store = ResearchDataStore(
+            ProjectStoragePolicy(Path({str(repo)!r}), required_drive=None),
+            minimum_free_bytes=0,
+        )
+        with store._locked():
+            Path({str(ready)!r}).write_text("ready", encoding="utf-8")
+            time.sleep(2.5)
+        """
+    )
+    writer_code = textwrap.dedent(
+        f"""
+        from pathlib import Path
+        import pandas as pd
+        from a_share_quant.storage.project_storage import ProjectStoragePolicy
+        from a_share_quant.storage.research_data_store import ResearchDataStore
+
+        store = ResearchDataStore(
+            ProjectStoragePolicy(Path({str(repo)!r}), required_drive=None),
+            minimum_free_bytes=0,
+        )
+        store.replace_dataset(
+            "research_returns",
+            "000001",
+            pd.DataFrame({{"symbol": ["000001"], "x": [1]}}),
+            "v1",
+        )
+        """
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code],
+        cwd=ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and holder.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists(), holder.communicate(timeout=2)
+
+    started = time.monotonic()
+    writer = subprocess.run(
+        [sys.executable, "-c", writer_code],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+
+    assert holder.returncode == 0, (holder_stdout, holder_stderr)
+    assert writer.returncode == 0, writer.stderr
+    assert elapsed >= 1.5
+
+
+@pytest.mark.parametrize("field,value", [("row_count", 999), ("schema_fingerprint", "c" * 64)])
+def test_manifest_canonical_digest_rejects_metadata_tampering(
+    research_temp: Path, field: str, value: object
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    artifact = store.replace_dataset("research_returns", "000001", frame(), "v1")
+    record = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    record[field] = value
+    store.manifest_path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ManifestIntegrityError, match="摘要|metadata|record"):
+        store.active_artifact("research_returns", "000001")
+    assert not store.verify(artifact)
+
+
+def test_manifest_created_at_wrong_type_is_integrity_error(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    store.replace_dataset("research_returns", "000001", frame(), "v1")
+    record = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    record["created_at"] = 123
+    store.manifest_path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ManifestIntegrityError, match="created_at"):
+        store.active_artifact("research_returns", "000001")
+
+
+def test_blob_parquet_metadata_must_match_manifest(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    store.replace_dataset("research_returns", "000001", frame(), "v1")
+    expanded = pd.concat([frame(), frame().iloc[[0]]], ignore_index=True)
+    temporary = store.blob_directory / f"metadata-test-{uuid4().hex}.parquet"
+    expanded.to_parquet(temporary, index=False)
+    digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+    replacement = store.blob_directory / f"{digest}.parquet"
+    os.replace(temporary, replacement)
+    record = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    record["sha256"] = digest
+    record["blob_path"] = f"blobs/{digest}.parquet"
+    record["size_bytes"] = replacement.stat().st_size
+    record["record_id"] = hashlib.sha256(
+        f"{record['dataset']}\0{record['key']}\0{record['data_version']}\0{digest}".encode()
+    ).hexdigest()
+    record["record_sha256"] = store._canonical_record_sha256(record)
+    store.manifest_path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ManifestIntegrityError, match="摘要|大小"):
+        store.active_artifact("research_returns", "000001")
+
+
+def test_same_logical_version_with_changed_content_is_a_conflict(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    old = store.replace_dataset("research_returns", "000001", frame(1), "v1")
+
+    with pytest.raises(research_store_module.ManifestConflictError, match="data_version|逻辑"):
+        store.replace_dataset("research_returns", "000001", frame(50), "v1")
+
+    assert store.active_artifact("research_returns", "000001") == old
+    assert store.manifest_count() == 1
+
+
+def test_manifest_rejects_conflicting_duplicate_logical_version(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    store.replace_dataset("research_returns", "000001", frame(), "v1")
+    record = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    duplicate = dict(record)
+    duplicate["sha256"] = "d" * 64
+    duplicate["blob_path"] = f"blobs/{duplicate['sha256']}.parquet"
+    duplicate["record_id"] = hashlib.sha256(
+        f"{duplicate['dataset']}\0{duplicate['key']}\0{duplicate['data_version']}\0{duplicate['sha256']}".encode()
+    ).hexdigest()
+    duplicate["record_sha256"] = store._canonical_record_sha256(duplicate)
+    store.manifest_path.write_text(
+        "".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+            for item in (record, duplicate)
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(research_store_module.ManifestConflictError, match="data_version|逻辑"):
+        store.active_artifact("research_returns", "000001")
+
+
+def test_manifest_failure_leaves_owned_orphan_that_cleanup_can_remove(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("manifest publish failed")
+
+    store._manifest_replace = fail_replace
+    with pytest.raises(OSError, match="manifest publish"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    orphans = [path for path in store.blob_directory.glob("*.parquet") if len(path.stem) == 64]
+    markers = list(store.ownership_directory.glob("*.owned.json"))
+    assert len(orphans) == 1
+    assert markers
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+    assert orphans[0] in report.removed
+    assert not orphans[0].exists()
+    assert not list(store.ownership_directory.glob("*.owned.json"))
+
+
+def test_fake_ownership_marker_never_authorizes_deletion(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    foreign = store.blob_directory / ("e" * 64 + ".parquet")
+    foreign.write_bytes(b"foreign")
+    fake = store.ownership_directory / f"{uuid4().hex}.owned.json"
+    fake.write_text(
+        json.dumps(
+            {
+                "schema": "a-share-quant.research-owned-object",
+                "kind": "orphan_blob",
+                "relative_path": f"blobs/{foreign.name}",
+                "digest": foreign.stem,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+    assert foreign.exists()
+    assert fake.exists()
+    assert fake in report.rejected
+
+
+def test_stale_owned_marker_for_referenced_blob_removes_only_marker(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    artifact = store.replace_dataset("research_returns", "000001", frame(), "v1")
+    marker = store._create_owned_marker(
+        "orphan_blob", artifact.path, digest=artifact.sha256
+    )
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert artifact.path.exists()
+    assert artifact.path not in report.removed
+    assert not marker.exists()
+
+
+def test_recursive_quota_counts_old_stage_and_unknown_files(research_temp: Path) -> None:
+    store = store_at(
+        research_temp,
+        minimum_free_bytes=0,
+        maximum_research_data_bytes=8_000,
+    )
+    stranded = store.root_directory / "foreign-cache.bin"
+    stranded.write_bytes(b"x" * 6_000)
+
+    with pytest.raises(StorageQuotaError, match="配额"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    assert stranded.exists()
+    assert not store.manifest_path.exists()
+    assert not list(store.blob_directory.glob("[0-9a-f]*.parquet"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"dataset": ""}, "dataset"),
+        ({"key": ""}, "key"),
+        ({"data_version": ""}, "data_version"),
+        ({"path": "not-a-path"}, "path"),
+        ({"path": Path("relative/a.parquet")}, "absolute"),
+        ({"path": Path("D:/safe/wrong.parquet")}, "sha256|filename"),
+    ],
+)
+def test_research_artifact_rejects_invalid_identity_and_path(
+    overrides: dict[str, object], match: str
+) -> None:
+    values: dict[str, object] = {
+        "dataset": "research_returns",
+        "key": "000001",
+        "data_version": "v1",
+        "sha256": "a" * 64,
+        "path": Path("D:/safe") / ("a" * 64 + ".parquet"),
+        "row_count": 1,
+        "size_bytes": 1,
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "schema_fingerprint": "b" * 64,
+    }
+    values.update(overrides)
+    with pytest.raises((TypeError, ValueError), match=match):
+        ResearchArtifact(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("factor", [0.0, -1.0, math.inf, -math.inf, math.nan])
+def test_corporate_action_requires_positive_finite_factor(factor: float) -> None:
+    with pytest.raises(ValueError, match="adjustment_factor"):
+        CorporateAction("000001", date(2026, 1, 5), "split", factor, "v1")
+
+
+@pytest.mark.parametrize("symbol,name", [("", "name"), ("000001", ""), (" ", "name")])
+def test_point_in_time_instrument_requires_identity(symbol: str, name: str) -> None:
+    with pytest.raises(ValueError, match="symbol|name"):
+        PointInTimeInstrument(symbol, name, date(2020, 1, 1), None, True)
+
+
+def test_directory_fsync_failure_preserves_previous_active(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    old = store.replace_dataset("research_returns", "000001", frame(1), "v1")
+
+    def fail_directory_fsync(path: Path) -> None:
+        if path == store.root_directory:
+            raise OSError("directory fsync failed")
+
+    store._directory_fsync = fail_directory_fsync
+    with pytest.raises(OSError, match="directory fsync"):
+        store.replace_dataset("research_returns", "000001", frame(20), "v2")
+
+    store._directory_fsync = lambda _path: None
+    assert store.active_artifact("research_returns", "000001") == old
+
+
+def test_successful_publication_fsyncs_blob_and_manifest_directories(
+    research_temp: Path,
+) -> None:
+    calls: list[Path] = []
+    store = store_at(research_temp, minimum_free_bytes=0, directory_fsync=calls.append)
+    store.replace_dataset("research_returns", "000001", frame(), "v1")
+    assert store.blob_directory in calls
+    assert store.root_directory in calls
