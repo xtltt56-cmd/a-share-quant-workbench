@@ -7,15 +7,19 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from a_share_quant.account.import_inbox import AccountImportInbox
 from a_share_quant.account.snapshot_store import AccountSnapshotStore
 from a_share_quant.config import Settings
+from a_share_quant.data.providers.baostock import BaoStockDataProvider
 from a_share_quant.data.realtime.diagnostics import (
     collect_network_diagnostics,
     write_network_diagnostics_report,
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
 from a_share_quant.research.evolution import EvolutionRegistry
+from a_share_quant.runtime.historical_backfill import HistoricalBackfillCoordinator
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import (
     PriceGuidanceRuntime,
@@ -26,6 +30,8 @@ from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.market_store import MarketDataStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
+from a_share_quant.storage.project_storage import ProjectStoragePolicy
+from a_share_quant.storage.research_data_store import ResearchDataStore
 from a_share_quant.workbench.advisory_context import load_advisory_context, load_instrument_map
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.app import run_server
@@ -167,11 +173,53 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", type=Path, default=Path(".runtime/advisory/price-guidance.json")
     )
     inspect.add_argument("--symbol", default=None)
+
+    history = subcommands.add_parser("history", help="历史研究数据工具")
+    history_subcommands = history.add_subparsers(dest="history_command", required=True)
+    history_subcommands.add_parser("status", help="离线查看历史数据覆盖与D盘目标")
+    history_backfill = history_subcommands.add_parser(
+        "backfill", help="在明确授权网络后执行一个有界历史回填批次"
+    )
+    history_backfill.add_argument("--start", required=True, help="开始日期 YYYY-MM-DD")
+    history_backfill.add_argument("--end", required=True, help="结束日期 YYYY-MM-DD")
+    history_backfill.add_argument(
+        "--network",
+        action="store_true",
+        help="显式允许本批次访问免费历史数据源",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "history":
+        repo_root = Path(__file__).resolve().parents[1]
+        if args.history_command == "backfill" and not args.network:
+            raise SystemExit("history backfill requires explicit --network authorization")
+        coordinator = _create_history_coordinator(
+            repo_root,
+            allow_network=args.history_command == "backfill" and bool(args.network),
+        )
+        targets = {
+            "网络访问": bool(args.history_command == "backfill" and args.network),
+            "D盘研究数据目录": str(coordinator.data_root),
+            "D盘检查点": str(coordinator.checkpoint_path),
+        }
+        if args.history_command == "status":
+            print(
+                json.dumps(
+                    {**targets, "覆盖状态": coordinator.coverage().to_dict()},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        # This announcement is deliberately flushed before coordinator.run(),
+        # which is the first point at which provider calls are permitted.
+        print(json.dumps({"授权写入目标": targets}, ensure_ascii=False, indent=2), flush=True)
+        result = coordinator.run(start=args.start, end=args.end)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "workbench":
         repo_root = Path(__file__).resolve().parents[1]
         official_signal_path = _inside(repo_root, args.official_signal_path)
@@ -372,6 +420,60 @@ def _operator_path(root: Path, value: Path) -> Path:
     """Resolve a fixed operator-selected path without exposing it to HTTP."""
 
     return (value if value.is_absolute() else root / value).resolve()
+
+
+def _create_history_coordinator(
+    repo_root: Path, *, allow_network: bool
+) -> HistoricalBackfillCoordinator:
+    """Build the fixed-path history runtime without initiating network access."""
+
+    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    maturity = _yaml_mapping(repo_root / "config" / "research_maturity.yaml")
+    storage = maturity.get("storage", {})
+    if not isinstance(storage, dict):
+        raise SystemExit("config/research_maturity.yaml storage must be a mapping")
+    store = ResearchDataStore(
+        policy,
+        maximum_single_file_bytes=int(
+            storage.get(
+                "maximum_single_download_bytes",
+                ResearchDataStore.DEFAULT_MAXIMUM_SINGLE_FILE_BYTES,
+            )
+        ),
+        maximum_research_data_bytes=int(
+            storage.get(
+                "maximum_research_data_bytes",
+                ResearchDataStore.DEFAULT_MAXIMUM_RESEARCH_DATA_BYTES,
+            )
+        ),
+        minimum_free_bytes=int(
+            storage.get(
+                "minimum_free_bytes", ResearchDataStore.DEFAULT_MINIMUM_FREE_BYTES
+            )
+        ),
+    )
+    data_config = _yaml_mapping(repo_root / "config" / "data.yaml")
+    request = data_config.get("data", {}).get("request", {})
+    if not isinstance(request, dict):
+        raise SystemExit("config/data.yaml data.request must be a mapping")
+    provider = BaoStockDataProvider() if allow_network else None
+    return HistoricalBackfillCoordinator(
+        store,
+        provider,
+        retry_count=int(request.get("retry_count", 3)),
+        delay_seconds=float(request.get("delay_seconds", 0.25)),
+    )
+
+
+def _yaml_mapping(path: Path) -> dict:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise SystemExit(f"cannot load required project config: {path.name}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"project config must be a mapping: {path.name}")
+    return payload
 
 
 if __name__ == "__main__":

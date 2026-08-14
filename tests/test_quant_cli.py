@@ -1,4 +1,118 @@
+from pathlib import Path
+
+import pytest
+
 from scripts.quant_cli import build_parser, main
+
+
+def test_history_cli_exposes_offline_status_and_explicit_network_backfill() -> None:
+    status = build_parser().parse_args(["history", "status"])
+    backfill = build_parser().parse_args(
+        [
+            "history",
+            "backfill",
+            "--start",
+            "2019-01-01",
+            "--end",
+            "2026-08-13",
+            "--network",
+        ]
+    )
+
+    assert status.history_command == "status"
+    assert backfill.network is True
+
+
+def test_history_backfill_requires_network_before_building_provider(monkeypatch) -> None:
+    built: list[bool] = []
+    monkeypatch.setattr(
+        "scripts.quant_cli._create_history_coordinator",
+        lambda _root, *, allow_network: built.append(allow_network),
+    )
+
+    with pytest.raises(SystemExit, match="--network"):
+        main(
+            [
+                "history",
+                "backfill",
+                "--start",
+                "2019-01-01",
+                "--end",
+                "2026-08-13",
+            ]
+        )
+
+    assert built == []
+
+
+def test_history_backfill_prints_fixed_d_drive_targets_before_requests(
+    monkeypatch, capsys
+) -> None:
+    events: list[str] = []
+
+    class Coordinator:
+        checkpoint_path = Path("D:/量化交易/.runtime/research/history.json")
+        data_root = Path("D:/量化交易/data/research")
+
+        def run(self, *, start, end):
+            printed = capsys.readouterr().out
+            assert "D:\\" in printed or "D:/" in printed
+            assert "history.json" in printed
+            events.append(f"run:{start}:{end}")
+            return type(
+                "Result",
+                (),
+                {
+                    "to_dict": lambda self: {
+                        "symbols_updated": 1,
+                        "rows_written": 2,
+                        "failures": {},
+                    }
+                },
+            )()
+
+    monkeypatch.setattr(
+        "scripts.quant_cli._create_history_coordinator",
+        lambda _root, *, allow_network: Coordinator(),
+    )
+
+    assert main(
+        [
+            "history",
+            "backfill",
+            "--start",
+            "2019-01-01",
+            "--end",
+            "2026-08-13",
+            "--network",
+        ]
+    ) == 0
+    assert events == ["run:2019-01-01:2026-08-13"]
+
+
+def test_history_status_is_offline_and_rejects_custom_output_path(
+    monkeypatch, capsys
+) -> None:
+    created: list[bool] = []
+
+    class Coordinator:
+        checkpoint_path = Path("D:/量化交易/.runtime/research/history.json")
+        data_root = Path("D:/量化交易/data/research")
+
+        def coverage(self):
+            return type("Coverage", (), {"to_dict": lambda self: {"row_count": 0}})()
+
+    def create(_root, *, allow_network):
+        created.append(allow_network)
+        return Coordinator()
+
+    monkeypatch.setattr("scripts.quant_cli._create_history_coordinator", create)
+    assert main(["history", "status"]) == 0
+    assert created == [False]
+    assert '"网络访问": false' in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["history", "status", "--output", "C:/history"])
 
 
 def test_daily_candidates_cli_exposes_explicit_stale_data_escape_hatch() -> None:
