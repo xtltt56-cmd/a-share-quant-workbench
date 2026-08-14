@@ -1,0 +1,22 @@
+history:
+  minimum_symbols: 30
+  minimum_sessions: 1750
+  start_date: "2019-01-01"
+validation:
+  train_sessions: 756
+  validation_sessions: 252
+  embargo_sessions: 126
+  test_sessions: 126
+  minimum_oos_windows: 3
+  evidence_mode: "NON_PROMOTIONAL_ENGINEERING"
+prospective_competition:
+  primary_metric: "net_cost_return"
+  tie_break: ["max_drawdown", "brier", "ece", "rank_ic", "turnover"]
+  provisional_sessions: 20
+  provisional_matured_predictions: 100
+  approval_sessions: 60
+  approval_matured_predictions: 200
+storage:
+  minimum_free_bytes: 21474836480
+  maximum_single_download_bytes: 536870912
+  maximum_research_data_bytes: 21474836480
