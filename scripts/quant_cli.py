@@ -481,6 +481,15 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
     """Freeze verified model provenance for future-only observation."""
 
     policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    destination = policy.authorize(".runtime/research/prospective-contest.json")
+    if destination.exists():
+        policy.revalidate(destination)
+        existing = _read_local_json(destination)
+        _verify_frozen_contest(existing)
+        # A frozen contest remains readable and idempotent after newer data or
+        # model candidates arrive; callers must create a distinct future
+        # contest through the governed model-registration workflow.
+        return existing
     registration = _frozen_model_registration(repo_root, policy)
     terms = _contest_terms(repo_root)
     now = datetime.now(timezone.utc)
@@ -517,15 +526,6 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
         "status": "PROSPECTIVE_COLLECTING",
         "promotion": "NEVER",
     }
-    destination = policy.authorize(".runtime/research/prospective-contest.json")
-    if destination.exists():
-        policy.revalidate(destination)
-        existing = _read_local_json(destination)
-        _verify_frozen_contest(existing)
-        immutable = tuple(key for key in body if key != "contest_started_at")
-        if any(existing.get(key) != body[key] for key in immutable):
-            raise SystemExit("future contest is already frozen to different verified provenance")
-        return existing
     encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     payload = {**body, "sha256": hashlib.sha256(encoded).hexdigest()}
     policy.revalidate(destination.parent)

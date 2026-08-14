@@ -354,6 +354,12 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
     assert frozen["tie_break"] == terms["tie_break"]
     assert frozen["provisional_sessions"] == 20
     assert frozen["approval_matured_predictions"] == 200
+    monkeypatch.setattr(
+        "scripts.quant_cli._frozen_model_registration",
+        lambda _root, _policy: (_ for _ in ()).throw(
+            AssertionError("an existing frozen contest must not depend on newer inputs")
+        ),
+    )
     assert quant_cli._freeze_contest(d_cli_root) == frozen
 
     tampered = {**frozen, "model_version": "tampered"}
