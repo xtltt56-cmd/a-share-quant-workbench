@@ -192,6 +192,7 @@ class WindowMetrics:
 class ScreeningTrial:
     candidate_id: str
     model_family: str
+    canonical_parameters: Mapping[str, Any]
     random_seed: int
     status: str
     governance_state: str
@@ -312,7 +313,10 @@ class HistoricalEngineeringScreen:
         )
         status = (
             "ENGINEERING_BLOCKED"
-            if any(trial.status == "ENGINEERING_BLOCKED" for trial in trials)
+            if any(
+                trial.status in {"ENGINEERING_BLOCKED", "UNAVAILABLE_DEPENDENCY"}
+                for trial in trials
+            )
             else "ENGINEERING_SCREENED"
         )
         return HistoricalScreeningResult(
@@ -341,6 +345,7 @@ class HistoricalEngineeringScreen:
             return ScreeningTrial(
                 candidate_id=candidate.candidate_id,
                 model_family=family,
+                canonical_parameters=candidate.canonical_parameters(),
                 random_seed=seed,
                 status="UNAVAILABLE_DEPENDENCY",
                 governance_state="NON_PROMOTIONAL_ENGINEERING",
@@ -366,7 +371,11 @@ class HistoricalEngineeringScreen:
                     candidate, seed, ("missing_or_invalid_labels",)
                 )
             for fold in folds:
-                train = merged.loc[merged["_session_date"].le(fold.train_end)].copy()
+                train = merged.loc[
+                    merged["_session_date"].between(
+                        fold.train_start, fold.train_end, inclusive="both"
+                    )
+                ].copy()
                 validation = merged.loc[
                     merged["_session_date"].between(
                         fold.validation_start, fold.validation_end, inclusive="both"
@@ -413,12 +422,16 @@ class HistoricalEngineeringScreen:
             for item in fold_metrics
         ]
         trial_flags.extend(
-            flag for item in fold_metrics for flag in item.leakage_flags if flag not in trial_flags
+            flag
+            for item in fold_metrics
+            for flag in item.leakage_flags
+            if flag not in trial_flags and not flag.endswith("_for_cost")
         )
         status = "ENGINEERING_BLOCKED" if trial_flags else "ENGINEERING_SCREENED"
         return ScreeningTrial(
             candidate_id=candidate.candidate_id,
             model_family=family,
+            canonical_parameters=candidate.canonical_parameters(),
             random_seed=seed,
             status=status,
             governance_state=(
@@ -470,7 +483,19 @@ class HistoricalEngineeringScreen:
                 _without_realized_labels(target),
                 _without_realized_labels(train),
             )
+            repeat_values = _call_scorer(
+                candidate.scorer,
+                _without_realized_labels(target),
+                _without_realized_labels(train),
+            )
             scores = pd.Series(values, index=target.index, dtype="float64")
+            repeat_scores = pd.Series(
+                repeat_values, index=target.index, dtype="float64"
+            )
+            if not np.array_equal(
+                scores.to_numpy(), repeat_scores.to_numpy(), equal_nan=True
+            ):
+                raise ValueError("reproducibility failure")
         elif candidate.model_family in {"rule-baseline", "rule", "momentum"}:
             direction = float(candidate.parameters.get("direction", 1.0))
             scores = x_target.iloc[:, 0].astype(float) * direction
@@ -630,7 +655,7 @@ def _feature_columns(frame: pd.DataFrame, candidate: HistoricalCandidate) -> lis
 def _is_realized_label_column(column: str) -> bool:
     normalized = str(column).strip().lower()
     return normalized in _REALIZED_LABEL_COLUMNS or normalized.startswith(
-        ("forward_", "excess_return")
+        ("forward_", "excess_return", "research_return", "future_return", "target_", "label_")
     )
 
 
@@ -705,10 +730,12 @@ def _window_metrics(
     # Use the same conservative A-share cost object as the execution research
     # path.  The configured round-trip assumption is the floor; fees can only
     # increase the net cost.
-    lot = max(cost_model.lot_size, config.top_k * cost_model.lot_size)
-    buy = config_cost = _round_trip_cost_rate(config, cost_model=cost_model, lot=lot)
-    net = gross - config_cost
-    daily = selected.groupby("_session_date", sort=True)["_label"].mean() - config_cost
+    cost_rate, cost_flags = _selected_cost_rate(
+        selected, config=config, cost_model=cost_model
+    )
+    net = gross - cost_rate
+    selected["_net_return"] = selected["_label"] - selected["_cost_rate"]
+    daily = selected.groupby("_session_date", sort=True)["_net_return"].mean()
     equity = (1.0 + daily.fillna(0.0)).cumprod()
     drawdown = equity / equity.cummax() - 1.0
     max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
@@ -730,7 +757,7 @@ def _window_metrics(
         brier=brier,
         ece=ece,
         turnover=turnover,
-        estimated_cost=buy,
+        estimated_cost=cost_rate,
         max_drawdown=max_drawdown,
         capacity=capacity,
         capacity_ok=capacity >= config.capacity_limit,
@@ -738,20 +765,49 @@ def _window_metrics(
         pbo=pbo,
         deflated_sharpe=deflated_sharpe,
         cpcv_paths=cpcv_paths,
-        leakage_flags=(),
+        leakage_flags=cost_flags,
         reproducible=True,
     )
 
 
-def _round_trip_cost_rate(
-    config: ScreeningConfig, *, cost_model: AshareCostModel, lot: int
-) -> float:
-    model = cost_model
-    price = 10.0
-    buy = model.estimate(side="BUY", price=price, quantity=lot).total
-    sell = model.estimate(side="SELL", price=price, quantity=lot).total
-    notional = price * lot
-    return max(float(config.round_trip_cost), float((buy + sell) / notional))
+def _selected_cost_rate(
+    selected: pd.DataFrame,
+    *,
+    config: ScreeningConfig,
+    cost_model: AshareCostModel,
+) -> tuple[float, tuple[str, ...]]:
+    price_column = next(
+        (column for column in ("price", "close", "adj_close") if column in selected),
+        None,
+    )
+    quantity_column = next(
+        (column for column in ("quantity", "shares", "position_size") if column in selected),
+        None,
+    )
+    if price_column is None:
+        selected["_cost_rate"] = float(config.round_trip_cost)
+        return float(config.round_trip_cost), ("missing_price_for_cost",)
+    rates: list[float] = []
+    fallback_used = False
+    for _, row in selected.iterrows():
+        price = pd.to_numeric(pd.Series([row[price_column]]), errors="coerce").iloc[0]
+        quantity = row[quantity_column] if quantity_column is not None else cost_model.lot_size
+        quantity = pd.to_numeric(pd.Series([quantity]), errors="coerce").iloc[0]
+        if (
+            not pd.notna(price)
+            or not pd.notna(quantity)
+            or float(price) <= 0
+            or float(quantity) <= 0
+        ):
+            rates.append(float(config.round_trip_cost))
+            fallback_used = True
+            continue
+        quantity = max(cost_model.lot_size, cost_model.fillable_quantity(float(quantity)))
+        buy = cost_model.estimate(side="BUY", price=float(price), quantity=quantity).total
+        sell = cost_model.estimate(side="SELL", price=float(price), quantity=quantity).total
+        rates.append(max(float(config.round_trip_cost), (buy + sell) / (float(price) * quantity)))
+    selected["_cost_rate"] = rates
+    return float(np.mean(rates)), (("invalid_price_or_quantity_for_cost",) if fallback_used else ())
 
 
 def _score_summary(frame: pd.DataFrame, scores: pd.Series, top_k: int) -> float:
@@ -760,7 +816,11 @@ def _score_summary(frame: pd.DataFrame, scores: pd.Series, top_k: int) -> float:
     ranked = frame.copy()
     ranked["_score"] = scores.to_numpy()
     return float(
-        ranked.sort_values(["_session_date", "_score"], ascending=[True, False])
+        ranked.sort_values(
+            ["_session_date", "_score", "symbol"],
+            ascending=[True, False, True],
+            kind="stable",
+        )
         .groupby("_session_date", sort=True, group_keys=False)
         .head(max(1, top_k))["_label"]
         .mean()
@@ -888,8 +948,9 @@ def _blocked_trial(
     flags: tuple[str, ...],
 ) -> ScreeningTrial:
     return ScreeningTrial(
-        candidate_id=candidate.candidate_id,
-        model_family=candidate.model_family,
+            candidate_id=candidate.candidate_id,
+            model_family=candidate.model_family,
+            canonical_parameters=candidate.canonical_parameters(),
         random_seed=seed,
         status="ENGINEERING_BLOCKED",
         governance_state="ENGINEERING_BLOCKED",
@@ -897,7 +958,7 @@ def _blocked_trial(
         validation_score=float("nan"),
         fold_metrics=(),
         leakage_flags=tuple(sorted(set(flags))),
-        reproducible=True,
+        reproducible="reproducibility_failure" not in flags,
         pbo=float("nan"),
         deflated_sharpe=float("nan"),
         cpcv={"paths": 0, "splits": 0, "status": "ENGINEERING_BLOCKED"},
@@ -906,8 +967,9 @@ def _blocked_trial(
 
 def _trial_dict(trial: ScreeningTrial) -> dict[str, Any]:
     return {
-        "candidate_id": trial.candidate_id,
-        "model_family": trial.model_family,
+            "candidate_id": trial.candidate_id,
+            "model_family": trial.model_family,
+            "canonical_parameters": _json_safe(trial.canonical_parameters),
         "random_seed": trial.random_seed,
         "status": trial.status,
         "governance_state": trial.governance_state,
@@ -938,6 +1000,8 @@ def _as_date(value: Any) -> date:
 
 def _safe_error_code(exc: BaseException) -> str:
     text = str(exc).lower()
+    if "reproducibility" in text:
+        return "reproducibility_failure"
     if "future" in text:
         return "future_feature"
     if "missing" in text:

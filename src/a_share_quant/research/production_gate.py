@@ -106,7 +106,10 @@ class ProductionResearchGate:
             evidence.oos_excess_returns
         )
         checks = {
-            "historical_data": evidence.data_mode in {"historical", "paper"},
+            # Historical screens are engineering diagnostics only.  They must
+            # never satisfy a production promotion gate; only prospective
+            # paper evidence may proceed here.
+            "historical_data": evidence.data_mode == "paper",
             "walk_forward": evidence.walk_forward_windows >= self.minimum_walk_forward_windows,
             "oos_edge": positive_fraction >= self.minimum_positive_window_fraction
             and median(evidence.oos_excess_returns) > 0,

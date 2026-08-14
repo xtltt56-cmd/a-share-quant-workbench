@@ -202,3 +202,40 @@ def test_all_realized_label_columns_are_excluded_from_implicit_features():
         ChangedSnapshot(), [HistoricalCandidate("valid", model_family="rule-baseline")]
     )
     assert result.trials[0].status in {"ENGINEERING_SCREENED", "ENGINEERING_BLOCKED"}
+
+
+def test_cost_uses_actual_price_and_lot_costs():
+    snapshot = _snapshot()
+    changed_features = snapshot.features.assign(price=100.0, quantity=100)
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = snapshot.labels
+        features = changed_features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("priced", score_column="price")]
+    )
+    costs = [metric.estimated_cost for metric in result.trials[0].fold_metrics]
+    assert costs
+    # At a 100 yuan price the minimum commission must not be diluted by
+    # pretending that every selected name costs the same 10 yuan.
+    assert all(cost > 0.0012 for cost in costs)
+
+
+def test_nondeterministic_custom_scorer_is_blocked_and_not_reproducible():
+    state = {"value": 0}
+
+    def unstable(frame):
+        state["value"] += 1
+        return [state["value"]] * len(frame)
+
+    result = HistoricalEngineeringScreen().run(
+        _snapshot(), [HistoricalCandidate("unstable", scorer=unstable)]
+    )
+    trial = result.trials[0]
+    assert trial.status == "ENGINEERING_BLOCKED"
+    assert trial.reproducible is False
+    assert "reproducibility_failure" in trial.leakage_flags
+    assert trial.canonical_parameters == {}
