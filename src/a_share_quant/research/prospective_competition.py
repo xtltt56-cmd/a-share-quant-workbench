@@ -134,7 +134,7 @@ class ProspectivePrediction:
     evidence_mode: str = "PROSPECTIVE"
     maturity_date: date | None = None
     prediction_id: str = ""
-    maturity_explicit: bool = dataclass_field(default=False, init=False, repr=False, compare=False)
+    maturity_explicit: bool = dataclass_field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for field in (
@@ -209,6 +209,7 @@ class ProspectivePrediction:
             "guidance_price_bands": self.guidance_price_bands,
             "evidence_mode": self.evidence_mode,
             "maturity_date": self.maturity_date,
+            "maturity_explicit": self.maturity_explicit,
         }
 
     def _computed_id(self) -> str:
@@ -235,15 +236,19 @@ class ProspectivePrediction:
             "guidance_price_bands": dict(self.guidance_price_bands),
             "evidence_mode": self.evidence_mode,
             "maturity_date": self.maturity_date.isoformat(),
+            "maturity_explicit": self.maturity_explicit,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ProspectivePrediction:
         payload = dict(value)
+        explicit = bool(payload.pop("maturity_explicit", False))
         payload["prediction_at"] = datetime.fromisoformat(str(payload["prediction_at"]))
         payload["as_of"] = date.fromisoformat(str(payload["as_of"]))
         payload["maturity_date"] = date.fromisoformat(str(payload["maturity_date"]))
-        return cls(**payload)
+        prediction = cls(**payload)
+        object.__setattr__(prediction, "maturity_explicit", explicit)
+        return prediction
 
 
 @dataclass(frozen=True)

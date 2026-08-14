@@ -449,3 +449,15 @@ def test_preconstructed_explicit_maturity_requires_calendar(tmp_path: Path) -> N
     )
     with pytest.raises(ValueError, match="calendar"):
         competition.append_prediction(prediction)
+
+
+def test_automatic_maturity_remains_non_explicit_after_restart(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    first = ProspectiveCompetition(store=ProspectiveLedgerStore(path), now=NOW)
+    prediction = _prediction(first)
+    assert prediction.maturity_explicit is False
+    restored_store = ProspectiveLedgerStore(path)
+    restored = restored_store.read(prediction.id)
+    assert restored.maturity_explicit is False
+    restored_competition = ProspectiveCompetition(store=restored_store, now=NOW)
+    assert restored_competition.append_prediction(restored) == restored
