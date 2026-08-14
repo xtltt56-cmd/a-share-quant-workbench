@@ -92,6 +92,7 @@ def _fake_baostock(
     omit_status: bool = False,
     state_conflict: bool = False,
     duplicate_execution_date: bool = False,
+    shuffle_research_rows: bool = False,
     history_error: bool = False,
 ) -> types.SimpleNamespace:
     module = types.SimpleNamespace()
@@ -144,6 +145,8 @@ def _fake_baostock(
             )
             if state_conflict and not omit_status:
                 rows[1][-2:] = ["1", "0"]
+            if shuffle_research_rows:
+                rows[:] = [rows[2], rows[0], rows[1]]
         else:
             row_fields, rows = _history_rows(omit_status=omit_status)
             if duplicate_execution_date:
@@ -217,6 +220,7 @@ def test_research_history_marks_missing_adjusted_date_unusable(
     assert len(history) == 3
     assert not bool(history.loc[1, "research_usable"])
     assert "missing" in history.loc[1, "unusable_reason"]
+    assert history["research_return"].isna().all()
 
 
 def test_research_history_marks_duplicate_or_non_numeric_adjusted_rows_unusable(
@@ -229,6 +233,7 @@ def test_research_history_marks_duplicate_or_non_numeric_adjusted_rows_unusable(
     )
     assert duplicate["research_usable"].eq(False).all()
     assert duplicate["unusable_reason"].str.contains("duplicate").all()
+    assert duplicate["research_return"].isna().all()
 
     non_numeric_fake = _fake_baostock(non_numeric_research_close=True)
     monkeypatch.setitem(sys.modules, "baostock", non_numeric_fake)
@@ -273,6 +278,20 @@ def test_research_history_marks_status_conflicts_and_duplicate_execution_dates(
     )
     assert duplicate["research_usable"].eq(False).all()
     assert duplicate["unusable_reason"].str.contains("duplicate execution").all()
+
+
+def test_research_history_aligns_adjusted_close_by_date_when_sdk_rows_are_shuffled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_baostock(shuffle_research_rows=True)
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    history = BaoStockDataProvider().get_research_history(
+        "600001", "2020-01-02", "2020-01-06"
+    )
+
+    assert history["research_return"].iloc[1] == pytest.approx(-0.2)
+    assert history["research_return"].iloc[2] == pytest.approx(0.5)
 
 
 def test_research_history_logs_in_once_for_multiple_requests(

@@ -300,13 +300,13 @@ class BaoStockDataProvider:
                 "_is_st_valid",
             ]
         ].copy()
-        adjusted_work = adjusted_work.sort_values("date", kind="stable").reset_index(drop=True)
         if "close" in adjusted_raw.columns:
             adjusted_work["adjusted_close"] = pd.to_numeric(
                 adjusted_raw["close"], errors="coerce"
             ).to_numpy()
         else:
             adjusted_work["adjusted_close"] = float("nan")
+        adjusted_work = adjusted_work.sort_values("date", kind="stable").reset_index(drop=True)
         adjusted_work["previous_close"] = adjusted_work["adjusted_close"].shift(1)
         adjusted_work["research_return"] = (
             adjusted_work["adjusted_close"] / adjusted_work["previous_close"] - 1
@@ -319,7 +319,10 @@ class BaoStockDataProvider:
         )
         adjusted_date_set = set(adjusted_work["date"])
         execution_date_set = set(execution["date"])
-        if adjusted_date_set != execution_date_set:
+        adjusted_axis_complete = (
+            not adjusted_duplicate.any() and adjusted_date_set == execution_date_set
+        )
+        if not adjusted_axis_complete:
             for index in execution.index:
                 reasons[index].append("research date axis mismatch")
 
@@ -357,6 +360,9 @@ class BaoStockDataProvider:
             ):
                 reasons[index].append("invalid history status")
                 execution.at[index, "tradable"] = False
+
+        if not adjusted_axis_complete:
+            execution["research_return"] = float("nan")
 
         for index, row_reasons in reasons.items():
             if row_reasons:
