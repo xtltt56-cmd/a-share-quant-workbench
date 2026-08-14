@@ -26,6 +26,7 @@ def _snapshot(session_count: int = 1750):
                     "date": current,
                     "available_at": current,
                     "feature_momentum": float((session_index + symbol_index) % 11) / 11,
+                    "price": 10.0,
                 }
             )
             label_rows.append(
@@ -33,6 +34,7 @@ def _snapshot(session_count: int = 1750):
                     "symbol": symbol,
                     "date": current,
                     "forward_excess_return_5": 0.01 if symbol_index == 0 else -0.002,
+                    "horizon_days": 5,
                 }
             )
 
@@ -239,3 +241,53 @@ def test_nondeterministic_custom_scorer_is_blocked_and_not_reproducible():
     assert trial.reproducible is False
     assert "reproducibility_failure" in trial.leakage_flags
     assert trial.canonical_parameters == {}
+
+
+def test_missing_unadjusted_price_blocks_candidate():
+    snapshot = _snapshot()
+    changed_features = snapshot.features.drop(columns=["price"])
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = snapshot.labels
+        features = changed_features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("no-price")]
+    )
+    trial = result.trials[0]
+    assert trial.status == "ENGINEERING_BLOCKED"
+    assert "cost_data_unavailable" in trial.leakage_flags
+
+
+def test_adjusted_close_is_not_used_as_execution_cost_price():
+    snapshot = _snapshot()
+    changed_features = snapshot.features.drop(columns=["price"]).assign(adj_close=10.0)
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = snapshot.labels
+        features = changed_features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("adjusted-only")]
+    )
+    assert "cost_data_unavailable" in result.trials[0].leakage_flags
+
+
+def test_unknown_label_maturity_blocks_training_boundary():
+    snapshot = _snapshot()
+    changed_labels = snapshot.labels.drop(columns=["horizon_days"])
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("unknown-maturity")]
+    )
+    assert "missing_input" in result.trials[0].leakage_flags

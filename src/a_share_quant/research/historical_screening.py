@@ -376,6 +376,7 @@ class HistoricalEngineeringScreen:
                         fold.train_start, fold.train_end, inclusive="both"
                     )
                 ].copy()
+                train = _mature_training_labels(train, fold.train_end)
                 validation = merged.loc[
                     merged["_session_date"].between(
                         fold.validation_start, fold.validation_end, inclusive="both"
@@ -599,6 +600,26 @@ def _prepare_inputs(
         label_frame["_session_date"] = pd.to_datetime(
             label_frame[label_date], errors="coerce"
         ).dt.date
+        maturity_column = next(
+            (
+                name
+                for name in ("label_available_at", "maturity_date")
+                if name in label_frame.columns
+            ),
+            None,
+        )
+        if maturity_column is not None:
+            label_frame["_maturity_date"] = pd.to_datetime(
+                label_frame[maturity_column], errors="coerce"
+            ).dt.date
+        elif "horizon_days" in label_frame.columns:
+            horizon = pd.to_numeric(label_frame["horizon_days"], errors="coerce")
+            session = pd.to_datetime(label_frame["_session_date"])
+            label_frame["_maturity_date"] = (
+                session + pd.to_timedelta(horizon, unit="D")
+            ).dt.date
+        else:
+            label_frame["_maturity_date"] = None
         label_column = next((name for name in _LABEL_COLUMNS if name in label_frame.columns), None)
         if label_column is None:
             raise ValueError("labels requires a forward return label")
@@ -615,11 +636,20 @@ def _merge_features_labels(
     left = features[["symbol", "_session_date", *feature_columns]].copy()
     if labels.empty:
         return pd.DataFrame()
-    right = labels[["symbol", "_session_date", "_label"]].copy()
+    right = labels[["symbol", "_session_date", "_label", "_maturity_date"]].copy()
     merged = left.merge(right, on=["symbol", "_session_date"], how="inner", validate="one_to_one")
     merged["_label"] = pd.to_numeric(merged["_label"], errors="coerce")
     merged = merged.loc[np.isfinite(merged["_label"])].copy()
     return merged.sort_values(["_session_date", "symbol"], kind="stable").reset_index(drop=True)
+
+
+def _mature_training_labels(frame: pd.DataFrame, train_end: date) -> pd.DataFrame:
+    """Keep only outcomes known by the end of the training window."""
+
+    maturity = pd.to_datetime(frame["_maturity_date"], errors="coerce").dt.date
+    if maturity.isna().any():
+        raise ValueError("unknown label maturity at training boundary")
+    return frame.loc[maturity.le(train_end)].copy()
 
 
 def _feature_columns(frame: pd.DataFrame, candidate: HistoricalCandidate) -> list[str]:
@@ -777,18 +807,15 @@ def _selected_cost_rate(
     cost_model: AshareCostModel,
 ) -> tuple[float, tuple[str, ...]]:
     price_column = next(
-        (column for column in ("price", "close", "adj_close") if column in selected),
-        None,
+        (column for column in ("price", "close") if column in selected), None
     )
     quantity_column = next(
         (column for column in ("quantity", "shares", "position_size") if column in selected),
         None,
     )
     if price_column is None:
-        selected["_cost_rate"] = float(config.round_trip_cost)
-        return float(config.round_trip_cost), ("missing_price_for_cost",)
+        raise ValueError("cost data unavailable: missing unadjusted price or close")
     rates: list[float] = []
-    fallback_used = False
     for _, row in selected.iterrows():
         price = pd.to_numeric(pd.Series([row[price_column]]), errors="coerce").iloc[0]
         quantity = row[quantity_column] if quantity_column is not None else cost_model.lot_size
@@ -799,15 +826,13 @@ def _selected_cost_rate(
             or float(price) <= 0
             or float(quantity) <= 0
         ):
-            rates.append(float(config.round_trip_cost))
-            fallback_used = True
-            continue
+            raise ValueError("cost data unavailable: invalid unadjusted price or quantity")
         quantity = max(cost_model.lot_size, cost_model.fillable_quantity(float(quantity)))
         buy = cost_model.estimate(side="BUY", price=float(price), quantity=quantity).total
         sell = cost_model.estimate(side="SELL", price=float(price), quantity=quantity).total
         rates.append(max(float(config.round_trip_cost), (buy + sell) / (float(price) * quantity)))
     selected["_cost_rate"] = rates
-    return float(np.mean(rates)), (("invalid_price_or_quantity_for_cost",) if fallback_used else ())
+    return float(np.mean(rates)), ()
 
 
 def _score_summary(frame: pd.DataFrame, scores: pd.Series, top_k: int) -> float:
@@ -1002,6 +1027,10 @@ def _safe_error_code(exc: BaseException) -> str:
     text = str(exc).lower()
     if "reproducibility" in text:
         return "reproducibility_failure"
+    if "cost data unavailable" in text:
+        return "cost_data_unavailable"
+    if "unknown label maturity" in text:
+        return "missing_input"
     if "future" in text:
         return "future_feature"
     if "missing" in text:
