@@ -5,12 +5,12 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
 def _require_utc(value: datetime, field_name: str) -> None:
-    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+    if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
         raise ValueError(f"{field_name} must be an aware UTC datetime")
 
 

@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,14 @@ class CleanupReport:
     removed: tuple[Path, ...]
     dry_run: bool
     rejected: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ExpectedOwnedFile:
+    size_bytes: int
+    sha256: str
+    device: int
+    inode: int
 
 
 _KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -145,17 +153,17 @@ class ResearchDataStore:
                 self.blob_directory / f".research-stage-{uuid4().hex}.parquet"
             )
             stage_marker = self._create_owned_marker("stage", stage)
+            stage_expected: _ExpectedOwnedFile | None = None
             blob_marker: Path | None = None
             manifest_published = False
             try:
                 self.policy.revalidate(stage)
                 self._parquet_writer(frame, stage)
+                stage_expected = self._capture_expected_owned_file(stage)
                 self.policy.revalidate(stage)
                 self._file_fsync(stage)
-                self.policy.revalidate(stage)
-                size_bytes = stage.stat().st_size
-                self.policy.revalidate(stage)
-                digest = self._sha256(stage)
+                size_bytes = stage_expected.size_bytes
+                digest = stage_expected.sha256
                 self._seal_owned_marker(stage_marker, stage)
                 self.policy.revalidate(stage)
                 parquet_file = pq.ParquetFile(stage)
@@ -180,7 +188,7 @@ class ResearchDataStore:
                         "同一逻辑 dataset/key/data_version 不能指向不同内容"
                     )
 
-                created_at = datetime.now(UTC)
+                created_at = datetime.now(timezone.utc)
                 record_id = hashlib.sha256(
                     f"{dataset_value}\0{key}\0{data_version}\0{digest}".encode()
                 ).hexdigest()
@@ -225,7 +233,7 @@ class ResearchDataStore:
                 manifest_published = True
                 return self._artifact_from_record(record)
             finally:
-                self._safe_unlink_stage(stage, stage_marker)
+                self._safe_unlink_stage(stage, stage_marker, expected=stage_expected)
                 if manifest_published and blob_marker is not None:
                     self._safe_retire_owned_marker(blob_marker, "orphan_blob")
 
@@ -251,21 +259,28 @@ class ResearchDataStore:
                 expected = self.policy.authorize(self.blob_directory / f"{artifact.sha256}.parquet")
                 if artifact.path != expected:
                     return False
-                matching = any(
-                    record["dataset"] == dataset_value
-                    and record["key"] == artifact.key
-                    and record["data_version"] == artifact.data_version
-                    and record["sha256"] == artifact.sha256
-                    for record in records
+                matching = next(
+                    (
+                        record
+                        for record in records
+                        if record["dataset"] == dataset_value
+                        and record["key"] == artifact.key
+                        and record["data_version"] == artifact.data_version
+                        and record["sha256"] == artifact.sha256
+                    ),
+                    None,
                 )
-                if not matching:
+                if matching is None:
+                    return False
+                manifest_artifact = self._artifact_from_record(matching)
+                if manifest_artifact != artifact:
                     return False
                 self._validate_blob(
-                    artifact.path,
-                    artifact.sha256,
-                    artifact.size_bytes,
-                    artifact.row_count,
-                    artifact.schema_fingerprint,
+                    manifest_artifact.path,
+                    manifest_artifact.sha256,
+                    manifest_artifact.size_bytes,
+                    manifest_artifact.row_count,
+                    manifest_artifact.schema_fingerprint,
                 )
                 return True
         except (OSError, StorageBoundaryError, ManifestIntegrityError, ValueError):
@@ -383,6 +398,49 @@ class ResearchDataStore:
         ):
             raise ManifestIntegrityError(
                 "owned cleanup target hash or size no longer matches sealed marker"
+            )
+
+    def _capture_expected_owned_file(self, target: Path) -> _ExpectedOwnedFile:
+        """Bind the current operation to a just-closed ordinary file."""
+
+        self.policy.revalidate(target)
+        if not target.is_file():
+            raise ManifestIntegrityError("current ownership target is not a regular file")
+        self.policy.revalidate(target)
+        before = target.stat()
+        self.policy.revalidate(target)
+        sha256 = self._sha256(target)
+        self.policy.revalidate(target)
+        after = target.stat()
+        identity_before = (before.st_dev, before.st_ino, before.st_size)
+        identity_after = (after.st_dev, after.st_ino, after.st_size)
+        if identity_before != identity_after:
+            raise ManifestIntegrityError("current ownership target changed during capture")
+        return _ExpectedOwnedFile(
+            size_bytes=after.st_size,
+            sha256=sha256,
+            device=after.st_dev,
+            inode=after.st_ino,
+        )
+
+    def _validate_expected_owned_file(
+        self, target: Path, expected: _ExpectedOwnedFile
+    ) -> None:
+        self.policy.revalidate(target)
+        if not target.is_file():
+            raise ManifestIntegrityError("current ownership target is not a regular file")
+        self.policy.revalidate(target)
+        metadata = target.stat()
+        self.policy.revalidate(target)
+        sha256 = self._sha256(target)
+        if (
+            metadata.st_size != expected.size_bytes
+            or metadata.st_dev != expected.device
+            or metadata.st_ino != expected.inode
+            or sha256 != expected.sha256
+        ):
+            raise ManifestIntegrityError(
+                "current ownership target no longer matches operation expectation"
             )
 
     def _prepare_owned_directories(self) -> None:
@@ -583,7 +641,7 @@ class ResearchDataStore:
             created_at = datetime.fromisoformat(record["created_at"].replace("Z", "+00:00"))
         except (AttributeError, ValueError) as exc:
             raise ManifestIntegrityError("manifest created_at 无效") from exc
-        if created_at.utcoffset() != UTC.utcoffset(created_at):
+        if created_at.utcoffset() != timezone.utc.utcoffset(created_at):
             raise ManifestIntegrityError("manifest created_at 必须是 UTC")
         expected_id = hashlib.sha256(
             f"{record['dataset']}\0{record['key']}\0{record['data_version']}\0{record['sha256']}".encode()
@@ -660,7 +718,7 @@ class ResearchDataStore:
             self.ownership_directory / f".marker-{marker_id}.tmp"
         )
         ownership: dict[str, Any] = {
-            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "digest": digest,
             "kind": kind,
             "marker_id": marker_id,
@@ -764,7 +822,7 @@ class ResearchDataStore:
             )
         except (AttributeError, ValueError) as exc:
             raise ManifestIntegrityError("ownership marker created_at is invalid") from exc
-        if created_at.utcoffset() != UTC.utcoffset(created_at):
+        if created_at.utcoffset() != timezone.utc.utcoffset(created_at):
             raise ManifestIntegrityError("ownership marker created_at must be UTC")
         return ownership
 
@@ -862,16 +920,24 @@ class ResearchDataStore:
             previous = self.manifest_path.read_bytes()
         rollback: Path | None = None
         rollback_marker: Path | None = None
+        temp_expected: _ExpectedOwnedFile | None = None
+        rollback_expected: _ExpectedOwnedFile | None = None
         try:
             if previous_exists:
                 rollback = self.policy.authorize(
                     self.root_directory / f".manifest-{uuid4().hex}.tmp"
                 )
                 rollback_marker = self._create_owned_marker("manifest_temp", rollback)
-                self._write_fsynced_file(rollback, previous, self._manifest_fsync)
+                self._write_closed_file(rollback, previous)
+                rollback_expected = self._capture_expected_owned_file(rollback)
+                self.policy.revalidate(rollback)
+                self._manifest_fsync(rollback)
                 self._seal_owned_marker(rollback_marker, rollback)
             self.policy.revalidate(temp)
-            self._write_fsynced_file(temp, payload, self._manifest_fsync)
+            self._write_closed_file(temp, payload)
+            temp_expected = self._capture_expected_owned_file(temp)
+            self.policy.revalidate(temp)
+            self._manifest_fsync(temp)
             self._seal_owned_marker(marker, temp)
             if self._tree_size(self.root_directory) > self.maximum_research_data_bytes:
                 raise StorageQuotaError("研究数据总量超过配额")
@@ -886,21 +952,19 @@ class ResearchDataStore:
                 self._restore_manifest(previous_exists, rollback)
                 raise
         finally:
-            self._safe_unlink_manifest_temp(temp, marker)
+            self._safe_unlink_manifest_temp(temp, marker, expected=temp_expected)
             if rollback is not None:
                 if rollback_marker is None:
                     raise ManifestIntegrityError("manifest rollback marker is missing")
-                self._safe_unlink_manifest_temp(rollback, rollback_marker)
+                self._safe_unlink_manifest_temp(
+                    rollback, rollback_marker, expected=rollback_expected
+                )
 
-    def _write_fsynced_file(
-        self, path: Path, payload: bytes, fsync: Callable[[Path], None]
-    ) -> None:
+    def _write_closed_file(self, path: Path, payload: bytes) -> None:
         self.policy.revalidate(path)
         with path.open("xb") as handle:
             handle.write(payload)
             handle.flush()
-        self.policy.revalidate(path)
-        fsync(path)
 
     def _restore_manifest(self, previous_exists: bool, rollback: Path | None) -> None:
         if not previous_exists:
@@ -963,13 +1027,36 @@ class ResearchDataStore:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def _safe_unlink_stage(self, path: Path, marker: Path) -> bool:
-        return self._safe_unlink_owned_file(path, marker, "stage")
+    def _safe_unlink_stage(
+        self,
+        path: Path,
+        marker: Path,
+        *,
+        expected: _ExpectedOwnedFile | None = None,
+    ) -> bool:
+        return self._safe_unlink_owned_file(
+            path, marker, "stage", expected=expected
+        )
 
-    def _safe_unlink_manifest_temp(self, path: Path, marker: Path) -> bool:
-        return self._safe_unlink_owned_file(path, marker, "manifest_temp")
+    def _safe_unlink_manifest_temp(
+        self,
+        path: Path,
+        marker: Path,
+        *,
+        expected: _ExpectedOwnedFile | None = None,
+    ) -> bool:
+        return self._safe_unlink_owned_file(
+            path, marker, "manifest_temp", expected=expected
+        )
 
-    def _safe_unlink_owned_file(self, path: Path, marker: Path, kind: str) -> bool:
+    def _safe_unlink_owned_file(
+        self,
+        path: Path,
+        marker: Path,
+        kind: str,
+        *,
+        expected: _ExpectedOwnedFile | None = None,
+    ) -> bool:
         """Conditionally delete a sealed target; retain both on any mismatch.
 
         The second content check is deliberately adjacent to unlink. Standard
@@ -978,7 +1065,7 @@ class ResearchDataStore:
 
         try:
             ownership = self._read_owned_marker(marker)
-            if ownership["state"] != "sealed" or ownership["kind"] != kind:
+            if ownership["kind"] != kind:
                 return False
             if self._owned_marker_target(ownership) != path:
                 return False
@@ -986,9 +1073,16 @@ class ResearchDataStore:
             if not path.exists():
                 self._remove_owned_marker(marker)
                 return True
-            self._validate_owned_target(ownership, path)
-            self.policy.revalidate(path)
-            self._validate_owned_target(ownership, path)
+            if ownership["state"] == "sealed":
+                self._validate_owned_target(ownership, path)
+                self.policy.revalidate(path)
+                self._validate_owned_target(ownership, path)
+            elif ownership["state"] == "allocated" and expected is not None:
+                self._validate_expected_owned_file(path, expected)
+                self.policy.revalidate(path)
+                self._validate_expected_owned_file(path, expected)
+            else:
+                return False
             self.policy.revalidate(path)
             path.unlink(missing_ok=True)
             self._remove_owned_marker(marker)

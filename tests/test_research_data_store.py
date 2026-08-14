@@ -206,6 +206,56 @@ def test_finally_does_not_delete_stage_replaced_after_seal(research_temp: Path) 
     )
 
 
+def test_stage_fsync_failure_cleans_current_owned_unsealed_file(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    old = store.replace_dataset("research_returns", "000001", frame(1), "v1")
+    original_fsync = store._file_fsync
+
+    def fail_only_stage(path: Path) -> None:
+        if path.name.startswith(".research-stage-"):
+            raise OSError("stage fsync failed")
+        original_fsync(path)
+
+    store._file_fsync = fail_only_stage
+    with pytest.raises(OSError, match="stage fsync failed"):
+        store.replace_dataset("research_returns", "000001", frame(20), "v2")
+
+    store._file_fsync = original_fsync
+    assert store.active_artifact("research_returns", "000001") == old
+    assert not list(store.blob_directory.glob(".research-stage-*.parquet"))
+    assert not any(
+        store._read_owned_marker(marker)["kind"] == "stage"
+        for marker in store.ownership_directory.glob("*.owned.json")
+    )
+
+
+def test_stage_fsync_failure_retains_file_replaced_after_expected_capture(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    original_fsync = store._file_fsync
+
+    def replace_stage_then_fail(path: Path) -> None:
+        if path.name.startswith(".research-stage-"):
+            path.write_bytes(b"foreign-after-expected-capture")
+            raise OSError("stage fsync failed")
+        original_fsync(path)
+
+    store._file_fsync = replace_stage_then_fail
+    with pytest.raises(OSError, match="stage fsync failed"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    stages = list(store.blob_directory.glob(".research-stage-*.parquet"))
+    assert len(stages) == 1
+    assert stages[0].read_bytes() == b"foreign-after-expected-capture"
+    assert any(
+        store._read_owned_marker(marker)["kind"] == "stage"
+        for marker in store.ownership_directory.glob("*.owned.json")
+    )
+
+
 def test_finally_does_not_delete_manifest_temp_replaced_after_seal(
     research_temp: Path,
 ) -> None:
@@ -228,6 +278,57 @@ def test_finally_does_not_delete_manifest_temp_replaced_after_seal(
         store._read_owned_marker(marker)["relative_path"]
         == replaced_temp.relative_to(store.root_directory).as_posix()
         for marker in markers
+    )
+
+
+def test_manifest_fsync_failure_cleans_current_owned_unsealed_temp(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    old = store.replace_dataset("research_returns", "000001", frame(1), "v1")
+    original_fsync = store._manifest_fsync
+    fsync_calls = 0
+
+    def fail_new_manifest_temp(path: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("manifest fsync failed")
+        original_fsync(path)
+
+    store._manifest_fsync = fail_new_manifest_temp
+    with pytest.raises(OSError, match="manifest fsync failed"):
+        store.replace_dataset("research_returns", "000001", frame(20), "v2")
+
+    store._manifest_fsync = original_fsync
+    assert fsync_calls == 2
+    assert store.active_artifact("research_returns", "000001") == old
+    assert not list(store.root_directory.glob(".manifest-*.tmp"))
+    assert not any(
+        store._read_owned_marker(marker)["kind"] == "manifest_temp"
+        for marker in store.ownership_directory.glob("*.owned.json")
+    )
+
+
+def test_manifest_fsync_failure_retains_temp_replaced_after_expected_capture(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+
+    def replace_manifest_then_fail(path: Path) -> None:
+        path.write_bytes(b"foreign-after-expected-capture")
+        raise OSError("manifest fsync failed")
+
+    store._manifest_fsync = replace_manifest_then_fail
+    with pytest.raises(OSError, match="manifest fsync failed"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    temps = list(store.root_directory.glob(".manifest-*.tmp"))
+    assert len(temps) == 1
+    assert temps[0].read_bytes() == b"foreign-after-expected-capture"
+    assert any(
+        store._read_owned_marker(marker)["kind"] == "manifest_temp"
+        for marker in store.ownership_directory.glob("*.owned.json")
     )
 
 
@@ -549,6 +650,30 @@ def test_manifest_created_at_wrong_type_is_integrity_error(research_temp: Path) 
 
     with pytest.raises(ManifestIntegrityError, match="created_at"):
         store.active_artifact("research_returns", "000001")
+
+
+def test_verify_rejects_manifest_metadata_rewrite_even_when_record_is_resigned(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    artifact = store.replace_dataset("research_returns", "000001", frame(), "v1")
+    record = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    record["created_at"] = "2020-01-01T00:00:00Z"
+    record["record_sha256"] = store._canonical_record_sha256(record)
+    store.manifest_path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    assert not store.verify(artifact)
+
+
+def test_new_research_modules_avoid_python_311_datetime_utc_import() -> None:
+    for relative in (
+        "src/a_share_quant/research/history_contracts.py",
+        "src/a_share_quant/storage/research_data_store.py",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "from datetime import UTC" not in source
 
 
 def test_blob_parquet_metadata_must_match_manifest(research_temp: Path) -> None:
