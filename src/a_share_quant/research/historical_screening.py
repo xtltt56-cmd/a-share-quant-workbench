@@ -45,7 +45,13 @@ _REALIZED_LABEL_COLUMNS = frozenset(
         "forward_return",
     }
 )
-_DATE_COLUMNS = ("date", "signal_date", "available_at")
+_DATE_COLUMNS = (
+    "trading_date",
+    "session_date",
+    "date",
+    "signal_date",
+    "available_at",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +345,8 @@ class HistoricalEngineeringScreen:
         base_leakage: tuple[str, ...],
     ) -> ScreeningTrial:
         family = candidate.model_family
+        if base_leakage:
+            return _blocked_trial(candidate, seed, base_leakage)
         if family in {"lightgbm", "qlib", "qlib-double-ensemble"} and not _optional_available(
             family
         ):
@@ -359,8 +367,6 @@ class HistoricalEngineeringScreen:
                 cpcv={"paths": 0, "splits": 0, "status": "UNAVAILABLE_DEPENDENCY"},
             )
 
-        if base_leakage:
-            return _blocked_trial(candidate, seed, base_leakage)
         fold_metrics: list[WindowMetrics] = []
         validation_scores: list[float] = []
         trial_flags: list[str] = []
@@ -609,9 +615,8 @@ def _prepare_inputs(
             None,
         )
         label_frame["_maturity_error"] = False
-        session_dates = sorted(
-            prepared["_session_date"].dropna().unique().tolist()
-        )
+        session_dates = sorted(prepared["_session_date"].dropna().unique().tolist())
+        session_index = {value: index for index, value in enumerate(session_dates)}
         if maturity_column is not None:
             label_frame["_maturity_date"] = pd.to_datetime(
                 label_frame[maturity_column], errors="coerce"
@@ -632,8 +637,8 @@ def _prepare_inputs(
                     and int(raw_horizon) in {5, 10, 20}
                 )
                 try:
-                    date_index = session_dates.index(row["_session_date"])
-                except ValueError:
+                    date_index = session_index[row["_session_date"]]
+                except KeyError:
                     date_index = -1
                 maturity_index = date_index + int(raw_horizon) if valid_horizon else -1
                 if maturity_index < 0 or maturity_index >= len(session_dates):
@@ -645,6 +650,8 @@ def _prepare_inputs(
         else:
             label_frame["_maturity_date"] = None
             label_frame["_maturity_error"] = True
+        if label_frame["_maturity_error"].astype(bool).any():
+            leakage.append("invalid_label_maturity")
         label_column = next((name for name in _LABEL_COLUMNS if name in label_frame.columns), None)
         if label_column is None:
             raise ValueError("labels requires a forward return label")

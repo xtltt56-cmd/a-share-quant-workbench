@@ -9,12 +9,13 @@ from a_share_quant.research.historical_screening import (
     HistoricalCandidate,
     HistoricalEngineeringScreen,
     ScreeningConfig,
+    _prepare_inputs,
 )
 
 
 def _snapshot(session_count: int = 1750):
     start = date(2019, 1, 1)
-    sessions = [start + timedelta(days=index) for index in range(session_count)]
+    sessions = [start + timedelta(days=index) for index in range(session_count + 30)]
     feature_rows: list[dict[str, object]] = []
     label_rows: list[dict[str, object]] = []
     for session_index, current in enumerate(sessions):
@@ -29,14 +30,17 @@ def _snapshot(session_count: int = 1750):
                     "price": 10.0,
                 }
             )
-            label_rows.append(
-                {
-                    "symbol": symbol,
-                    "date": current,
-                    "forward_excess_return_5": 0.01 if symbol_index == 0 else -0.002,
-                    "horizon_days": 5,
-                }
-            )
+            if session_index < session_count:
+                label_rows.append(
+                    {
+                        "symbol": symbol,
+                        "date": current,
+                        "forward_excess_return_5": 0.01
+                        if symbol_index == 0
+                        else -0.002,
+                        "horizon_days": 5,
+                    }
+                )
 
     class Snapshot:
         canonical_sha256 = "a" * 64
@@ -290,7 +294,7 @@ def test_unknown_label_maturity_blocks_training_boundary():
     result = HistoricalEngineeringScreen().run(
         ChangedSnapshot(), [HistoricalCandidate("unknown-maturity")]
     )
-    assert "missing_input" in result.trials[0].leakage_flags
+    assert "invalid_label_maturity" in result.trials[0].leakage_flags
 
 
 def test_horizon_uses_sessions_not_calendar_days_at_weekend_boundary():
@@ -344,3 +348,41 @@ def test_maturity_date_must_be_strictly_after_label_date():
         ChangedSnapshot(), [HistoricalCandidate("same-day-maturity")]
     )
     assert result.trials[0].status == "ENGINEERING_BLOCKED"
+
+
+def test_horizon_skips_weekend_using_verified_session_sequence():
+    dates = [date(2023, 1, 6), date(2023, 1, 9), date(2023, 1, 10),
+             date(2023, 1, 11), date(2023, 1, 12), date(2023, 1, 13)]
+    features = pd.DataFrame(
+        [{"symbol": "000001", "date": value, "price": 10.0} for value in dates]
+    )
+    labels = pd.DataFrame(
+        [{"symbol": "000001", "date": dates[0], "horizon_days": 5,
+          "forward_return": 0.01}]
+    )
+    _, prepared_labels, leakage = _prepare_inputs(features, labels, dates[-1])
+
+    assert leakage == ()
+    assert prepared_labels.loc[0, "_maturity_date"] == dates[-1]
+
+
+def test_invalid_maturity_in_test_segment_blocks_before_window_execution():
+    snapshot = _snapshot()
+    changed_labels = snapshot.labels.copy()
+    changed_labels.loc[changed_labels.index[-1], "maturity_date"] = changed_labels.loc[
+        changed_labels.index[-1], "date"
+    ]
+    changed_labels = changed_labels.drop(columns=["horizon_days"])
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("test-invalid-maturity")]
+    )
+    assert result.status == "ENGINEERING_BLOCKED"
+    assert result.trials[0].status == "ENGINEERING_BLOCKED"
+    assert "invalid_label_maturity" in result.trials[0].leakage_flags
