@@ -435,3 +435,17 @@ def test_explicit_maturity_requires_calendar_and_storage_rejects_early_settlemen
     ledger.store.append_settlement(_valid_outcome(prediction))
     with pytest.raises(ValueError, match="settlement"):
         ledger.store.append_pending(_valid_outcome(prediction), "STALE")
+
+
+def test_preconstructed_explicit_maturity_requires_calendar(tmp_path: Path) -> None:
+    prediction = ProspectivePrediction(
+        model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+        symbol="600001", name="示例", prediction_at=datetime(2026, 8, 19, 8, tzinfo=UTC),
+        as_of=date(2026, 8, 19), horizon=5, score=0.1, probability=0.5,
+        guidance_price_bands=_bands(), maturity_date=date(2026, 8, 26),
+    )
+    competition = ProspectiveCompetition(
+        store=ProspectiveLedgerStore(tmp_path / "ledger.jsonl"), now=NOW
+    )
+    with pytest.raises(ValueError, match="calendar"):
+        competition.append_prediction(prediction)

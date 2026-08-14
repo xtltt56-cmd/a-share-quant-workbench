@@ -13,6 +13,7 @@ import json
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import date, datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Any
@@ -133,6 +134,7 @@ class ProspectivePrediction:
     evidence_mode: str = "PROSPECTIVE"
     maturity_date: date | None = None
     prediction_id: str = ""
+    maturity_explicit: bool = dataclass_field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for field in (
@@ -174,6 +176,7 @@ class ProspectivePrediction:
             raise ValueError("evidence_mode must be PROSPECTIVE")
         object.__setattr__(self, "evidence_mode", evidence_mode)
         raw_maturity = self.maturity_date
+        maturity_was_explicit = raw_maturity is not None
         if isinstance(raw_maturity, str):
             raw_maturity = date.fromisoformat(raw_maturity)
         maturity = (
@@ -186,6 +189,7 @@ class ProspectivePrediction:
         if prediction_at.date() >= maturity:
             raise ValueError("prediction_at must precede maturity_date")
         object.__setattr__(self, "maturity_date", maturity)
+        object.__setattr__(self, "maturity_explicit", maturity_was_explicit)
         provided_id = str(self.prediction_id).strip()
         object.__setattr__(self, "prediction_id", provided_id or self._computed_id())
 
@@ -420,13 +424,11 @@ class ProspectiveCompetition:
                 raw_timestamp = datetime.fromisoformat(raw_timestamp)
             if _utc(raw_timestamp, field="prediction_at") > self.now:
                 raise FutureTimestampError("prediction timestamp is in the future")
+        candidate = prediction if prediction is not None else ProspectivePrediction(**fields)
         if (
-            prediction is None
-            and fields.get("maturity_date") is not None
-            and self.session_calendar is None
+            self.session_calendar is None and candidate.maturity_explicit
         ):
             raise ValueError("explicit maturity_date requires a session calendar")
-        candidate = prediction if prediction is not None else ProspectivePrediction(**fields)
         if not isinstance(candidate, ProspectivePrediction):
             raise TypeError("prediction must be ProspectivePrediction")
         if candidate.prediction_at > self.now:

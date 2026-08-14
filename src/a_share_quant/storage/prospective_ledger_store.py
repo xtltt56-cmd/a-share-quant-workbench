@@ -216,6 +216,9 @@ class ProspectiveLedgerStore:
             raise LedgerIntegrityError("前瞻预测账本锁文件不可用") from exc
 
     def _load(self) -> None:
+        self._predictions.clear()
+        self._settlements.clear()
+        self._pending.clear()
         if self.policy is not None:
             self.policy.revalidate(self.path)
         if not self.path.exists():
@@ -296,6 +299,8 @@ class ProspectiveLedgerStore:
             ):
                 raise LedgerIntegrityError("结算记录与预测不匹配")
             if kind == "settlement":
+                if outcome.outcome_at.date() < outcome.maturity_date:
+                    raise LedgerIntegrityError("结算记录早于预测到期日")
                 self._validate_settlement_quality(outcome)
                 existing = self._settlements.get(outcome.prediction_id)
                 if existing is not None and existing != outcome:
