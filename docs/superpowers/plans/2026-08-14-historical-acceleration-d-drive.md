@@ -1,10 +1,10 @@
-# Historical Maturity Acceleration and D-Drive Isolation Implementation Plan
+# Prospective Model Competition and D-Drive Isolation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a leakage-resistant historical validation pipeline that can grant a clearly marked 20-session provisional status while retaining the 60-session, human-approved production gate, with every new byte constrained to `D:\量化交易`.
+**Goal:** Use historical data only for training and engineering screening, then compare frozen model versions exclusively on future, pre-registered out-of-sample predictions; 20 sessions/100 matured predictions are observation-only, while 60 sessions/200 matured predictions plus every frozen gate may enter human approval, with every new byte constrained to `D:\量化交易`.
 
-**Architecture:** Add a single project-root storage policy beneath all new download, cache, temporary, model, evidence, and report writers. Build versioned research datasets beside—never over—the existing unadjusted execution data, then feed frozen walk-forward evaluations into a durable maturity ledger and the existing human-controlled evolution registry. The workbench owns background backfill/training workers and exposes storage and maturity evidence in Simplified Chinese.
+**Architecture:** Add a single project-root storage policy beneath all new download, cache, temporary, model, evidence, and report writers. Build versioned research datasets beside—never over—the existing unadjusted execution data, use historical walk-forward/CPCV results only to detect engineering failures, freeze each contest version and its metrics before launch, and atomically append predictions before outcomes are known. A durable prospective ledger settles only matured, quality-qualified future outcomes and feeds the existing human-controlled evolution registry. The workbench owns background backfill/training/settlement workers and exposes storage and prospective maturity evidence in Simplified Chinese.
 
 **Tech Stack:** Python 3.12, pandas, PyArrow/Parquet, DuckDB, BaoStock, AKShare, scikit-learn, LightGBM, existing reference backtester, stdlib HTTP/server/process APIs, pytest, Ruff, PowerShell launcher.
 
@@ -17,16 +17,17 @@
 - `src/a_share_quant/data/providers/baostock.py`: free historical daily status and research-return retrieval without changing execution-bar semantics.
 - `src/a_share_quant/research/history_contracts.py`: typed point-in-time instrument, corporate-action, and dataset-profile contracts.
 - `src/a_share_quant/runtime/historical_backfill.py`: resumable seven-year backfill orchestration and coverage reporting.
-- `src/a_share_quant/research/historical_validation.py`: frozen walk-forward/CPCV evaluation, trial accounting, PBO/DSR inputs, regime and reproducibility evidence.
-- `src/a_share_quant/research/maturity.py`: separate historical evidence, provisional live maturity, and formal live maturity state machine.
+- `src/a_share_quant/research/historical_screening.py`: frozen historical engineering checks, trial accounting, and explicitly non-promotional PBO/DSR/CPCV diagnostics.
+- `src/a_share_quant/research/prospective_competition.py`: frozen contest registration, append-only predictions, quality-aware settlement, metrics, and 20/100 versus 60/200 state machine.
+- `src/a_share_quant/storage/prospective_ledger_store.py`: atomic append, idempotency, immutable failed predictions, and versioned outcome records.
 - `src/a_share_quant/runtime/research_jobs.py`: allowlisted owned jobs, D-drive-only child environment, checkpoints, and shutdown.
 - `src/a_share_quant/runtime/research_worker.py`: backfill, validate, and settle commands using only repository-owned paths.
 - `src/a_share_quant/workbench/service.py`: storage and maturity state publication.
 - `src/a_share_quant/workbench/app.py`: Simplified Chinese maturity/storage UI and JSON endpoints.
-- `scripts/quant_cli.py`: bounded operator commands for history status/backfill and research validation.
+- `scripts/quant_cli.py`: bounded operator commands for history status/backfill, engineering screening, contest freeze/start, and prospective status/settlement.
 - `scripts/start_quant_workbench.ps1`: process-local D-drive cache/temp environment.
-- `config/research_maturity.yaml`: frozen historical, provisional, formal, quota, and scheduling thresholds.
-- `reports/research/`: generated Chinese coverage and validation reports.
+- `config/research_maturity.yaml`: historical coverage, prospective primary metric/tie-break, 20/100, 60/200, quota, and scheduling thresholds.
+- `reports/research/`: generated Chinese coverage, engineering-screening, and prospective contest reports.
 
 ### Task 1: Enforce the D-drive project storage boundary
 
@@ -152,6 +153,16 @@ def test_research_store_rejects_quota_before_creating_target(tmp_path):
     with pytest.raises(StorageQuotaError, match="配额"):
         store.replace_dataset("research_returns", "000001", large_frame(), data_version="v1")
     assert not list((tmp_path / "data").rglob("*.parquet"))
+
+
+def test_duplicate_digest_is_idempotent_and_cleanup_removes_only_rebuildable_temp(tmp_path):
+    store = bounded_store(tmp_path)
+    first = store.replace_dataset("research_returns", "000001", frame(), data_version="v1")
+    second = store.replace_dataset("research_returns", "000001", frame(), data_version="v1")
+    assert second.sha256 == first.sha256
+    assert store.manifest_count(first.sha256) == 1
+    store.cleanup_rebuildable_temporary_files()
+    assert first.path.exists()
 ```
 
 - [ ] **Step 2: Run RED**
@@ -161,7 +172,7 @@ Expected: collection fails because the store and contracts do not exist.
 
 - [ ] **Step 3: Implement focused contracts and atomic store**
 
-Define immutable `ResearchArtifact`, `DatasetCoverage`, `PointInTimeInstrument`, and `CorporateAction` dataclasses. `ResearchDataStore.replace_dataset()` must write a same-directory temporary Parquet file, `fsync`, calculate SHA-256 and size, enforce per-file/dataset quotas, then `os.replace` and atomically append a JSONL manifest record. Valid dataset names are a fixed enum, never caller-created directories.
+Define immutable `ResearchArtifact`, `DatasetCoverage`, `PointInTimeInstrument`, and `CorporateAction` dataclasses. `ResearchDataStore.replace_dataset()` must write a same-directory temporary Parquet file, `fsync`, calculate SHA-256 and size, enforce per-file/dataset quotas before publication, then `os.replace` and atomically append a JSONL manifest record. Repeated content hashes are idempotently deduplicated. Cleanup may remove only repository-owned, safely rebuildable temporary files; datasets, manifests, models, predictions, settlements, audit records, and failed predictions are never cleanup targets. Valid dataset names are a fixed enum, never caller-created directories.
 
 - [ ] **Step 4: Freeze configuration**
 
@@ -176,11 +187,14 @@ validation:
   embargo_sessions: 126
   test_sessions: 126
   minimum_oos_windows: 3
-maturity:
-  provisional_shadow_sessions: 20
+  evidence_mode: "NON_PROMOTIONAL_ENGINEERING"
+prospective_competition:
+  primary_metric: "net_cost_return"
+  tie_break: ["max_drawdown", "brier", "ece", "rank_ic", "turnover"]
+  provisional_sessions: 20
   provisional_matured_predictions: 100
-  formal_shadow_sessions: 60
-  formal_matured_predictions: 200
+  approval_sessions: 60
+  approval_matured_predictions: 200
 storage:
   minimum_free_bytes: 21474836480
   maximum_single_download_bytes: 536870912
@@ -323,21 +337,21 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_research_snapshot.py tests/t
 Expected: all tests pass.  
 Commit: `git commit -am "feat: freeze point-in-time research snapshots"`
 
-### Task 6: Evaluate challengers with frozen walk-forward evidence
+### Task 6: Run historical engineering screening without promotion
 
 **Files:**
-- Create: `src/a_share_quant/research/historical_validation.py`
-- Create: `tests/test_historical_validation.py`
+- Create: `src/a_share_quant/research/historical_screening.py`
+- Create: `tests/test_historical_engineering_screening.py`
 - Modify: `src/a_share_quant/research/forecasting.py`
 - Modify: `src/a_share_quant/research/production_gate.py`
 - Modify: `tests/test_forecasting_pipeline.py`
 - Modify: `tests/test_production_research_gate.py`
 
-- [ ] **Step 1: Write failing fold, trial, and repeatability tests**
+- [ ] **Step 1: Write failing fold, repeatability, and non-promotional tests**
 
 ```python
-def test_validator_never_selects_parameters_on_test_window():
-    result = validator().run(snapshot(), candidates())
+def test_screen_never_selects_parameters_on_test_window():
+    result = screen().run(snapshot(), candidates())
     for fold in result.folds:
         assert fold.train_end < fold.validation_start <= fold.validation_end
         assert fold.validation_end < fold.test_start <= fold.test_end
@@ -346,79 +360,111 @@ def test_validator_never_selects_parameters_on_test_window():
 
 
 def test_same_snapshot_seed_and_candidates_are_bitwise_reproducible(tmp_path):
-    first = validator(tmp_path / "one").run(snapshot(), candidates(), seed=20260814)
-    second = validator(tmp_path / "two").run(snapshot(), candidates(), seed=20260814)
+    first = screen(tmp_path / "one").run(snapshot(), candidates(), seed=20260814)
+    second = screen(tmp_path / "two").run(snapshot(), candidates(), seed=20260814)
     assert first.canonical_digest == second.canonical_digest
+
+
+def test_historical_metrics_can_only_block_engineering_failures():
+    result = screen_with_exceptional_historical_metrics().run(snapshot(), candidates())
+    assert result.evidence_mode == "NON_PROMOTIONAL_ENGINEERING"
+    assert result.can_rank_models is False
+    assert result.can_issue_provisional is False
+    assert result.can_issue_approval_token is False
+    assert production_gate.champion_id == "champion-v1"
 ```
 
 - [ ] **Step 2: Run RED**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/test_historical_validation.py -q`  
-Expected: historical validator is missing.
+Run: `.venv\Scripts\python.exe -m pytest tests/test_historical_engineering_screening.py -q`
+Expected: historical engineering screen is missing.
 
-- [ ] **Step 3: Implement one fair evaluation path**
+- [ ] **Step 3: Implement one diagnostic evaluation path**
 
-The validator must use the configured 756/252/126/126 windows, existing A-share cost/execution rules, and one shared snapshot for rule baseline, portable logistic regression, LightGBM, and optional Qlib models. Parameters are selected on validation data; test data is evaluated once. Record every attempted configuration, not only winners. Generate per-window excess return, rank IC, Brier/ECE, turnover, costs, drawdown, capacity, regime tags, PBO inputs, Deflated Sharpe inputs, and leakage/reproducibility flags.
+The screen must use the configured 756/252/126/126 windows, existing A-share cost/execution rules, and one shared snapshot for rule baseline, portable logistic regression, LightGBM, and optional Qlib models. Parameters are selected on validation data; test data is evaluated once. Record every attempted configuration, not only favorable ones. Generate per-window excess return, rank IC, Brier/ECE, turnover, costs, drawdown, capacity, regime tags, PBO/Deflated Sharpe/CPCV diagnostics, and leakage/reproducibility flags, all labeled `NON_PROMOTIONAL_ENGINEERING`. Historical output may train models, diagnose interfaces/cost/leakage, or exclude models that cannot run or are plainly wrong; it must never rank a winner or trigger provisional/formal/promotion state.
 
-- [ ] **Step 4: Harden the production gate**
+- [ ] **Step 4: Prove the production gate ignores historical performance**
 
-Require at least three sample-out windows and reject missing/NaN evidence. Historical pass sets `HISTORICAL_PASS` only; it cannot create an approval token or modify `champion_id`.
+Missing/NaN evidence, leakage, execution failure, or inconsistent artifacts may set `ENGINEERING_BLOCKED`. There is no `HISTORICAL_PASS`: PBO, DSR, CPCV, historical Sharpe, historical rank IC, and every other historical score cannot create a favorable governance state, approval token, model ordering, or `champion_id` change.
 
 - [ ] **Step 5: Run GREEN and commit**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/test_historical_validation.py tests/test_forecasting_pipeline.py tests/test_production_research_gate.py -q`  
+Run: `.venv\Scripts\python.exe -m pytest tests/test_historical_engineering_screening.py tests/test_forecasting_pipeline.py tests/test_production_research_gate.py -q`
 Expected: all tests pass.  
-Commit: `git commit -am "feat: validate challengers on frozen historical windows"`
+Commit: `git commit -am "feat: restrict history to engineering screening"`
 
-### Task 7: Add the 20/60-session maturity ledger
+### Task 7: Add the pre-registered prospective competition ledger
 
 **Files:**
-- Create: `src/a_share_quant/research/maturity.py`
-- Create: `src/a_share_quant/storage/maturity_store.py`
-- Create: `tests/test_maturity_ledger.py`
+- Create: `src/a_share_quant/research/prospective_competition.py`
+- Create: `src/a_share_quant/storage/prospective_ledger_store.py`
+- Create: `tests/test_prospective_competition_ledger.py`
 - Modify: `src/a_share_quant/research/evolution.py`
 - Modify: `tests/test_controlled_model_evolution.py`
 
-- [ ] **Step 1: Write failing state-transition tests**
+- [ ] **Step 1: Write failing pre-registration, settlement, and governance tests**
 
 ```python
-def test_historical_pass_needs_twenty_live_sessions_for_provisional():
-    ledger = MaturityLedger(history=passing_history())
-    ledger.settle(live_observations(sessions=19, matured=100))
-    assert ledger.status == "SHADOW"
-    ledger.settle(live_observations(sessions=20, matured=100))
-    assert ledger.status == "PROVISIONAL"
+def test_prediction_is_atomically_appended_before_outcome_and_never_deleted():
+    prediction = ledger.append_prediction(
+        model_id="challenger", model_version="v1", config_hash="cfg",
+        training_snapshot_hash="train", symbol="600001", name="示例",
+        prediction_at=frozen_now, as_of=frozen_session, horizon=5,
+        score=0.73, probability=0.68, guidance_price_bands=price_bands(),
+        evidence_mode="PROSPECTIVE",
+    )
+    assert ledger.read(prediction.id) == prediction
+    with pytest.raises(ImmutablePredictionError):
+        ledger.delete(prediction.id)
+
+
+def test_missing_suspended_or_stale_outcome_delays_settlement():
+    result = ledger.settle_due(outcome(status="SUSPENDED", data_version="bars-v3"))
+    assert result.matured is False
+    assert result.delay_reason == "SUSPENDED"
+    assert ledger.matured_predictions == 0
+
+
+def test_twenty_sessions_is_observation_only_and_sixty_requires_manual_approval():
+    ledger.settle(qualified_future_observations(sessions=20, matured=100))
+    assert ledger.status == "PROVISIONAL_UNMATURED_OBSERVATION"
     assert ledger.can_replace_champion is False
-
-
-def test_sixty_sessions_still_requires_human_confirmation():
-    ledger = mature_ledger(sessions=60, matured=200)
+    ledger.settle(qualified_future_observations(sessions=60, matured=200))
     assert ledger.status == "AWAITING_MANUAL_APPROVAL"
     assert registry.champion_id == "champion-v1"
-    with pytest.raises(TypeError):
-        registry.approve(ledger.report_id, auto_approve=True)
+
+
+def test_new_version_resets_future_counts_and_metrics_are_immutable_after_start():
+    contest = started_contest(primary_metric="net_cost_return", tie_break=["max_drawdown", "brier"])
+    contest.register_version(model_version="v2", config_hash="changed")
+    assert contest.future_sessions == 0
+    assert contest.matured_predictions == 0
+    with pytest.raises(FrozenContestError):
+        contest.change_primary_metric("directional_hit_rate")
 ```
 
 - [ ] **Step 2: Run RED**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/test_maturity_ledger.py -q`  
-Expected: maturity ledger and store are missing.
+Run: `.venv\Scripts\python.exe -m pytest tests/test_prospective_competition_ledger.py -q`
+Expected: prospective competition ledger and store are missing.
 
-- [ ] **Step 3: Implement distinct historical and live counters**
+- [ ] **Step 3: Implement immutable prediction and quality-aware settlement records**
 
-Persist `historical_oos_windows`, `historical_matured_samples`, `live_shadow_sessions`, `live_matured_predictions`, live Brier/ECE, net performance, drawdown, drift, data-quality failures, and status. Never add historical observations to live counters. Reprocessing an observation ID must be idempotent; future timestamps, duplicate outcomes with changed values, and predictions made after their outcome cutoff are rejected.
+Before the contest starts, freeze `contest_started_at`, model/version, `config_hash`, `training_snapshot_hash`, primary metric, tie-break order, horizons, thresholds, costs, and regime definitions. Atomically append each prediction before its result is known with model/version/config hash/training snapshot hash/symbol/name/prediction_at/as_of/horizon/score/probability/guidance price bands/evidence mode. Records are immutable: failed predictions cannot be overwritten or deleted, and revisions require a new model version.
 
-- [ ] **Step 4: Connect governance without weakening formal gates**
+Settle only after the horizon expires and the realized market data passes freshness, completeness, session alignment, and corporate-action checks. Missing, suspended, stale, or conflicting data remains pending with a delay reason and is neither success nor failure. Append the outcome data version and SHA-256 to each settlement. Reprocessing a prediction/outcome ID is idempotent; changed duplicate outcomes, future timestamps, predictions appended after their outcome cutoff, and any mutation are rejected.
 
-Extend `EvolutionEvaluator` to accept a verified maturity snapshot. It may issue an approval-ready report only at 60/200 plus all existing checks. `PROVISIONAL` is a display state and cannot issue a confirmation token.
+- [ ] **Step 4: Calculate frozen prospective metrics and connect governance**
+
+For each frozen model version calculate directional hit rate, Brier, ECE, rank IC, net-of-commission/tax/slippage return, maximum drawdown, turnover, coverage/rejection rate, and regime stability. The pre-registered primary metric drives comparison and the frozen tie-break resolves ties; every mandatory quality/risk threshold must pass, and neither may change after results are visible. At 20 future sessions/100 matured predictions expose only `PROVISIONAL_UNMATURED_OBSERVATION`, which never replaces the champion or issues a token. Only 60 future sessions/200 matured predictions plus every frozen gate may issue an approval-ready report; human approval remains mandatory, and there is no automatic promotion or order path. A model/version/config change creates a new contestant with counters reset to zero.
 
 - [ ] **Step 5: Run GREEN and commit**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/test_maturity_ledger.py tests/test_controlled_model_evolution.py tests/test_model_governance_http.py -q`  
+Run: `.venv\Scripts\python.exe -m pytest tests/test_prospective_competition_ledger.py tests/test_controlled_model_evolution.py tests/test_model_governance_http.py -q`
 Expected: all tests pass.  
-Commit: `git commit -am "feat: govern provisional and formal model maturity"`
+Commit: `git commit -am "feat: govern prospective model competition"`
 
-### Task 8: Own backfill, validation, and settlement worker lifecycles
+### Task 8: Own backfill, engineering-screening, prediction, and settlement worker lifecycles
 
 **Files:**
 - Modify: `src/a_share_quant/runtime/research_jobs.py`
@@ -440,7 +486,7 @@ def test_worker_process_receives_only_d_drive_owned_environment(tmp_path, monkey
 
 
 def test_shutdown_checkpoints_then_stops_download_and_training_children():
-    supervisor = supervisor_with_running("history-backfill", "forecast-validation")
+    supervisor = supervisor_with_running("history-backfill", "historical-screen", "prospective-settle")
     result = supervisor.shutdown(timeout_seconds=5)
     assert result.checkpoint_saved
     assert result.children_stopped
@@ -454,17 +500,17 @@ Expected: storage policy and new job commands are unsupported.
 
 - [ ] **Step 3: Implement fixed command mapping and schedule**
 
-Allow only `("research", "history")`, `("research", "validate")`, and `("research", "settle")`. Map them internally to module invocations; callers cannot add paths or flags. Schedule history once per completed session, settlement after data refresh, and validation only when the dataset fingerprint changes. Keep one CPU training worker and one network worker maximum. The checkpoint records command, input fingerprint, stage, completed artifact digest, and next eligible time.
+Allow only `("research", "history")`, `("research", "screen")`, `("research", "predict")`, and `("research", "settle")`. Map them internally to module invocations; callers cannot add paths or flags. Schedule history once per completed session, historical engineering screening only when the training dataset fingerprint changes, prediction before the eligible outcome window opens, and settlement after data refresh. Keep one CPU training worker and one network worker maximum. The checkpoint records command, input fingerprint, stage, completed artifact digest, and next eligible time.
 
-Add operator commands `quant_cli.py research status` and `quant_cli.py research validate`. `status` is read-only and offline; `validate` accepts no path arguments, reads only manifest-verified D-drive datasets, and never changes the champion.
+Add operator commands `quant_cli.py research status`, `quant_cli.py research screen`, and `quant_cli.py research contest-start`. `status` is read-only and offline; `screen` accepts no path arguments, reads only manifest-verified D-drive datasets, labels all outputs non-promotional, and never changes the champion. `contest-start` freezes the selected engineering-valid model versions, training snapshot hashes, primary metric, tie-break, thresholds, and start time before any prospective outcomes exist.
 
 - [ ] **Step 4: Run GREEN and commit**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_research_job_supervisor.py tests/test_research_worker.py tests/test_quant_cli.py -q`  
 Expected: all tests pass, including corrupt checkpoint and forced shutdown cases.  
-Commit: `git commit -am "feat: own accelerated research job lifecycle"`
+Commit: `git commit -am "feat: own prospective research job lifecycle"`
 
-### Task 9: Publish Simplified Chinese storage and maturity evidence
+### Task 9: Publish Simplified Chinese storage and prospective contest evidence
 
 **Files:**
 - Modify: `src/a_share_quant/workbench/service.py`
@@ -475,48 +521,57 @@ Commit: `git commit -am "feat: own accelerated research job lifecycle"`
 - [ ] **Step 1: Write failing state and rendered-page tests**
 
 ```python
-def test_state_separates_historical_and_live_maturity():
+def test_state_separates_historical_screening_and_prospective_maturity():
     state = service_with_maturity().state()
-    assert state["research_maturity"]["status_zh"] == "临时挑战者"
-    assert state["research_maturity"]["historical_oos_windows"] == 4
-    assert state["research_maturity"]["live_shadow_sessions"] == 20
-    assert state["research_maturity"]["formal_remaining_sessions"] == 40
+    contest = state["prospective_competition"]
+    assert contest["status_zh"] == "临时未成熟观察"
+    assert contest["contest_started_at"] == "2026-08-14"
+    assert contest["future_matured_sessions"] == 20
+    assert contest["future_matured_predictions"] == 100
+    assert contest["approval_remaining_sessions"] == 40
+    assert contest["approval_remaining_predictions"] == 100
 
 
 def test_dashboard_explains_missing_guidance_and_d_drive_storage():
-    html = render_dashboard(state_with_block("INSUFFICIENT_HISTORY"))
-    assert "历史数据不足" in html
+    html = render_dashboard(state_with_contest())
+    assert "历史结果不参与晋升" in html
+    assert "失败预测不可删除" in html
+    assert "比赛开始日" in html
+    assert "距临时门槛" in html
+    assert "距正式审批门槛" in html
     assert "D:\\量化交易" in html
     assert "C盘写入已阻止" in html
-    assert "预测准确率" not in html
+    assert "当前状态" in html
 ```
 
 - [ ] **Step 2: Run RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_workbench_service.py tests/test_workbench_app.py -q`  
-Expected: maturity and storage fields are absent.
+Expected: prospective contest and storage fields are absent.
 
 - [ ] **Step 3: Add bounded state objects and Chinese UI**
 
-Expose only aggregate storage and research evidence: repo root, free bytes, dataset bytes, last download bytes, rejected-path count, champion/challenger IDs, historical windows, live sessions, matured predictions, status, remaining thresholds, risk checks, and reason codes. Do not expose local tokens, full provider URLs, environment variables, raw exception strings, or arbitrary filesystem paths.
+Expose only aggregate storage and research evidence: repo root, free bytes, dataset bytes, last download bytes, rejected-path count, champion/contestant version IDs, contest start date, future matured sessions, future matured predictions, current status, remaining 20/100 and 60/200 thresholds, frozen primary metric/tie-break, risk checks, and reason codes. Do not expose local tokens, full provider URLs, environment variables, raw exception strings, or arbitrary filesystem paths.
 
-Render distinct badges for `历史不足`, `历史验证中`, `影子观察`, `临时挑战者`, `待人工批准`, and `阻塞`. Historical and live metrics must occupy separate columns. Provisional recommendations must include `临时、未成熟、仅供观察` and never replace the official daily ranking.
+Render distinct badges for `历史工程筛查中`, `工程阻塞`, `未来竞赛中`, `临时未成熟观察`, and `待人工审批`. The Chinese UI must always show `比赛开始日`, `未来成熟交易日/预测数`, `失败预测不可删除`, `历史结果不参与晋升`, `距临时门槛`, `距正式审批门槛`, and `当前状态`. Historical diagnostics and prospective metrics occupy separate columns. Provisional observations include `临时、未成熟、仅供观察`, never declare a winner, and never replace the official daily ranking.
 
 - [ ] **Step 4: Run GREEN and commit**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_workbench_service.py tests/test_workbench_app.py -q`  
 Expected: all tests pass and all new user-visible strings are Simplified Chinese.  
-Commit: `git commit -am "feat: show research maturity and D-drive storage"`
+Commit: `git commit -am "feat: show prospective contest and D-drive storage"`
 
-### Task 10: Perform real D-drive backfill and generate evidence
+### Task 10: Backfill training data, freeze contestants, and start the prospective contest
 
 **Files:**
 - Create at runtime: `data/lake/research_returns/*.parquet`
 - Create at runtime: `data/lake/instrument_history/*.parquet`
 - Create at runtime: `data/manifests/*.jsonl`
 - Create at runtime: `.runtime/research/evidence/*.json`
+- Create at runtime: `.runtime/research/prospective/predictions/*.jsonl`
 - Create: `reports/research/historical_coverage_2026-08-14.md`
-- Create: `reports/research/historical_validation_2026-08-14.md`
+- Create: `reports/research/historical_engineering_screening_2026-08-14.md`
+- Create: `reports/research/prospective_contest_start_2026-08-14.md`
 
 - [ ] **Step 1: Prepare process-local D-drive caches**
 
@@ -542,22 +597,28 @@ Expected: JSON/Chinese output shows target paths on D, available bytes, current 
 Run: `.venv\Scripts\python.exe scripts\quant_cli.py history backfill --start 2019-01-01 --end 2026-08-13 --network`  
 Expected: at least 30 symbols reach 1750 sessions, all output paths resolve below `D:\量化交易`, failed symbols are enumerated without aborting completed symbols, and the checkpoint permits safe continuation.
 
-- [ ] **Step 4: Run historical validation without promotion**
+- [ ] **Step 4: Run historical engineering screening, then freeze and start the contest**
 
-Run: `.venv\Scripts\python.exe scripts\quant_cli.py research validate`  
-Expected: versioned evidence and Chinese report are written, champion ID is unchanged, and any insufficient gate is explicitly `BLOCKED`.
+Run:
+
+```powershell
+.venv\Scripts\python.exe scripts\quant_cli.py research screen
+.venv\Scripts\python.exe scripts\quant_cli.py research contest-start
+```
+
+Expected: training inputs and non-promotional engineering evidence are versioned; models that cannot run or are plainly wrong are excluded without naming a historical winner. `contest-start` freezes model/version/config hashes, training snapshot hashes, primary metric, tie-break, thresholds, and contest start time before future outcomes exist. The champion ID is unchanged and all prospective counters start at zero.
 
 - [ ] **Step 5: Commit code and human-readable reports only**
 
 Do not commit Parquet, caches, runtime state, tokens, or temporary files.  
-Commit: `git add reports/research config && git commit -m "docs: record historical validation evidence"`
+Commit: `git add reports/research config && git commit -m "docs: record prospective contest start"`
 
 ### Task 11: Full regression, storage audit, desktop lifecycle, and handoff
 
 **Files:**
 - Modify: `config/production_readiness.yaml`
 - Modify: `reports/reliability_upgrade_handoff_2026-08-13.md`
-- Create: `reports/research/historical_acceleration_acceptance_2026-08-14.md`
+- Create: `reports/research/prospective_competition_acceptance_2026-08-14.md`
 
 - [ ] **Step 1: Run complete automated verification**
 
@@ -583,16 +644,17 @@ Run `scripts\stop_quant_workbench.ps1`, then `scripts\start_quant_workbench.ps1`
 
 - [ ] **Step 4: Update readiness honestly**
 
-Set only evidenced checks to `PASS`. Keep formal model `BLOCKED` until the 60-session gate and manual approval are actually satisfied; keep broker read-only `BLOCKED` until QMT/XtQuant authorization exists. Add links to coverage, validation, storage audit, and test evidence.
+Set only evidenced engineering checks to `PASS`; never translate a historical score into model preference. Keep the contest `PROSPECTIVE_COLLECTING` until 60 future sessions/200 matured future predictions and every frozen gate are actually satisfied, then at most `AWAITING_MANUAL_APPROVAL`. Keep broker read-only `BLOCKED` until QMT/XtQuant authorization exists. Add links to coverage, engineering screening, contest registration, storage audit, and test evidence.
 
 - [ ] **Step 5: Commit final handoff**
 
-Commit: `git add config/production_readiness.yaml reports && git commit -m "docs: hand off accelerated research pipeline"`
+Commit: `git add config/production_readiness.yaml reports && git commit -m "docs: hand off prospective competition pipeline"`
 
 ## Execution safeguards
 
 - Every implementation task follows RED → minimal GREEN → focused regression → commit.
 - Before any network call or dependency installation, set process-local D-drive cache/temp paths and print their resolved values.
-- Do not lower the 60-session formal gate, auto-promote a model, overwrite unadjusted execution bars, scrape the broker UI, or add order APIs.
+- Historical PBO/DSR/CPCV/Sharpe and every other historical result are diagnostic only: never use them to choose a winner, issue provisional/formal status, shorten prospective collection, or promote a model.
+- Do not lower the 60-session/200-matured approval-entry gate, mutate frozen metrics after contest start, delete failed predictions, auto-promote a model, overwrite unadjusted execution bars, scrape the broker UI, or add order APIs.
 - If a free source cannot provide trustworthy historical status or corporate-action evidence, mark the affected sample unavailable and keep the corresponding readiness gate blocked.
 - Stop execution on any attempted C-drive/project-external write, insufficient D-drive space, integrity mismatch, or uncontrolled child process.
