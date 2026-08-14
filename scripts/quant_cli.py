@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -265,12 +267,6 @@ def main(argv: list[str] | None = None) -> int:
         governance = EvolutionRegistry(
             state_path=repo_root / ".runtime" / "research" / "evolution-registry.json"
         )
-        lifecycle_now = datetime.now(timezone.utc)
-        research_supervisor.register_default_jobs(
-            now=lifecycle_now,
-            **_workbench_research_context(repo_root, lifecycle_now),
-        )
-        research_supervisor.start_due_jobs(now=lifecycle_now)
         official_signal_store = load_or_generate_official_store(
             official_signal_path,
             repo_root=repo_root,
@@ -307,6 +303,9 @@ def main(argv: list[str] | None = None) -> int:
             price_guidance_store=price_guidance_store,
             supervisor=research_supervisor,
             governance=governance,
+            research_context_supplier=lambda tick_now, _service: _workbench_research_context(
+                repo_root, tick_now
+            ),
         )
         return 0
     if args.command == "price-guidance":
@@ -460,16 +459,36 @@ def _research_screen_status(repo_root: Path) -> dict[str, object]:
     """Read the latest screen artifact; never create a worker from the CLI."""
 
     policy = ProjectStoragePolicy(repo_root, required_drive="D:")
-    path = policy.authorize(".runtime/research/screen-status.json")
-    if not path.exists():
+    directory = policy.authorize(".runtime/research/status")
+    if not directory.exists():
         return {
             "状态": "等待工作台调度",
             "网络访问": False,
             "说明": "工程筛查仅在打开的工作台生命周期内由受监督子进程执行。",
             "晋级": "禁止",
         }
-    policy.revalidate(path)
-    payload = _read_local_json(path)
+    try:
+        policy.revalidate(directory)
+        records: list[tuple[str, dict[str, object]]] = []
+        for path in directory.glob("screen-*.json"):
+            policy.revalidate(path)
+            if not path.is_file():
+                continue
+            payload = _read_local_json(path)
+            if payload.get("job") != "screen" or payload.get("job_id") != path.stem:
+                continue
+            timestamp = str(payload.get("updated_at", ""))
+            records.append((timestamp, payload))
+    except (OSError, SystemExit, ValueError):
+        records = []
+    if not records:
+        return {
+            "状态": "等待工作台调度",
+            "网络访问": False,
+            "说明": "工程筛查仅在打开的工作台生命周期内由受监督子进程执行。",
+            "晋级": "禁止",
+        }
+    _, payload = max(records, key=lambda item: item[0])
     return {
         **payload,
         "来源": "工作台受监督任务",
@@ -486,12 +505,9 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
         policy.revalidate(destination)
         existing = _read_local_json(destination)
         _verify_frozen_contest(existing)
-        # A frozen contest remains readable and idempotent after newer data or
-        # model candidates arrive; callers must create a distinct future
-        # contest through the governed model-registration workflow.
         return existing
-    registration = _frozen_model_registration(repo_root, policy)
-    terms = _contest_terms(repo_root)
+    registration = _derived_model_registration(repo_root, policy)
+    terms = _require_fixed_contest_terms(_contest_terms(repo_root))
     now = datetime.now(timezone.utc)
     contest = ProspectiveContest(
         now=now,
@@ -510,12 +526,13 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
     )
     state = contest.to_dict()
     body: dict[str, object] = {
-        "format_version": 2,
+        "format_version": 3,
         "contest_started_at": state["contest_started_at"],
         "model_id": registration["model_id"],
         "model_version": registration["model_version"],
         "config_hash": registration["config_hash"],
         "training_snapshot_hash": registration["training_snapshot_hash"],
+        "official_signal_digest": registration["official_signal_digest"],
         "primary_metric": terms["primary_metric"],
         "tie_break": terms["tie_break"],
         "provisional_sessions": 20,
@@ -528,19 +545,28 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
     }
     encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     payload = {**body, "sha256": hashlib.sha256(encoded).hexdigest()}
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
     policy.revalidate(destination.parent)
     destination.parent.mkdir(parents=True, exist_ok=True)
     policy.revalidate(destination.parent)
-    temporary = destination.with_name(f".{destination.name}.tmp")
-    policy.revalidate(temporary)
-    temporary.write_bytes(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
-    )
-    policy.revalidate(temporary)
-    policy.revalidate(destination)
-    temporary.replace(destination)
-    policy.revalidate(destination)
-    return payload
+    # First writer wins.  There is deliberately no temporary replace: an
+    # existing contest is immutable and a concurrent caller may only validate
+    # the object written by the process that won this exclusive create.
+    try:
+        policy.revalidate(destination)
+        with destination.open("xb") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        policy.revalidate(destination)
+        return payload
+    except FileExistsError:
+        policy.revalidate(destination)
+        existing = _read_local_json(destination)
+        _verify_frozen_contest(existing)
+        return existing
+    except OSError as exc:
+        raise SystemExit("未来竞赛冻结文件无法安全创建") from exc
 
 
 def _read_local_json(path: Path) -> dict[str, object]:
@@ -566,6 +592,7 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
         "model_version",
         "config_hash",
         "training_snapshot_hash",
+        "official_signal_digest",
         "primary_metric",
         "tie_break",
         "provisional_sessions",
@@ -576,7 +603,7 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
         "status",
         "promotion",
     }
-    if set(body) != required or body.get("format_version") != 2:
+    if set(body) != required or body.get("format_version") != 3:
         raise SystemExit("未来竞赛冻结文件字段无效")
     if (
         body.get("provisional_sessions") != 20
@@ -584,6 +611,10 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
         or body.get("approval_sessions") != 60
         or body.get("approval_matured_predictions") != 200
         or body.get("evidence_mode") != "PROSPECTIVE_ONLY"
+        or body.get("status") != "PROSPECTIVE_COLLECTING"
+        or body.get("primary_metric") != "net_cost_return"
+        or body.get("tie_break")
+        != ["max_drawdown", "brier", "ece", "rank_ic", "turnover"]
         or body.get("promotion") != "NEVER"
     ):
         raise SystemExit("未来竞赛冻结门槛无效")
@@ -591,7 +622,7 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
         started = datetime.fromisoformat(str(body["contest_started_at"]))
         if started.tzinfo is None or started.utcoffset() is None:
             raise ValueError
-        for key in ("config_hash", "training_snapshot_hash"):
+        for key in ("config_hash", "training_snapshot_hash", "official_signal_digest"):
             _sha256_value(body[key], key)
         model_id = _frozen_text(body["model_id"], "model_id")
         model_version = _frozen_text(body["model_version"], "model_version")
@@ -616,20 +647,29 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
 
 
 def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, object]:
-    """Derive only conservative, local lifecycle facts at dashboard startup."""
+    """Derive lifecycle facts from fixed local research artifacts only."""
 
     policy = ProjectStoragePolicy(repo_root, required_drive="D:")
     fingerprint = _verified_research_manifest_digest(policy)
-    lifecycle = _read_signed_control(policy, "lifecycle-state.json")
-    session_completed = bool(lifecycle and lifecycle.get("session_completed") is True)
-    data_refreshed = bool(lifecycle and lifecycle.get("data_refreshed") is True)
+    session_completed = _completed_trading_session(now)
+    data_refreshed = _fresh_daily_signal_available(policy, now)
     outcome_cutoff = None
-    contest = _read_signed_control(policy, "prospective-contest.json")
-    if contest is not None:
+    contest_path = policy.authorize(".runtime/research/prospective-contest.json")
+    # A frozen model is not itself a forecast input.  The supervisor receives
+    # a predict window only after this session's verified official daily
+    # artifact is present, so a BLOCKED pre-refresh child cannot consume the
+    # one allowed job instance for that daily cycle.
+    if data_refreshed and contest_path.exists():
         try:
-            _verify_frozen_contest({**contest, "sha256": _control_digest(contest)})
-            outcome_cutoff = now + timedelta(minutes=1)
-        except SystemExit:
+            policy.revalidate(contest_path)
+            _verify_frozen_contest(_read_local_json(contest_path))
+            shanghai = now.astimezone(ZoneInfo("Asia/Shanghai"))
+            outcome_cutoff = (
+                datetime.combine(
+                    shanghai.date() + timedelta(days=1), time.min, tzinfo=shanghai.tzinfo
+                ).astimezone(timezone.utc)
+            )
+        except (OSError, SystemExit, ValueError):
             outcome_cutoff = None
     return {
         "session_completed": session_completed,
@@ -639,32 +679,33 @@ def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, obj
     }
 
 
-def _frozen_model_registration(
+def _derived_model_registration(
     repo_root: Path, policy: ProjectStoragePolicy
 ) -> dict[str, str]:
-    """Load immutable model provenance; user CLI values never define it."""
+    """Derive immutable provenance from verified D-drive research artifacts."""
 
-    payload = _read_signed_control(policy, "model-registration.json")
-    if payload is None:
-        raise SystemExit("尚无已核验模型登记，不能开始未来竞赛")
+    signals, signal_digest = _verified_official_signal_artifact(policy)
     try:
+        models = {(signal.strategy_version, signal.model_version) for signal in signals}
+        if len(models) != 1:
+            raise ValueError
+        model_id, model_version = next(iter(models))
         registration = {
-            "model_id": _frozen_text(payload["model_id"], "model_id"),
-            "model_version": _frozen_text(payload["model_version"], "model_version"),
-            "config_hash": _sha256_value(payload["config_hash"], "config_hash"),
-            "training_snapshot_hash": _sha256_value(
-                payload["training_snapshot_hash"], "training_snapshot_hash"
+            "model_id": _frozen_text(model_id, "model_id"),
+            "model_version": _frozen_text(model_version, "model_version"),
+            "official_signal_digest": _sha256_value(
+                signal_digest, "official_signal_digest"
             ),
         }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SystemExit("模型登记文件字段无效") from exc
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("尚无已核验模型登记，不能开始未来竞赛") from exc
     config_path = policy.authorize(repo_root / "config" / "research_maturity.yaml")
     policy.revalidate(config_path)
-    expected_config = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    if registration["config_hash"] != expected_config:
-        raise SystemExit("模型登记配置摘要与当前受控配置不一致")
-    if registration["training_snapshot_hash"] != _verified_research_manifest_digest(policy):
+    registration["config_hash"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    snapshot_hash = _verified_research_manifest_digest(policy)
+    if snapshot_hash is None:
         raise SystemExit("模型登记训练快照未通过D盘研究数据校验")
+    registration["training_snapshot_hash"] = snapshot_hash
     return registration
 
 
@@ -685,10 +726,20 @@ def _contest_terms(repo_root: Path) -> dict[str, object]:
         "approval_sessions": raw.get("approval_sessions"),
         "approval_matured_predictions": raw.get("approval_matured_predictions"),
     }
+    return _require_fixed_contest_terms(terms)
+
+
+def _require_fixed_contest_terms(terms: object) -> dict[str, object]:
+    """Reject configuration drift before any immutable contest is created."""
+
+    if not isinstance(terms, dict):
+        raise SystemExit("未来竞赛固定指标与门槛无效")
+    expected_tie_break = ["max_drawdown", "brier", "ece", "rank_ic", "turnover"]
     if (
-        not terms["tie_break"]
+        terms.get("primary_metric") != "net_cost_return"
+        or terms.get("tie_break") != expected_tie_break
         or tuple(
-            terms[key]
+            terms.get(key)
             for key in (
                 "provisional_sessions",
                 "provisional_matured_predictions",
@@ -698,16 +749,24 @@ def _contest_terms(repo_root: Path) -> dict[str, object]:
         )
         != (20, 100, 60, 200)
     ):
-        raise SystemExit("未来竞赛门槛必须固定为20/100和60/200")
-    return terms
+        raise SystemExit("未来竞赛固定指标与门槛无效")
+    return {
+        "primary_metric": "net_cost_return",
+        "tie_break": expected_tie_break,
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+    }
 
 
 def _verified_research_manifest_digest(policy: ProjectStoragePolicy) -> str | None:
-    """Verify all immutable blobs before accepting a training snapshot digest."""
+    """Accept only a mature coverage checkpoint backed by verified artifacts."""
 
     try:
         store = ResearchDataStore(policy)
-        if store.manifest_count() < 1:
+        coverage = HistoricalBackfillCoordinator(store, None).coverage()
+        if coverage.symbol_count < 30 or coverage.session_count < 1750:
             return None
         policy.revalidate(store.manifest_path)
         return hashlib.sha256(store.manifest_path.read_bytes()).hexdigest()
@@ -715,28 +774,49 @@ def _verified_research_manifest_digest(policy: ProjectStoragePolicy) -> str | No
         return None
 
 
-def _read_signed_control(
-    policy: ProjectStoragePolicy, name: str
-) -> dict[str, object] | None:
-    path = policy.authorize(f".runtime/research/{name}")
-    if not path.exists():
-        return None
+def _verified_official_signal_artifact(
+    policy: ProjectStoragePolicy,
+) -> tuple[tuple[object, ...], str]:
+    """Read a fixed daily signal artifact and return its integrity digest."""
+
+    path = policy.authorize(".runtime/signals/official-daily.json")
     try:
         policy.revalidate(path)
-        payload = _read_local_json(path)
-        digest = payload.pop("sha256", None)
-        if not isinstance(digest, str) or digest != _control_digest(payload):
-            return None
-        return payload
+        raw = path.read_bytes()
+        if not raw:
+            raise ValueError
+        digest = hashlib.sha256(raw).hexdigest()
+        signals = OfficialSignalStore(path=path).latest()
+        policy.revalidate(path)
+        if not signals or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError
+        return tuple(signals), digest
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit("尚无已核验模型登记，不能开始未来竞赛") from exc
+
+
+def _fresh_daily_signal_available(policy: ProjectStoragePolicy, now: datetime) -> bool:
+    """Use only a current, parseable paper-only official artifact as refresh proof."""
+
+    try:
+        signals, _ = _verified_official_signal_artifact(policy)
+        session_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        return bool(
+            signals
+            and all(
+                signal.signal_date == session_date
+                and signal.data_cutoff == signal.signal_date
+                and signal.generated_at <= now
+                for signal in signals
+            )
+        )
     except SystemExit:
-        return None
+        return False
 
 
-def _control_digest(payload: dict[str, object]) -> str:
-    encoded = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
+def _completed_trading_session(now: datetime) -> bool:
+    local = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    return local.weekday() < 5 and local.timetz().replace(tzinfo=None) >= time(15, 10)
 
 
 def _frozen_text(value: object, field: str) -> str:

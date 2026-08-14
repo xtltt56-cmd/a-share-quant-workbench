@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ _REASONS = {
     "predict": "FUTURE_CONTEST_NOT_READY",
     "settle": "REFRESHED_OUTCOME_NOT_READY",
 }
-_MAX_CONTROL_BYTES = 1_048_576
+_MAX_INTEGRITY_ARTIFACT_BYTES = 1_048_576
 _MAX_OUTPUT_BYTES = 1_048_576
 
 
@@ -33,6 +34,24 @@ class _Blocked(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code)
         self.reason_code = reason_code
+
+
+class _Partial(_Blocked):
+    """A bounded batch persisted some evidence but cannot claim success."""
+
+
+class _Failed(_Blocked):
+    """A verified operation ran but its entire bounded batch failed."""
+
+
+@dataclass(frozen=True)
+class _DerivedScreenSnapshot:
+    """Minimal immutable view assembled from verified return artifacts only."""
+
+    features: Any
+    labels: Any
+    signal_cutoff: date
+    canonical_sha256: str
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,8 +76,11 @@ def run_job(
     # Direct library tests may use a dedicated D-drive root. The process entry
     # point below always supplies the production D-drive policy.
     policy = storage_policy or ProjectStoragePolicy(root, required_drive=None)
-    status_path = policy.authorize(f".runtime/research/{job}-status.json")
+    instance_id = _worker_instance_id(job)
+    status_path = _status_path(policy, job, instance_id)
     try:
+        if os.environ.get("A_SHARE_QUANT_RESEARCH_WORKBENCH") == "1" and instance_id is None:
+            raise _Blocked("WORKER_INSTANCE_INVALID")
         context = _verified_job_context(job, policy)
         if context is None:
             raise _Blocked(_REASONS[job])
@@ -69,26 +91,56 @@ def run_job(
             "settle": _run_settle,
         }[job]
         result = operation(root, policy, context)
-        digest = _artifact_digest(result)
+        artifact_relpath, digest = _write_instance_evidence(
+            policy, job, instance_id, result
+        )
         payload: dict[str, Any] = {
-            "format_version": 2,
+            "format_version": 3,
             "job": job,
+            "job_id": instance_id,
             "status": "SUCCESS",
             "promotion": "NEVER",
             "reason_code": None,
             "artifact_digest": digest,
+            "artifact_relpath": artifact_relpath,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "status_path": str(status_path),
         }
         _write_status(policy, status_path, payload)
         return 0
+    except _Partial as exc:
+        payload = _blocked_payload(
+            job,
+            status_path,
+            exc.reason_code,
+            status="PARTIAL",
+            instance_id=instance_id,
+        )
+        _write_status(policy, status_path, payload)
+        return 1
+    except _Failed as exc:
+        payload = _blocked_payload(
+            job,
+            status_path,
+            exc.reason_code,
+            status="FAILED",
+            instance_id=instance_id,
+        )
+        _write_status(policy, status_path, payload)
+        return 2
     except _Blocked as exc:
-        payload = _blocked_payload(job, status_path, exc.reason_code)
+        payload = _blocked_payload(job, status_path, exc.reason_code, instance_id=instance_id)
         _write_status(policy, status_path, payload)
         return 1
     except Exception:
         # Do not persist provider exceptions, paths, tokens, or command text.
-        payload = _blocked_payload(job, status_path, "COORDINATOR_FAILED", status="FAILED")
+        payload = _blocked_payload(
+            job,
+            status_path,
+            "COORDINATOR_FAILED",
+            status="FAILED",
+            instance_id=instance_id,
+        )
         _write_status(policy, status_path, payload)
         return 2
 
@@ -100,18 +152,83 @@ def run_forecast(repo_root: str | Path) -> int:
 
 
 def _blocked_payload(
-    job: str, status_path: Path, reason: str, *, status: str = "BLOCKED"
+    job: str,
+    status_path: Path,
+    reason: str,
+    *,
+    status: str = "BLOCKED",
+    instance_id: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "format_version": 2,
+        "format_version": 3,
         "job": job,
+        "job_id": instance_id,
         "status": status,
         "promotion": "NEVER",
         "reason_code": _safe_reason(reason),
         "artifact_digest": None,
+        "artifact_relpath": None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "status_path": str(status_path),
     }
+
+
+def _worker_instance_id(job: str) -> str | None:
+    """Read only the supervisor-provided opaque ID, never a user path."""
+
+    value = os.environ.get("A_SHARE_QUANT_RESEARCH_JOB_ID")
+    if value is None:
+        return None
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > 128
+        or (normalized != job and not normalized.startswith(f"{job}-"))
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+            for character in normalized
+        )
+    ):
+        return None
+    return normalized
+
+
+def _status_path(
+    policy: ProjectStoragePolicy, job: str, instance_id: str | None
+) -> Path:
+    """Use per-instance status for children, preserving direct test compatibility."""
+
+    if instance_id is not None:
+        return policy.authorize(f".runtime/research/status/{instance_id}.json")
+    return policy.authorize(f".runtime/research/{job}-status.json")
+
+
+def _write_instance_evidence(
+    policy: ProjectStoragePolicy,
+    job: str,
+    instance_id: str | None,
+    result: dict[str, Any],
+) -> tuple[str | None, str]:
+    """Persist the exact bytes whose digest a supervisor will verify."""
+
+    if instance_id is None:
+        # Direct library callers have no supervising instance.  They retain the
+        # legacy status compatibility contract but cannot claim an owned child
+        # success to a supervisor.
+        return None, _artifact_digest(result)
+    body = {
+        "format_version": 1,
+        "job": job,
+        "job_id": instance_id,
+        "result": result,
+    }
+    encoded = _canonical_json(body)
+    if len(encoded) > _MAX_OUTPUT_BYTES:
+        raise _Blocked("RESEARCH_OUTPUT_TOO_LARGE")
+    relpath = f"evidence/{instance_id}.json"
+    destination = policy.authorize(f".runtime/research/{relpath}")
+    _atomic_write(policy, destination, encoded)
+    return relpath, hashlib.sha256(encoded).hexdigest()
 
 
 def _verified_job_context(
@@ -129,15 +246,15 @@ def _verified_job_context(
             return None
         return {"session_completed": True}
 
-    contest = _read_frozen_contest(policy)
     if job == "screen":
-        request = _read_control(policy, "screen-request.json")
-        return {"request": request} if request is not None else None
+        return _derive_screen_context(policy)
+
+    contest = _read_frozen_contest(policy)
     if contest is None:
         return None
-    name = "predict-request.json" if job == "predict" else "settle-request.json"
-    request = _read_control(policy, name)
-    return {"contest": contest, "request": request} if request is not None else None
+    if job == "predict":
+        return _derive_predict_context(policy, contest)
+    return _derive_settle_context(policy, contest)
 
 
 def _run_history(
@@ -156,6 +273,11 @@ def _run_history(
         # Never bootstrap an exchange-wide multi-year download from a workbench
         # opening.  The coordinator itself has a bounded 100-symbol default.
         result = coordinator.run(start=end - timedelta(days=14), end=end, limit=100)
+        failures = getattr(result, "failures", {})
+        if failures:
+            if int(getattr(result, "rows_written", 0)) > 0:
+                raise _Partial("HISTORY_PARTIAL")
+            raise _Failed("HISTORY_ALL_FAILED")
         return {"kind": "history", "result": result.to_dict()}
     finally:
         close = getattr(provider, "close", None)
@@ -169,51 +291,29 @@ def _run_screen(
     """Run non-promotional historical engineering screening on verified inputs."""
 
     from a_share_quant.research.historical_screening import HistoricalEngineeringScreen
-    from a_share_quant.research.research_snapshot import ResearchSnapshotBuilder
-    from a_share_quant.storage.research_data_store import ResearchDataStore
-
-    request = context.get("request")
-    if not isinstance(request, dict):
+    snapshot = context.get("snapshot")
+    candidates = context.get("candidates")
+    if snapshot is None or not isinstance(candidates, tuple) or not candidates:
         raise _Blocked("VERIFIED_DATASET_NOT_READY")
-    store = ResearchDataStore(policy)
     try:
-        universe = store.active_artifact(
-            _request_text(request, "universe_dataset"),
-            _request_text(request, "universe_key"),
-        )
-        features = store.active_artifact(
-            _request_text(request, "feature_dataset"),
-            _request_text(request, "feature_key"),
-        )
-        labels = store.active_artifact(
-            _request_text(request, "label_dataset"),
-            _request_text(request, "label_key"),
-        )
-        if not all(store.verify(item) for item in (universe, features, labels)):
-            raise _Blocked("VERIFIED_DATASET_NOT_READY")
-        snapshot = ResearchSnapshotBuilder(
-            store,
-            universe_artifact=universe,
-            feature_artifact=features,
-            label_artifact=labels,
-        ).build(signal_cutoff=_request_date(request, "signal_cutoff"))
-        candidates = request.get("candidates")
-        if not isinstance(candidates, list) or not candidates:
-            raise _Blocked("SCREEN_CANDIDATES_NOT_READY")
         result = HistoricalEngineeringScreen().run(snapshot, candidates)
     except _Blocked:
         raise
     except (KeyError, TypeError, ValueError):
         raise _Blocked("VERIFIED_DATASET_NOT_READY") from None
     payload = result.to_dict()
-    _write_evidence(policy, "screen-result.json", payload)
-    return {"kind": "screen", "result": payload}
+    return {
+        "kind": "screen",
+        "result": payload,
+        "evidence_mode": "NON_PROMOTIONAL_ENGINEERING",
+        "promotion": "NEVER",
+    }
 
 
 def _run_predict(
     _root: Path, policy: ProjectStoragePolicy, context: dict[str, Any]
 ) -> dict[str, Any]:
-    """Append one precomputed, immutable future prediction to the frozen contest."""
+    """Append a future-only prediction derived from a verified daily signal."""
 
     from a_share_quant.research.prospective_competition import (
         ProspectiveCompetition,
@@ -222,48 +322,77 @@ def _run_predict(
     from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
     contest = _contest_from_payload(context.get("contest"))
-    request = context.get("request")
-    if not isinstance(request, dict) or not isinstance(request.get("prediction"), dict):
-        raise _Blocked("PREDICTION_REQUEST_NOT_READY")
+    signals = context.get("signals")
+    if not isinstance(signals, tuple) or not signals:
+        raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
+    now = _current_time()
     try:
-        prediction = ProspectivePrediction(**request["prediction"])
         competition = ProspectiveCompetition(
-            store=ProspectiveLedgerStore(policy=policy), contest=contest
+            store=ProspectiveLedgerStore(policy=policy), contest=contest, now=now
         )
-        appended = competition.append_prediction(prediction)
+        appended = tuple(
+            competition.append_prediction(
+                ProspectivePrediction(
+                    model_id=contest.model_id,
+                    model_version=contest.model_version,
+                    config_hash=contest.config_hash,
+                    training_snapshot_hash=contest.training_snapshot_hash,
+                    symbol=signal.symbol,
+                    name=signal.name,
+                    prediction_at=now,
+                    as_of=signal.data_cutoff,
+                    horizon=5,
+                    score=float(signal.normalized_score),
+                    # The daily rule emits a rank score, not a calibrated
+                    # probability.  This deterministic scale conversion is
+                    # recorded as uncalibrated and never presented as a
+                    # probability estimate to a user.
+                    probability=float(signal.normalized_score) / 100.0,
+                    guidance_price_bands={
+                        "reference": (float(signal.reference_price), float(signal.reference_price)),
+                        "invalidation": (
+                            float(signal.invalidation_price),
+                            float(signal.invalidation_price),
+                        ),
+                    },
+                )
+            )
+            for signal in signals
+        )
     except (TypeError, ValueError, KeyError):
-        raise _Blocked("PREDICTION_REQUEST_NOT_READY") from None
-    return {"kind": "predict", "prediction": appended.to_dict()}
+        raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY") from None
+    return {
+        "kind": "predict",
+        "predictions": [item.to_dict() for item in appended],
+        "input_integrity_digest": context.get("daily_signal_digest"),
+        "probability_semantics": "NORMALIZED_SCORE_NOT_CALIBRATED",
+    }
 
 
 def _run_settle(
     _root: Path, policy: ProjectStoragePolicy, context: dict[str, Any]
 ) -> dict[str, Any]:
-    """Settle only supplied, fresh, complete, post-refresh outcome observations."""
+    """Settle only fresh actual prices derived after a verified refresh."""
 
     from a_share_quant.research.prospective_competition import (
-        OutcomeObservation,
         ProspectiveCompetition,
     )
     from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
     contest = _contest_from_payload(context.get("contest"))
-    request = context.get("request")
-    raw_outcomes = request.get("outcomes") if isinstance(request, dict) else None
-    if not isinstance(raw_outcomes, list) or not raw_outcomes:
+    outcomes = context.get("outcomes")
+    if not isinstance(outcomes, tuple) or not outcomes:
         raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
     try:
-        outcomes = tuple(
-            OutcomeObservation(**item) for item in raw_outcomes if isinstance(item, dict)
-        )
-        if len(outcomes) != len(raw_outcomes):
-            raise ValueError
         competition = ProspectiveCompetition(
-            store=ProspectiveLedgerStore(policy=policy), contest=contest
+            store=ProspectiveLedgerStore(policy=policy),
+            contest=contest,
+            now=_current_time(),
         )
         results = competition.settle(outcomes)
     except (TypeError, ValueError, KeyError):
         raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+    ledger_digest = _ledger_integrity_digest(policy)
     return {
         "kind": "settle",
         "settlements": [
@@ -275,15 +404,302 @@ def _run_settle(
             }
             for item in results
         ],
+        "ledger_integrity_digest": ledger_digest,
     }
 
 
-def _read_control(policy: ProjectStoragePolicy, name: str) -> dict[str, Any] | None:
+def _derive_screen_context(policy: ProjectStoragePolicy) -> dict[str, Any] | None:
+    """Build an engineering snapshot directly from verified return artifacts."""
+
+    import pandas as pd
+
+    from a_share_quant.research.historical_screening import HistoricalCandidate
+    from a_share_quant.runtime.historical_backfill import HistoricalBackfillCoordinator
+    from a_share_quant.storage.research_data_store import ResearchDataset, ResearchDataStore
+
+    try:
+        store = ResearchDataStore(policy)
+        coverage = HistoricalBackfillCoordinator(store, None).coverage()
+        if coverage.symbol_count < 30 or coverage.session_count < 1750:
+            raise _Blocked("VERIFIED_DATASET_NOT_READY")
+        feature_frames: list[Any] = []
+        label_frames: list[Any] = []
+        artifacts: list[dict[str, str]] = []
+        for symbol in coverage.symbols:
+            artifact = store.active_artifact(ResearchDataset.RESEARCH_RETURNS, symbol)
+            if not store.verify(artifact):
+                raise _Blocked("VERIFIED_DATASET_NOT_READY")
+            policy.revalidate(artifact.path)
+            frame = pd.read_parquet(artifact.path)
+            features, labels = _derived_screen_frames(frame, symbol)
+            if not features.empty:
+                feature_frames.append(features)
+            if not labels.empty:
+                label_frames.append(labels)
+            artifacts.append(
+                {
+                    "symbol": str(symbol),
+                    "data_version": artifact.data_version,
+                    "sha256": artifact.sha256,
+                }
+            )
+        if not feature_frames or not label_frames:
+            raise _Blocked("VERIFIED_DATASET_NOT_READY")
+        features = pd.concat(feature_frames, ignore_index=True)
+        labels = pd.concat(label_frames, ignore_index=True)
+        if features.empty or labels.empty:
+            raise _Blocked("VERIFIED_DATASET_NOT_READY")
+        cutoff = max(pd.to_datetime(features["date"]).dt.date)
+        digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "kind": "verified-return-screen-v1",
+                    "coverage": coverage.to_dict(),
+                    "artifacts": artifacts,
+                }
+            )
+        ).hexdigest()
+        snapshot = _DerivedScreenSnapshot(
+            features=features,
+            labels=labels,
+            signal_cutoff=cutoff,
+            canonical_sha256=digest,
+        )
+        return {
+            "snapshot": snapshot,
+            "candidates": (
+                HistoricalCandidate(
+                    "derived-momentum-5",
+                    model_family="rule-baseline",
+                    score_column="feature_momentum_5",
+                ),
+                HistoricalCandidate(
+                    "derived-momentum-20",
+                    model_family="rule-baseline",
+                    score_column="feature_momentum_20",
+                ),
+            ),
+            "source_integrity_digest": digest,
+            "evidence_mode": "NON_PROMOTIONAL_ENGINEERING",
+        }
+    except _Blocked:
+        raise
+    except Exception:
+        # Do not make an unverifiable local artifact look like a screened
+        # candidate; the supervisor records only this bounded reason.
+        raise _Blocked("VERIFIED_DATASET_NOT_READY") from None
+
+
+def _derived_screen_frames(frame: Any, symbol: str) -> tuple[Any, Any]:
+    """Construct lagged features and matured labels without request-file input."""
+
+    import pandas as pd
+
+    required = {"date", "close", "research_usable"}
+    if not hasattr(frame, "columns") or not required.issubset(frame.columns):
+        raise ValueError("verified return schema is incomplete")
+    working = frame.copy(deep=True)
+    working["symbol"] = str(symbol).zfill(6)
+    working["date"] = pd.to_datetime(working["date"], errors="coerce")
+    working["close"] = pd.to_numeric(working["close"], errors="coerce")
+    usable = working["research_usable"].astype(bool)
+    working = working.loc[
+        usable & working["date"].notna() & working["close"].gt(0)
+    ].sort_values("date", kind="stable")
+    if working.empty or working["date"].duplicated().any():
+        raise ValueError("verified return sessions are invalid")
+    daily_return = working["close"].pct_change()
+    # Each feature is lagged by one observed session, preventing the same-day
+    # close from entering its own signal.  Labels are kept separately and have
+    # their exact outcome maturity date.
+    working["feature_momentum_5"] = daily_return.rolling(5).sum().shift(1)
+    working["feature_momentum_20"] = daily_return.rolling(20).sum().shift(1)
+    working["feature_volatility_20"] = daily_return.rolling(20).std().shift(1)
+    working["forward_return_5"] = working["close"].shift(-5) / working["close"] - 1.0
+    working["maturity_date"] = working["date"].shift(-5)
+    feature_columns = [
+        "symbol",
+        "date",
+        "feature_momentum_5",
+        "feature_momentum_20",
+        "feature_volatility_20",
+    ]
+    features = working.loc[:, feature_columns].copy()
+    features["available_at"] = features["date"]
+    features = features.dropna(
+        subset=["feature_momentum_5", "feature_momentum_20", "feature_volatility_20"]
+    )
+    labels = working.loc[
+        :, ["symbol", "date", "forward_return_5", "maturity_date"]
+    ].dropna(subset=["forward_return_5", "maturity_date"])
+    return features, labels
+
+
+def _derive_predict_context(
+    policy: ProjectStoragePolicy, contest: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Use current verified daily model output; never accept a prediction file."""
+
+    signals, digest = _verified_official_signals(policy)
+    frozen = _contest_from_payload(contest)
+    now = _current_time()
+    selected = tuple(
+        signal
+        for signal in signals
+        if signal.strategy_version == frozen.model_id
+        and signal.model_version == frozen.model_version
+        and signal.signal_date == now.date()
+        and signal.data_cutoff == signal.signal_date
+        and signal.generated_at <= now
+        and signal.reference_price is not None
+        and signal.invalidation_price is not None
+    )
+    if not selected:
+        raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
+    return {
+        "contest": contest,
+        "signals": selected,
+        "daily_signal_digest": digest,
+    }
+
+
+def _derive_settle_context(
+    policy: ProjectStoragePolicy, contest: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Derive actual outcomes from verified refreshed returns, never a JSON request."""
+
+    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
+
+    frozen = _contest_from_payload(contest)
+    now = _current_time()
+    ledger = ProspectiveLedgerStore(policy=policy)
+    settled = {item.prediction_id for item in ledger.settlements()}
+    due = tuple(
+        prediction
+        for prediction in ledger.predictions()
+        if prediction.id not in settled
+        and prediction.maturity_date <= now.date()
+        and (
+            prediction.model_id,
+            prediction.model_version,
+            prediction.config_hash,
+            prediction.training_snapshot_hash,
+        )
+        == (
+            frozen.model_id,
+            frozen.model_version,
+            frozen.config_hash,
+            frozen.training_snapshot_hash,
+        )
+    )
+    if not due:
+        raise _Blocked("NO_MATURED_PREDICTIONS")
+    outcomes = tuple(_derived_outcome(policy, prediction, now) for prediction in due)
+    return {
+        "contest": contest,
+        "outcomes": outcomes,
+        "input_integrity_digest": _ledger_integrity_digest(policy),
+    }
+
+
+def _derived_outcome(policy: ProjectStoragePolicy, prediction: Any, now: datetime) -> Any:
+    """Read one mature actual price from a verified immutable return artifact."""
+
+    import pandas as pd
+
+    from a_share_quant.research.prospective_competition import OutcomeObservation
+    from a_share_quant.storage.research_data_store import ResearchDataset, ResearchDataStore
+
+    try:
+        store = ResearchDataStore(policy)
+        artifact = store.active_artifact(ResearchDataset.RESEARCH_RETURNS, prediction.symbol)
+        if not store.verify(artifact) or artifact.created_at < prediction.prediction_at:
+            raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
+        policy.revalidate(artifact.path)
+        frame = pd.read_parquet(artifact.path)
+        required = {"date", "close", "research_usable", "trade_status"}
+        if not required.issubset(frame.columns):
+            raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
+        rows = frame.loc[
+            pd.to_datetime(frame["date"], errors="coerce").dt.date
+            == prediction.maturity_date
+        ].copy()
+        if len(rows) != 1:
+            raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
+        row = rows.iloc[0]
+        price = float(row["close"])
+        reference = float(prediction.guidance_price_bands["reference"][0])
+        if (
+            not price > 0
+            or not reference > 0
+            or not bool(row["research_usable"])
+            or str(row["trade_status"]).strip() != "1"
+        ):
+            raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
+        return OutcomeObservation(
+            prediction_id=prediction.id,
+            symbol=prediction.symbol,
+            maturity_date=prediction.maturity_date,
+            outcome_at=now,
+            realized_price=price,
+            realized_return=price / reference - 1.0,
+            data_version=artifact.data_version,
+            data_sha256=artifact.sha256,
+            status="OK",
+            fresh=True,
+            complete=True,
+            session_aligned=True,
+            corporate_action_ok=True,
+        )
+    except _Blocked:
+        raise
+    except Exception:
+        raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+
+
+def _verified_official_signals(policy: ProjectStoragePolicy) -> tuple[tuple[Any, ...], str]:
+    """Load a fixed, integrity-checked daily artifact without creating it."""
+
+    from a_share_quant.storage.official_signal_store import OfficialSignalStore
+
+    path = policy.authorize(".runtime/signals/official-daily.json")
+    try:
+        policy.revalidate(path)
+        raw = path.read_bytes()
+        if not raw or len(raw) > _MAX_INTEGRITY_ARTIFACT_BYTES:
+            raise ValueError
+        digest = hashlib.sha256(raw).hexdigest()
+        signals = OfficialSignalStore(path=path).latest()
+        policy.revalidate(path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest or not signals:
+            raise ValueError
+        return signals, digest
+    except (OSError, TypeError, ValueError):
+        raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY") from None
+
+
+def _ledger_integrity_digest(policy: ProjectStoragePolicy) -> str:
+    path = policy.authorize(".runtime/research/prospective/predictions.jsonl")
+    try:
+        policy.revalidate(path)
+        raw = path.read_bytes()
+    except OSError:
+        raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _current_time() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _read_integrity_artifact(policy: ProjectStoragePolicy, name: str) -> dict[str, Any] | None:
+    """Read a project-owned SHA-256 integrity artifact, not a signature."""
+
     path = policy.authorize(f".runtime/research/{name}")
     try:
         policy.revalidate(path)
         raw = path.read_bytes()
-        if not raw or len(raw) > _MAX_CONTROL_BYTES:
+        if not raw or len(raw) > _MAX_INTEGRITY_ARTIFACT_BYTES:
             return None
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
@@ -299,7 +715,7 @@ def _read_control(policy: ProjectStoragePolicy, name: str) -> dict[str, Any] | N
 
 
 def _read_frozen_contest(policy: ProjectStoragePolicy) -> dict[str, Any] | None:
-    payload = _read_control(policy, "prospective-contest.json")
+    payload = _read_integrity_artifact(policy, "prospective-contest.json")
     if payload is None:
         return None
     try:
@@ -316,7 +732,29 @@ def _contest_from_payload(payload: Any):
 
     if not isinstance(payload, dict):
         raise ValueError("contest is required")
-    required = (
+    required = frozenset(
+        {
+            "format_version",
+            "contest_started_at",
+            "model_id",
+            "model_version",
+            "config_hash",
+            "training_snapshot_hash",
+            "official_signal_digest",
+            "primary_metric",
+            "tie_break",
+            "provisional_sessions",
+            "provisional_matured_predictions",
+            "approval_sessions",
+            "approval_matured_predictions",
+            "evidence_mode",
+            "status",
+            "promotion",
+        }
+    )
+    if set(payload) != required:
+        raise ValueError("frozen contest fields are invalid")
+    required_values = (
         "model_id",
         "model_version",
         "config_hash",
@@ -325,10 +763,12 @@ def _contest_from_payload(payload: Any):
         "tie_break",
         "contest_started_at",
     )
-    if any(not payload.get(key) for key in required):
+    if any(not payload.get(key) for key in required_values):
         raise ValueError("contest fields are missing")
     if (
-        payload.get("format_version") != 2
+        payload.get("format_version") != 3
+        or _sha256_text(payload.get("official_signal_digest"), "official_signal_digest")
+        != payload.get("official_signal_digest")
         or payload.get("provisional_sessions") != 20
         or payload.get("provisional_matured_predictions") != 100
         or payload.get("approval_sessions") != 60
@@ -356,17 +796,6 @@ def _contest_from_payload(payload: Any):
         started_at=started,
     )
     return contest
-
-
-def _request_text(request: dict[str, Any], name: str) -> str:
-    value = str(request.get(name, "")).strip()
-    if not value or len(value) > 128 or any(token in value for token in ("..", "/", "\\")):
-        raise ValueError(f"{name} is invalid")
-    return value
-
-
-def _request_date(request: dict[str, Any], name: str) -> date:
-    return date.fromisoformat(_request_text(request, name))
 
 
 def _sha256_text(value: Any, name: str) -> str:

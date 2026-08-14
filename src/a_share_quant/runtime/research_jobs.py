@@ -30,7 +30,10 @@ _ALLOWED_COMMANDS = frozenset(
         ("research", "settle"),
     }
 )
-_NETWORK_COMMANDS = frozenset({("research", "history"), ("research", "settle")})
+# Only history collection contacts a provider.  Settlement consumes the local,
+# already refreshed research store, so it remains available in an offline
+# workbench without weakening the no-network boundary.
+_NETWORK_COMMANDS = frozenset({("research", "history")})
 _DEFAULT_STAGE = {
     ("research", "history"): "history-backfill",
     ("research", "screen"): "engineering-screen",
@@ -40,6 +43,7 @@ _DEFAULT_STAGE = {
 _VALID_STAGES = frozenset(_DEFAULT_STAGE.values())
 _MAX_CHECKPOINT_BYTES = 1_048_576
 _MAX_STATUS_BYTES = 65_536
+_MAX_RETAINED_TERMINAL_JOBS = 64
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,7 @@ class ResearchJob:
     completed: bool = False
     process_exit_code: int | None = None
     failure_reason: str | None = None
+    cycle_key: str = ""
 
     @property
     def resource_class(self) -> str:
@@ -108,7 +113,17 @@ class ResearchJobSupervisor:
     @property
     def _repo_root(self) -> Path:
         # Production checkpoints live at <repo>/.runtime/research.
+        if self.storage_policy is not None:
+            return self.storage_policy.repo_root
         return self.root.parents[1]
+
+    def status_path_for(self, job_id: str) -> Path:
+        """Return the fixed per-instance worker status target for ``job_id``."""
+
+        normalized = str(job_id).strip()
+        if not normalized or _unsafe_argument(normalized):
+            raise ValueError("job id is not safe")
+        return self._revalidate(self.root / "status" / f"{normalized}.json")
 
     def register_job(
         self,
@@ -185,40 +200,65 @@ class ResearchJobSupervisor:
         if (
             self.network_enabled
             and session_completed
-            and self._last_history_session != session_key
-            and self._register_if_needed(
-                "history-backfill",
+            and (
+                job_id := self._register_cycle(
                 ("research", "history"),
                 current,
                 fingerprint,
+                cycle_key=f"history:{session_key}",
+                )
             )
         ):
             self._last_history_session = session_key
-            registered.append("history-backfill")
+            registered.append(job_id)
 
         if (
             fingerprint
-            and fingerprint != self._last_screen_fingerprint
-            and self._register_if_needed(
-                "screen", ("research", "screen"), current, fingerprint
+            and (
+                job_id := self._register_cycle(
+                    ("research", "screen"),
+                    current,
+                    fingerprint,
+                    cycle_key=f"screen:{fingerprint}",
+                )
             )
         ):
             self._last_screen_fingerprint = fingerprint
-            registered.append("screen")
+            registered.append(job_id)
 
         if (
             outcome_cutoff is not None
             and current < _utc(outcome_cutoff)
-            and self._register_if_needed(
-                "predict", ("research", "predict"), current, fingerprint
+            and (
+                job_id := self._register_cycle(
+                    ("research", "predict"),
+                    current,
+                    fingerprint,
+                    cycle_key=(
+                        f"predict:{fingerprint or 'no-fingerprint'}:"
+                        f"{_utc(outcome_cutoff).date().isoformat()}"
+                    ),
+                )
             )
         ):
-            registered.append("predict")
+            registered.append(job_id)
 
-        if self.network_enabled and data_refreshed and self._register_if_needed(
-            "settle", ("research", "settle"), current, fingerprint
+        if (
+            data_refreshed
+            and (
+                job_id := self._register_cycle(
+                    ("research", "settle"),
+                    current,
+                    fingerprint,
+                    cycle_key=(
+                        f"settle:{fingerprint or 'no-fingerprint'}:"
+                        f"{current.date().isoformat()}"
+                    ),
+                )
+            )
         ):
-            registered.append("settle")
+            registered.append(job_id)
+        self._prune_terminal_history()
         return tuple(registered)
 
     def start_due_jobs(self, *, now: datetime) -> tuple[str, ...]:
@@ -253,7 +293,7 @@ class ResearchJobSupervisor:
                 child = self._launch_job(job)
             except Exception:
                 self._jobs[job.job_id] = replace(
-                    job, failure_reason="LAUNCH_FAILED", process_exit_code=None
+                    job, failure_reason="LAUNCH_FAILED", process_exit_code=-1
                 )
                 self._terminal_job_ids.add(job.job_id)
                 continue
@@ -299,33 +339,69 @@ class ResearchJobSupervisor:
     def resume_eligible_jobs(self) -> tuple[str, ...]:
         """Return checkpoint-restored non-complete jobs without launching them."""
 
-        return tuple(job.job_id for job in self._jobs.values() if not job.completed)
+        # A restored terminal failure cannot be launched again in the same
+        # cycle.  Reporting it as resumable used to leave an operator-facing
+        # phantom job: it appeared eligible yet ``start_due_jobs`` would
+        # correctly refuse to relaunch it.  A later, distinct cycle remains
+        # eligible through ``_register_cycle``.
+        return tuple(
+            job.job_id
+            for job in self._jobs.values()
+            if not job.completed and job.job_id not in self._terminal_job_ids
+        )
 
-    def _register_if_needed(
+    def _register_cycle(
         self,
-        job_id: str,
         command: tuple[str, ...],
         due_at: datetime,
         fingerprint: str | None,
-    ) -> bool:
+        *,
+        cycle_key: str,
+    ) -> str | None:
+        """Register one deterministic, auditable lifecycle cycle.
+
+        A stage name alone is intentionally never the persistent identity.  A
+        new verified input fingerprint, completed-session date, or prediction
+        window produces a distinct instance while repeated ticks in that same
+        cycle return ``None``.  This keeps an old worker status from being
+        interpreted as success for fresh input.
+        """
+
+        normalized_cycle = _safe_metadata(cycle_key, "cycle_key")
+        if normalized_cycle is None:
+            raise ValueError("cycle key is required")
+        job_id = _cycle_job_id(command, normalized_cycle)
         existing = self._jobs.get(job_id)
         if existing is not None:
-            # The same artifact must not be recomputed on every workbench tick.
+            # A deterministic ID can only refer to exactly one internal
+            # contract.  Treat a mismatch as corruption rather than replacing
+            # state while an owned child may still be running.
             if (
-                existing.command == command
-                and existing.input_fingerprint == fingerprint
+                existing.command != command
+                or existing.cycle_key != normalized_cycle
+                or existing.input_fingerprint != fingerprint
             ):
-                return False
-            if job_id in self._children:
-                return False
-        self.register_job(job_id, command, due_at=due_at, input_fingerprint=fingerprint)
-        return True
+                raise ValueError("cycle identity does not match existing job")
+            return None
+        resolved_stage = _DEFAULT_STAGE[command]
+        self._jobs[job_id] = ResearchJob(
+            job_id=job_id,
+            command=command,
+            due_at=_utc(due_at),
+            input_fingerprint=fingerprint,
+            stage=resolved_stage,
+            next_eligible_at=_utc(due_at),
+            cycle_key=normalized_cycle,
+        )
+        self._terminal_job_ids.discard(job_id)
+        return job_id
 
     def _launch_job(self, job: ResearchJob) -> Any:
         if self._launcher is not None:
             return self._launcher(job.command)
         return _default_launcher(
             job.command,
+            job_id=job.job_id,
             repo_root=self._repo_root,
             storage_policy=self.storage_policy,
             network_enabled=self.network_enabled,
@@ -342,7 +418,12 @@ class ResearchJobSupervisor:
             status = self._read_child_status(job)
             digest = _safe_status_digest(status.get("artifact_digest"))
             status_value = str(status.get("status", "")).upper()
-            success = exit_code == 0 and status_value == "SUCCESS" and digest is not None
+            success = (
+                exit_code == 0
+                and status_value == "SUCCESS"
+                and digest is not None
+                and self._status_has_verified_artifact(job, status, digest)
+            )
             reason = _safe_reason(status.get("reason_code"))
             if not success and reason is None:
                 reason = "STATUS_MISSING" if not status else "WORKER_FAILED"
@@ -354,22 +435,62 @@ class ResearchJobSupervisor:
                 failure_reason=None if success else reason,
             )
             self._terminal_job_ids.add(job_id)
+            # Terminal children have already exited.  Releasing the process
+            # wrapper makes bounded lifecycle retention effective while the
+            # immutable job record remains in the checkpoint.
+            self._children.pop(job_id, None)
+        self._prune_terminal_history()
 
     def _read_child_status(self, job: ResearchJob) -> dict[str, Any]:
-        path = self.root / f"{job.command[1]}-status.json"
+        path = self.status_path_for(job.job_id)
         try:
             self._revalidate(path)
             raw = path.read_bytes()
             if not raw or len(raw) > _MAX_STATUS_BYTES:
                 return {}
             payload = json.loads(raw.decode("utf-8"))
-            return payload if isinstance(payload, dict) else {}
+            if (
+                not isinstance(payload, dict)
+                or payload.get("job_id") != job.job_id
+                or payload.get("job") != job.command[1]
+            ):
+                return {}
+            return payload
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
             return {}
 
+    def _status_has_verified_artifact(
+        self, job: ResearchJob, status: dict[str, Any], digest: str
+    ) -> bool:
+        """Verify the child bound success to its own immutable evidence file."""
+
+        expected_relpath = f"evidence/{job.job_id}.json"
+        if status.get("artifact_relpath") != expected_relpath:
+            return False
+        try:
+            artifact = self._revalidate(self.root / expected_relpath)
+            raw = artifact.read_bytes()
+        except (OSError, ValueError):
+            return False
+        actual = hashlib.sha256(raw).hexdigest()
+        return actual == digest.removeprefix("sha256:")
+
+    def _prune_terminal_history(self) -> None:
+        """Bound completed/failed instance retention without touching children."""
+
+        terminal = [
+            job_id
+            for job_id in self._jobs
+            if job_id in self._terminal_job_ids and job_id not in self._children
+        ]
+        removable = terminal[:-_MAX_RETAINED_TERMINAL_JOBS]
+        for job_id in removable:
+            self._jobs.pop(job_id, None)
+            self._terminal_job_ids.discard(job_id)
+
     def _write_checkpoint(self) -> bool:
         body = {
-            "format_version": 3,
+            "format_version": 4,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "jobs": [
                 {
@@ -384,6 +505,7 @@ class ResearchJobSupervisor:
                     "completed": job.completed,
                     "process_exit_code": job.process_exit_code,
                     "failure_reason": job.failure_reason,
+                    "cycle_key": job.cycle_key or None,
                 }
                 for job in self._jobs.values()
             ],
@@ -426,7 +548,7 @@ class ResearchJobSupervisor:
             if not raw or len(raw) > _MAX_CHECKPOINT_BYTES:
                 return None
             parsed = json.loads(raw.decode("utf-8"))
-            if not isinstance(parsed, dict) or parsed.get("format_version") not in {2, 3}:
+            if not isinstance(parsed, dict) or parsed.get("format_version") not in {2, 3, 4}:
                 return None
             digest = parsed.get("sha256")
             body = {key: value for key, value in parsed.items() if key != "sha256"}
@@ -471,10 +593,14 @@ class ResearchJobSupervisor:
                     completed=bool(item.get("completed", False)),
                     process_exit_code=item.get("process_exit_code"),
                     failure_reason=_safe_reason(item.get("failure_reason")),
+                    cycle_key=_safe_metadata(item.get("cycle_key"), "cycle_key")
+                    or _legacy_cycle_key(command, item),
                 )
             except (TypeError, ValueError):
                 return
             restored[job_id] = job
+            if job.completed or job.process_exit_code is not None:
+                self._terminal_job_ids.add(job_id)
             if command == ("research", "screen"):
                 screen_fingerprint = job.input_fingerprint
             elif command == ("research", "history"):
@@ -510,6 +636,12 @@ class ResearchJobSupervisor:
                 _safe_metadata(item.get(key), key)
             except ValueError:
                 return False
+        try:
+            cycle_key = _safe_metadata(item.get("cycle_key"), "cycle_key")
+        except ValueError:
+            return False
+        if item.get("cycle_key") is not None and cycle_key is None:
+            return False
         completed_digest = item.get("completed_artifact_digest")
         try:
             _safe_metadata(completed_digest, "completed_artifact_digest")
@@ -600,6 +732,27 @@ def _unsafe_argument(value: str) -> bool:
     return any(token in value for token in ("..", "/", "\\", "--"))
 
 
+def _cycle_job_id(command: tuple[str, ...], cycle_key: str) -> str:
+    """Return a stable, non-user-path identity for one lifecycle cycle."""
+
+    if command not in _ALLOWED_COMMANDS:
+        raise ValueError("job is not allowlisted")
+    encoded = json.dumps(
+        {"command": list(command), "cycle_key": cycle_key},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{command[1]}-{hashlib.sha256(encoded).hexdigest()[:20]}"
+
+
+def _legacy_cycle_key(command: tuple[str, ...], item: dict[str, Any]) -> str:
+    """Give pre-v4 checkpoint records a fixed audit identity on restore."""
+
+    fingerprint = str(item.get("input_fingerprint") or "no-fingerprint")
+    due = str(item.get("due_at") or "unknown")
+    return f"legacy:{command[1]}:{fingerprint}:{due}"
+
+
 def _child_return_code(child: Any) -> int | None:
     try:
         poll = getattr(child, "poll", None)
@@ -618,6 +771,7 @@ def _child_return_code(child: Any) -> int | None:
 def _default_launcher(
     command: tuple[str, ...],
     *,
+    job_id: str,
     repo_root: Path,
     storage_policy: ProjectStoragePolicy | None,
     network_enabled: bool = True,
@@ -629,6 +783,7 @@ def _default_launcher(
     environment = policy.child_environment(os.environ)
     environment["A_SHARE_QUANT_RESEARCH_WORKBENCH"] = "1"
     environment["A_SHARE_QUANT_RESEARCH_NETWORK"] = "1" if network_enabled else "0"
+    environment["A_SHARE_QUANT_RESEARCH_JOB_ID"] = job_id
     if command == ("research", "history"):
         environment["A_SHARE_QUANT_RESEARCH_HISTORY_READY"] = "1"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

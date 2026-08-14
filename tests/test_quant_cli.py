@@ -1,5 +1,6 @@
 import os
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -155,12 +156,10 @@ def test_workbench_cli_persists_governance_and_starts_owned_research_job(
             captured["network_enabled"] = kwargs.get("network_enabled")
 
         def register_default_jobs(self, **kwargs):
-            captured["schedule"] = kwargs
-            return ()
+            raise AssertionError("CLI must not schedule outside server lifecycle")
 
         def start_due_jobs(self, *, now):
-            captured["started_at"] = now
-            return ("forecast-on-launch",)
+            raise AssertionError("CLI must not launch outside server lifecycle")
 
     class Governance:
         def __init__(self, **kwargs):
@@ -199,8 +198,15 @@ def test_workbench_cli_persists_governance_and_starts_owned_research_job(
         ".runtime\\research\\evolution-registry.json"
     )
     assert captured["network_enabled"] is False
-    assert "schedule" in captured
-    assert "started_at" in captured
+    context = captured["run"]["research_context_supplier"](
+        datetime(2026, 8, 14, tzinfo=timezone.utc), object()
+    )
+    assert context == {
+        "session_completed": False,
+        "data_fingerprint": None,
+        "data_refreshed": False,
+        "outcome_cutoff": None,
+    }
 
 
 def test_workbench_cli_does_not_block_http_startup_on_daily_network_refresh(
@@ -248,17 +254,17 @@ def test_task8_workbench_registers_defaults_and_offline_never_launches_network(
             raise AssertionError("workbench must not hand-register only predict")
 
         def register_default_jobs(self, **kwargs):
-            captured["schedule"] = kwargs
-            return ("screen", "predict")
+            raise AssertionError("CLI must not schedule outside server lifecycle")
 
         def start_due_jobs(self, **kwargs):
-            captured["started"] = kwargs
-            return ("screen",)
+            raise AssertionError("CLI must not launch outside server lifecycle")
 
     monkeypatch.setattr("scripts.quant_cli.ResearchJobSupervisor", Supervisor)
     monkeypatch.setattr("scripts.quant_cli.EvolutionRegistry", lambda **_kwargs: object())
     monkeypatch.setattr("scripts.quant_cli.AdvisoryWorkbenchService", lambda **_kwargs: object())
-    monkeypatch.setattr("scripts.quant_cli.run_server", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        "scripts.quant_cli.run_server", lambda **kwargs: captured.update(run=kwargs)
+    )
     monkeypatch.setattr(
         "scripts.quant_cli._workbench_research_context",
         lambda _root, _now: {
@@ -282,14 +288,15 @@ def test_task8_workbench_registers_defaults_and_offline_never_launches_network(
     ) == 0
 
     assert captured["supervisor_kwargs"]["network_enabled"] is False
-    assert captured["schedule"] == {
+    context = captured["run"]["research_context_supplier"](
+        datetime(2026, 8, 14, tzinfo=timezone.utc), object()
+    )
+    assert context == {
         "session_completed": True,
         "data_fingerprint": "verified-data",
         "data_refreshed": True,
-        "outcome_cutoff": captured["schedule"]["outcome_cutoff"],
-        "now": captured["schedule"]["now"],
+        "outcome_cutoff": datetime(2026, 8, 14, tzinfo=timezone.utc),
     }
-    assert "started" in captured
 
 
 def test_task8_research_status_is_read_only_and_screen_does_not_bypass_supervisor(
@@ -323,6 +330,7 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
         "model_version": "2026.08.14",
         "config_hash": "c" * 64,
         "training_snapshot_hash": "d" * 64,
+        "official_signal_digest": "e" * 64,
     }
     terms = {
         "primary_metric": "net_cost_return",
@@ -333,7 +341,7 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
         "approval_matured_predictions": 200,
     }
     monkeypatch.setattr(
-        "scripts.quant_cli._frozen_model_registration",
+        "scripts.quant_cli._derived_model_registration",
         lambda _root, _policy: registration,
         raising=False,
     )
@@ -350,12 +358,13 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
     assert frozen["model_version"] == "2026.08.14"
     assert frozen["config_hash"] == "c" * 64
     assert frozen["training_snapshot_hash"] == "d" * 64
+    assert frozen["official_signal_digest"] == "e" * 64
     assert frozen["primary_metric"] == "net_cost_return"
     assert frozen["tie_break"] == terms["tie_break"]
     assert frozen["provisional_sessions"] == 20
     assert frozen["approval_matured_predictions"] == 200
     monkeypatch.setattr(
-        "scripts.quant_cli._frozen_model_registration",
+        "scripts.quant_cli._derived_model_registration",
         lambda _root, _policy: (_ for _ in ()).throw(
             AssertionError("an existing frozen contest must not depend on newer inputs")
         ),
@@ -367,3 +376,131 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
     path.write_text(__import__("json").dumps(tampered), encoding="utf-8")
     with pytest.raises(SystemExit, match="校验"):
         quant_cli._freeze_contest(d_cli_root)
+
+
+def test_task8_contest_first_writer_uses_exclusive_create_and_fixed_terms(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    """A later caller may only verify the first immutable contest artifact."""
+
+    from scripts import quant_cli
+
+    registration = {
+        "model_id": "official-rule-v1",
+        "model_version": "daily-rule-v1",
+        "config_hash": "c" * 64,
+        "training_snapshot_hash": "d" * 64,
+        "official_signal_digest": "e" * 64,
+    }
+    terms = {
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+    }
+    calls = 0
+
+    def derived(_root, _policy):
+        nonlocal calls
+        calls += 1
+        return registration
+
+    monkeypatch.setattr(
+        quant_cli, "_derived_model_registration", derived, raising=False
+    )
+    monkeypatch.setattr(quant_cli, "_contest_terms", lambda _root: terms)
+    monkeypatch.setattr(
+        Path,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("contest freeze must not replace an existing target")
+        ),
+    )
+
+    first = quant_cli._freeze_contest(d_cli_root)
+    second = quant_cli._freeze_contest(d_cli_root)
+
+    assert first == second
+    assert calls == 1
+    assert first["format_version"] == 3
+    assert first["official_signal_digest"] == "e" * 64
+    assert first["primary_metric"] == "net_cost_return"
+    assert first["tie_break"] == terms["tie_break"]
+
+
+def test_task8_contest_start_rejects_nonfixed_metric_or_tie_break(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    """Terms are governance constants, not a caller-controlled YAML preference."""
+
+    from scripts import quant_cli
+
+    monkeypatch.setattr(
+        quant_cli,
+        "_derived_model_registration",
+        lambda _root, _policy: {
+            "model_id": "official-rule-v1",
+            "model_version": "daily-rule-v1",
+            "config_hash": "c" * 64,
+            "training_snapshot_hash": "d" * 64,
+            "official_signal_digest": "e" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        quant_cli,
+        "_contest_terms",
+        lambda _root: {
+            "primary_metric": "sharpe",
+            "tie_break": ["turnover"],
+            "provisional_sessions": 20,
+            "provisional_matured_predictions": 100,
+            "approval_sessions": 60,
+            "approval_matured_predictions": 200,
+        },
+    )
+
+    with pytest.raises(SystemExit, match="固定"):
+        quant_cli._freeze_contest(d_cli_root)
+    assert not (d_cli_root / ".runtime" / "research" / "prospective-contest.json").exists()
+
+
+def test_task8_workbench_context_does_not_queue_predict_before_daily_input(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    """A contest alone is insufficient; predict waits for verified daily data."""
+
+    from scripts import quant_cli
+
+    monkeypatch.setattr(
+        quant_cli,
+        "_derived_model_registration",
+        lambda _root, _policy: {
+            "model_id": "official-rule-v1",
+            "model_version": "daily-rule-v1",
+            "config_hash": "c" * 64,
+            "training_snapshot_hash": "d" * 64,
+            "official_signal_digest": "e" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        quant_cli,
+        "_contest_terms",
+        lambda _root: {
+            "primary_metric": "net_cost_return",
+            "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+            "provisional_sessions": 20,
+            "provisional_matured_predictions": 100,
+            "approval_sessions": 60,
+            "approval_matured_predictions": 200,
+        },
+    )
+    quant_cli._freeze_contest(d_cli_root)
+
+    context = quant_cli._workbench_research_context(
+        d_cli_root, datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    )
+
+    assert context["data_refreshed"] is False
+    assert context["outcome_cutoff"] is None

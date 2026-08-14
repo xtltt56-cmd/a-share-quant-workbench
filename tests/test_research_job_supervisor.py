@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -57,10 +58,12 @@ class FakeChild:
 class FakeLauncher:
     def __init__(self) -> None:
         self.children: list[FakeChild] = []
+        self.commands: list[tuple[str, ...]] = []
 
     def __call__(self, command: tuple[str, ...]) -> FakeChild:
         child = FakeChild()
         self.children.append(child)
+        self.commands.append(command)
         return child
 
 
@@ -135,7 +138,12 @@ def test_default_schedule_respects_session_fingerprint_and_refresh_boundaries(tm
         outcome_cutoff=now + timedelta(days=5),
     )
 
-    assert jobs == ("history-backfill", "screen", "predict", "settle")
+    assert {job_id.split("-", maxsplit=1)[0] for job_id in jobs} == {
+        "history",
+        "screen",
+        "predict",
+        "settle",
+    }
     assert supervisor.register_default_jobs(
         now=now + timedelta(minutes=1),
         session_completed=True,
@@ -151,7 +159,21 @@ def test_default_schedule_respects_session_fingerprint_and_refresh_boundaries(tm
         data_fingerprint="dataset-a",
         data_refreshed=False,
         outcome_cutoff=now + timedelta(days=5),
-    ) == ("screen", "predict")
+    )
+    assert {
+        job_id.split("-", maxsplit=1)[0]
+        for job_id in supervisor2.resume_eligible_jobs()
+    } == {"screen", "predict"}
+
+    next_day = supervisor.register_default_jobs(
+        now=now + timedelta(days=1),
+        session_completed=True,
+        data_fingerprint="dataset-a",
+        data_refreshed=False,
+        outcome_cutoff=now + timedelta(days=5),
+    )
+    assert len(next_day) == 1
+    assert next_day[0].startswith("history-")
 
 
 def test_start_due_jobs_limits_one_cpu_and_one_network_child(tmp_path) -> None:
@@ -168,7 +190,10 @@ def test_start_due_jobs_limits_one_cpu_and_one_network_child(tmp_path) -> None:
 
     started = supervisor.start_due_jobs(now=now)
 
-    assert set(started) == {"history-backfill", "screen"}
+    assert {job_id.split("-", maxsplit=1)[0] for job_id in started} == {
+        "history",
+        "screen",
+    }
     assert len(launcher.children) == 2
 
 
@@ -249,7 +274,9 @@ def test_task8_offline_supervisor_never_starts_network_jobs(
         outcome_cutoff=now + timedelta(days=1),
     )
 
-    assert supervisor.start_due_jobs(now=now) == ("screen",)
+    started = supervisor.start_due_jobs(now=now)
+    assert len(started) == 1
+    assert started[0].startswith("screen-")
     assert [child for child in launcher.children] and len(launcher.children) == 1
 
 
@@ -291,17 +318,7 @@ def test_task8_successful_child_is_not_relaunched_and_result_is_checkpointed(
     now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
     supervisor.register_job("screen", ("research", "screen"), due_at=now)
     assert supervisor.start_due_jobs(now=now) == ("screen",)
-    status = d_research_root / "screen-status.json"
-    status.write_text(
-        json.dumps(
-            {
-                "status": "SUCCESS",
-                "artifact_digest": "a" * 64,
-                "reason_code": None,
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_instance_success(supervisor, "screen", {"legacy": "persisted"})
     launcher.children[0].running = False
 
     assert supervisor.start_due_jobs(now=now + timedelta(minutes=1)) == ()
@@ -310,4 +327,153 @@ def test_task8_successful_child_is_not_relaunched_and_result_is_checkpointed(
     checkpoint = json.loads((d_research_root / "research-checkpoint.json").read_text())
     assert checkpoint["jobs"][0]["completed"] is True
     assert checkpoint["jobs"][0]["process_exit_code"] == 0
-    assert checkpoint["jobs"][0]["artifact_digest"] == "a" * 64
+    assert checkpoint["jobs"][0]["artifact_digest"] == hashlib.sha256(
+        json.dumps({"legacy": "persisted"}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _write_instance_success(
+    supervisor: ResearchJobSupervisor, job_id: str, body: dict[str, object]
+) -> None:
+    """Create the durable artifact that a worker success status must bind to."""
+
+    artifact = supervisor.root / "evidence" / f"{job_id}.json"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(body, sort_keys=True).encode("utf-8")
+    artifact.write_bytes(encoded)
+    status = {
+        "format_version": 3,
+        "job_id": job_id,
+        "job": job_id.split("-", maxsplit=1)[0],
+        "status": "SUCCESS",
+        "reason_code": None,
+        "artifact_relpath": artifact.relative_to(supervisor.root).as_posix(),
+        "artifact_digest": hashlib.sha256(encoded).hexdigest(),
+    }
+    path = supervisor.status_path_for(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(status), encoding="utf-8")
+
+
+def test_task8_periodic_instances_ignore_static_stale_status_and_retry_next_cycle(
+    d_research_root: Path,
+) -> None:
+    """A new input cycle must never inherit a prior static stage status."""
+
+    launcher = FakeLauncher()
+    supervisor = ResearchJobSupervisor(
+        d_research_root,
+        launcher=launcher,
+        storage_policy=ProjectStoragePolicy(d_research_root),
+    )
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+
+    first = supervisor.register_default_jobs(
+        now=now,
+        data_fingerprint="verified-dataset-a",
+    )
+    assert len(first) == 1
+    first_id = first[0]
+    assert supervisor.start_due_jobs(now=now) == (first_id,)
+    _write_instance_success(supervisor, first_id, {"cycle": "a"})
+    launcher.children[0].running = False
+    assert supervisor.start_due_jobs(now=now + timedelta(minutes=1)) == ()
+
+    second = supervisor.register_default_jobs(
+        now=now + timedelta(minutes=2),
+        data_fingerprint="verified-dataset-b",
+    )
+    assert len(second) == 1
+    second_id = second[0]
+    assert second_id != first_id
+    assert supervisor.start_due_jobs(now=now + timedelta(minutes=2)) == (second_id,)
+
+    # This is the old shared stage filename. It must not complete a different
+    # per-cycle job instance.
+    (d_research_root / "screen-status.json").write_text(
+        json.dumps({"status": "SUCCESS", "artifact_digest": "f" * 64}),
+        encoding="utf-8",
+    )
+    launcher.children[1].running = False
+    assert supervisor.start_due_jobs(now=now + timedelta(minutes=3)) == ()
+    assert second_id not in supervisor.resume_eligible_jobs()
+
+    third = supervisor.register_default_jobs(
+        now=now + timedelta(days=1),
+        data_fingerprint="verified-dataset-c",
+    )
+    assert len(third) == 1
+    assert third[0] not in {first_id, second_id}
+
+
+def test_task8_next_tick_starts_queued_cpu_job_after_prior_cpu_exits(
+    d_research_root: Path,
+) -> None:
+    """The next lifecycle tick drains a queued CPU job without a busy loop."""
+
+    launcher = FakeLauncher()
+    supervisor = ResearchJobSupervisor(
+        d_research_root,
+        launcher=launcher,
+        storage_policy=ProjectStoragePolicy(d_research_root),
+    )
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    jobs = supervisor.register_default_jobs(
+        now=now,
+        session_completed=True,
+        data_fingerprint="verified-dataset-a",
+        data_refreshed=True,
+        outcome_cutoff=now + timedelta(days=1),
+    )
+    started = supervisor.start_due_jobs(now=now)
+    screen_id = next(job_id for job_id in started if job_id.startswith("screen-"))
+    screen_child = launcher.children[launcher.commands.index(("research", "screen"))]
+    _write_instance_success(supervisor, screen_id, {"screen": "persisted"})
+    screen_child.running = False
+
+    next_started = supervisor.start_due_jobs(now=now + timedelta(minutes=1))
+
+    assert next(job_id for job_id in jobs if job_id.startswith("predict-")) in next_started
+    assert any(command == ("research", "history") for command in launcher.commands)
+
+
+def test_task8_restored_terminal_failure_is_not_resume_eligible_but_next_cycle_retries(
+    d_research_root: Path,
+) -> None:
+    """A failed instance is terminal; fresh verified input creates its retry."""
+
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    first_launcher = FakeLauncher()
+    first = ResearchJobSupervisor(
+        d_research_root,
+        launcher=first_launcher,
+        storage_policy=ProjectStoragePolicy(d_research_root),
+    )
+    original = first.register_default_jobs(
+        now=now, data_fingerprint="verified-dataset-a"
+    )
+    original_id = original[0]
+    assert first.start_due_jobs(now=now) == (original_id,)
+    # No instance status is emitted: the owned child has a terminal failure.
+    first_launcher.children[0].running = False
+    assert first.start_due_jobs(now=now + timedelta(minutes=1)) == ()
+    assert first.shutdown().checkpoint_saved is True
+
+    retry_launcher = FakeLauncher()
+    restored = ResearchJobSupervisor(
+        d_research_root,
+        launcher=retry_launcher,
+        storage_policy=ProjectStoragePolicy(d_research_root),
+    )
+
+    assert original_id not in restored.resume_eligible_jobs()
+    assert restored.start_due_jobs(now=now + timedelta(minutes=2)) == ()
+    assert restored.register_default_jobs(
+        now=now + timedelta(minutes=3), data_fingerprint="verified-dataset-a"
+    ) == ()
+    retry = restored.register_default_jobs(
+        now=now + timedelta(minutes=4), data_fingerprint="verified-dataset-b"
+    )
+    assert len(retry) == 1
+    assert retry[0] != original_id
+    assert restored.start_due_jobs(now=now + timedelta(minutes=4)) == retry

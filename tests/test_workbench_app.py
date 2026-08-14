@@ -1,11 +1,35 @@
 import json
+import os
+import shutil
 import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import pytest
 
 from a_share_quant.workbench.app import create_server
+
+
+@pytest.fixture
+def d_workbench_root() -> Path:
+    """Keep lifecycle test state under the D-drive worktree only."""
+
+    workspace = Path(__file__).resolve().parents[1]
+    assert workspace.drive.casefold() == "d:"
+    parent = workspace / ".runtime" / "temp"
+    parent.mkdir(parents=True, exist_ok=True)
+    root = parent / f"task8-workbench-lifecycle-{uuid4().hex}"
+    root.mkdir()
+    try:
+        yield root
+    finally:
+        lexical = Path(os.path.normpath(os.path.abspath(root)))
+        assert lexical.parent == parent.resolve()
+        if lexical.exists():
+            shutil.rmtree(lexical)
 
 
 class FakeService:
@@ -258,6 +282,119 @@ def test_run_server_starts_and_stops_eod_coordinator(monkeypatch, tmp_path) -> N
     )
 
     assert calls == ["created", "started", "stopped"]
+
+
+def test_task8_run_server_owns_recurring_research_ticks_and_stops_them_first(
+    d_workbench_root: Path, monkeypatch
+) -> None:
+    """Research scheduling belongs to server lifetime, not one CLI pre-launch call."""
+
+    from a_share_quant.workbench import app
+
+    calls: list[object] = []
+
+    class Supervisor:
+        def register_default_jobs(self, **kwargs):
+            calls.append(("register", kwargs))
+            return ("screen-cycle-a",)
+
+        def start_due_jobs(self, **kwargs):
+            calls.append(("start", kwargs))
+            return ("screen-cycle-a",)
+
+        def shutdown(self, *, timeout_seconds: float = 5.0):
+            calls.append("supervisor.shutdown")
+            return type(
+                "Result", (), {"checkpoint_saved": True, "children_stopped": True}
+            )()
+
+    class Lifecycle:
+        def __init__(self, supervisor, context_supplier, *, clock, interval_seconds):
+            self.supervisor = supervisor
+            self.context_supplier = context_supplier
+            self.clock = clock
+            self.interval_seconds = interval_seconds
+            calls.append("lifecycle.created")
+
+        def start(self):
+            calls.append("lifecycle.start")
+            now = self.clock()
+            context = self.context_supplier(now)
+            self.supervisor.register_default_jobs(now=now, **context)
+            self.supervisor.start_due_jobs(now=now)
+
+        def stop(self):
+            calls.append("lifecycle.stop")
+
+    class StopServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(app, "ResearchLifecycle", Lifecycle, raising=False)
+    monkeypatch.setattr(app, "create_server", lambda **_kwargs: StopServer())
+
+    app.run_server(
+        repo_root=d_workbench_root,
+        allow_network=False,
+        supervisor=Supervisor(),
+        research_context_supplier=lambda tick_now, _service: {
+            "session_completed": False,
+            "data_fingerprint": "verified-dataset-a",
+            "data_refreshed": False,
+            "outcome_cutoff": tick_now + timedelta(days=1),
+        },
+        research_clock=lambda: now,
+        research_tick_interval_seconds=3.0,
+    )
+
+    assert "lifecycle.start" in calls
+    assert any(item[0] == "register" for item in calls if isinstance(item, tuple))
+    assert any(item[0] == "start" for item in calls if isinstance(item, tuple))
+    assert calls.index("lifecycle.stop") < calls.index("supervisor.shutdown")
+
+
+def test_task8_lifecycle_stop_prevents_any_later_research_start() -> None:
+    """The bounded scheduler must not launch after the workbench stops it."""
+
+    from a_share_quant.workbench.app import ResearchLifecycle
+
+    calls: list[str] = []
+
+    class Supervisor:
+        def register_default_jobs(self, **_kwargs):
+            calls.append("register")
+            return ()
+
+        def start_due_jobs(self, **_kwargs):
+            calls.append("start")
+            return ()
+
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    lifecycle = ResearchLifecycle(
+        Supervisor(),
+        lambda _now: {
+            "session_completed": False,
+            "data_fingerprint": None,
+            "data_refreshed": False,
+            "outcome_cutoff": None,
+        },
+        clock=lambda: now,
+        interval_seconds=60.0,
+    )
+
+    lifecycle.start()
+    lifecycle.stop()
+    assert lifecycle.tick() == ()
+    assert calls == ["register", "start"]
 
 
 def test_eod_refresh_publishes_candidates_and_replaces_guidance_together(
