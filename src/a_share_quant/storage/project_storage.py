@@ -16,7 +16,20 @@ _MANAGED_DIRECTORIES = {
     "MPLCONFIGDIR": Path(".runtime/cache/matplotlib"),
 }
 _WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
-    ("CON", "PRN", "AUX", "NUL", "CLOCK$", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³")
+    (
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+    )
     + tuple(f"COM{index}" for index in range(1, 10))
     + tuple(f"LPT{index}" for index in range(1, 10))
 )

@@ -89,8 +89,10 @@ def test_authorize_accepts_repo_paths_without_creating_business_file(
         "PrN.json",
         "AUX",
         "nul.data",
-        "CLOCK$",
-        "clock$.json",
+        "CONIN$",
+        "conin$.json",
+        "CONOUT$",
+        "conout$.json",
         "COM1",
         "com9.log",
         "LPT1",
@@ -122,7 +124,10 @@ def test_authorize_rejects_windows_unsafe_path_components(
         getattr(policy, method_name)(unsafe_path)
 
 
-@pytest.mark.parametrize("safe_path", ("data/file.json", "COM10", "COM10.json"))
+@pytest.mark.parametrize(
+    "safe_path",
+    ("data/file.json", "COM10", "COM10.json", "CLOCK$", "clock$.json"),
+)
 def test_authorize_allows_windows_safe_path_components(
     project_temp: Path,
     safe_path: str,
