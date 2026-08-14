@@ -225,10 +225,9 @@ class ResearchDataStore:
                 manifest_published = True
                 return self._artifact_from_record(record)
             finally:
-                self._safe_unlink_stage(stage)
-                self._remove_owned_marker(stage_marker)
+                self._safe_unlink_stage(stage, stage_marker)
                 if manifest_published and blob_marker is not None:
-                    self._remove_owned_marker(blob_marker)
+                    self._safe_retire_owned_marker(blob_marker, "orphan_blob")
 
     def active_artifact(self, dataset: str | ResearchDataset, key: str) -> ResearchArtifact:
         dataset_value = self._validate_dataset(dataset)
@@ -282,6 +281,13 @@ class ResearchDataStore:
     def cleanup_rebuildable_temporary_files(
         self, *, grace_seconds: float | None = None, dry_run: bool = False
     ) -> CleanupReport:
+        """Remove only sealed, content-matching, store-marked rebuildable files.
+
+        Markers provide unkeyed integrity and path binding, not cryptographic
+        ownership against another process that can write this repository. The
+        final revalidation narrows, but standard path APIs cannot eliminate,
+        the check-to-unlink race on Windows.
+        """
         grace = self.orphan_grace_seconds if grace_seconds is None else grace_seconds
         if grace < 0:
             raise ValueError("grace_seconds must be non-negative")
@@ -324,16 +330,46 @@ class ResearchDataStore:
             if not dry_run:
                 candidate_set = set(candidates)
                 for marker, target, _is_referenced in marker_targets:
-                    if target in candidate_set:
+                    try:
                         self.policy.revalidate(target)
-                        target.unlink(missing_ok=True)
-                        removed.append(target)
-                    self._remove_owned_marker(marker)
+                        if target.exists():
+                            # Re-read bytes and metadata immediately before the
+                            # destructive path operation. A privileged peer can
+                            # still race path replacement after this check.
+                            self._validate_owned_target(
+                                ownership=None, target=target, marker=marker
+                            )
+                            if target in candidate_set:
+                                self.policy.revalidate(target)
+                                target.unlink(missing_ok=True)
+                                removed.append(target)
+                        self._remove_owned_marker(marker)
+                    except (
+                        OSError,
+                        StorageBoundaryError,
+                        ManifestIntegrityError,
+                        ValueError,
+                    ):
+                        rejected.append(marker)
             return CleanupReport(
                 tuple(candidates), tuple(removed), dry_run, tuple(rejected)
             )
 
-    def _validate_owned_target(self, ownership: dict[str, Any], target: Path) -> None:
+    def _validate_owned_target(
+        self,
+        ownership: dict[str, Any] | None,
+        target: Path,
+        *,
+        marker: Path | None = None,
+    ) -> None:
+        if ownership is None:
+            if marker is None:
+                raise ManifestIntegrityError("ownership metadata is required")
+            ownership = self._read_owned_marker(marker)
+            if ownership["state"] != "sealed":
+                raise ManifestIntegrityError("ownership marker is not sealed")
+            if self._owned_marker_target(ownership) != target:
+                raise ManifestIntegrityError("ownership marker target changed")
         self.policy.revalidate(target)
         if not target.is_file():
             raise ManifestIntegrityError("owned cleanup target is not a regular file")
@@ -613,6 +649,8 @@ class ResearchDataStore:
     def _create_owned_marker(
         self, kind: str, target: Path, *, digest: str | None = None
     ) -> Path:
+        # This unkeyed record detects accidental/casual mutation and binds a
+        # fixed store path. It is not proof against a same-user privileged writer.
         marker_id = uuid4().hex
         relative_path = target.relative_to(self.root_directory).as_posix()
         marker = self.policy.authorize(
@@ -848,12 +886,11 @@ class ResearchDataStore:
                 self._restore_manifest(previous_exists, rollback)
                 raise
         finally:
-            self._safe_unlink_manifest_temp(temp)
-            self._remove_owned_marker(marker)
+            self._safe_unlink_manifest_temp(temp, marker)
             if rollback is not None:
-                self._safe_unlink_manifest_temp(rollback)
-            if rollback_marker is not None:
-                self._remove_owned_marker(rollback_marker)
+                if rollback_marker is None:
+                    raise ManifestIntegrityError("manifest rollback marker is missing")
+                self._safe_unlink_manifest_temp(rollback, rollback_marker)
 
     def _write_fsynced_file(
         self, path: Path, payload: bytes, fsync: Callable[[Path], None]
@@ -926,15 +963,57 @@ class ResearchDataStore:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def _safe_unlink_stage(self, path: Path) -> None:
-        if _STAGE_PATTERN.fullmatch(path.name) and path.parent == self.blob_directory:
-            self.policy.revalidate(path)
-            path.unlink(missing_ok=True)
+    def _safe_unlink_stage(self, path: Path, marker: Path) -> bool:
+        return self._safe_unlink_owned_file(path, marker, "stage")
 
-    def _safe_unlink_manifest_temp(self, path: Path) -> None:
-        if _MANIFEST_TEMP_PATTERN.fullmatch(path.name) and path.parent == self.root_directory:
+    def _safe_unlink_manifest_temp(self, path: Path, marker: Path) -> bool:
+        return self._safe_unlink_owned_file(path, marker, "manifest_temp")
+
+    def _safe_unlink_owned_file(self, path: Path, marker: Path, kind: str) -> bool:
+        """Conditionally delete a sealed target; retain both on any mismatch.
+
+        The second content check is deliberately adjacent to unlink. Standard
+        Windows path operations still leave a narrow, documented TOCTOU window.
+        """
+
+        try:
+            ownership = self._read_owned_marker(marker)
+            if ownership["state"] != "sealed" or ownership["kind"] != kind:
+                return False
+            if self._owned_marker_target(ownership) != path:
+                return False
+            self.policy.revalidate(path)
+            if not path.exists():
+                self._remove_owned_marker(marker)
+                return True
+            self._validate_owned_target(ownership, path)
+            self.policy.revalidate(path)
+            self._validate_owned_target(ownership, path)
             self.policy.revalidate(path)
             path.unlink(missing_ok=True)
+            self._remove_owned_marker(marker)
+            return True
+        except (OSError, StorageBoundaryError, ManifestIntegrityError, ValueError):
+            return False
+
+    def _safe_retire_owned_marker(self, marker: Path, kind: str) -> bool:
+        """Remove a marker only while its existing target still matches its seal."""
+
+        try:
+            ownership = self._read_owned_marker(marker)
+            if ownership["state"] != "sealed" or ownership["kind"] != kind:
+                return False
+            target = self._owned_marker_target(ownership)
+            self.policy.revalidate(target)
+            if not target.exists():
+                return False
+            self._validate_owned_target(ownership, target)
+            self.policy.revalidate(target)
+            self._validate_owned_target(ownership, target)
+            self._remove_owned_marker(marker)
+            return True
+        except (OSError, StorageBoundaryError, ManifestIntegrityError, ValueError):
+            return False
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -967,16 +1046,20 @@ def _lock_file(
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 return
             except OSError as exc:
-                is_contention = exc.errno in {errno.EACCES, errno.EDEADLK} or getattr(
-                    exc, "winerror", None
-                ) in {33, 36}
+                winerror = getattr(exc, "winerror", None)
+                is_contention = (
+                    winerror in {33, 36}
+                    if winerror is not None
+                    else exc.errno in {errno.EACCES, errno.EDEADLK}
+                )
                 if not is_contention:
                     raise
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise StorageLockTimeoutError(
                         f"research storage lock timed out after {timeout_seconds:g} seconds"
                     ) from exc
-                time.sleep(poll_interval_seconds)
+                time.sleep(min(poll_interval_seconds, remaining))
     else:
         import fcntl
 

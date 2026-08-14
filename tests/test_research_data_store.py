@@ -182,6 +182,80 @@ def test_injected_failure_preserves_previous_active(research_temp: Path, failure
     assert all(path.name != old.path.name for path in report.removed)
 
 
+def test_finally_does_not_delete_stage_replaced_after_seal(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    replaced_stage: Path | None = None
+
+    def replace_stage_then_fail(source: Path, _target: Path) -> None:
+        nonlocal replaced_stage
+        source.write_bytes(b"foreign-stage-after-seal")
+        replaced_stage = source
+        raise OSError("blob replace interrupted")
+
+    store._blob_replace = replace_stage_then_fail
+    with pytest.raises(OSError, match="blob replace interrupted"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    assert replaced_stage is not None and replaced_stage.exists()
+    markers = list(store.ownership_directory.glob("*.owned.json"))
+    assert markers
+    assert any(
+        store._read_owned_marker(marker)["relative_path"]
+        == replaced_stage.relative_to(store.root_directory).as_posix()
+        for marker in markers
+    )
+
+
+def test_finally_does_not_delete_manifest_temp_replaced_after_seal(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    replaced_temp: Path | None = None
+
+    def replace_manifest_temp_then_fail(source: Path, _target: Path) -> None:
+        nonlocal replaced_temp
+        source.write_bytes(b"foreign-manifest-temp-after-seal")
+        replaced_temp = source
+        raise OSError("manifest replace interrupted")
+
+    store._manifest_replace = replace_manifest_temp_then_fail
+    with pytest.raises(OSError, match="manifest replace interrupted"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    assert replaced_temp is not None and replaced_temp.exists()
+    markers = list(store.ownership_directory.glob("*.owned.json"))
+    assert any(
+        store._read_owned_marker(marker)["relative_path"]
+        == replaced_temp.relative_to(store.root_directory).as_posix()
+        for marker in markers
+    )
+
+
+def test_success_finally_keeps_blob_marker_when_referenced_blob_was_replaced(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    replaced_blob: Path | None = None
+
+    def publish_manifest_then_replace_blob(source: Path, target: Path) -> None:
+        nonlocal replaced_blob
+        os.replace(source, target)
+        record = json.loads(target.read_text(encoding="utf-8"))
+        replaced_blob = store.root_directory / record["blob_path"]
+        replaced_blob.write_bytes(b"foreign-referenced-blob")
+
+    store._manifest_replace = publish_manifest_then_replace_blob
+    artifact = store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    assert replaced_blob == artifact.path
+    assert not store.verify(artifact)
+    markers = list(store.ownership_directory.glob("*.owned.json"))
+    assert any(
+        store._read_owned_marker(marker)["kind"] == "orphan_blob"
+        for marker in markers
+    )
+
+
 def test_manifest_truncation_and_conflicting_duplicate_fail_closed(research_temp: Path) -> None:
     store = store_at(research_temp, minimum_free_bytes=0)
     store.replace_dataset("research_returns", "000001", frame(), "v1")
@@ -639,6 +713,33 @@ def test_sealed_stage_replaced_with_foreign_content_is_rejected(research_temp: P
 
     report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
 
+    assert target.exists()
+    assert marker.exists()
+    assert marker in report.rejected
+
+
+def test_cleanup_revalidates_content_again_immediately_before_unlink(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    target = store.blob_directory / f".research-stage-{uuid4().hex}.parquet"
+    marker = store._create_owned_marker("stage", target)
+    target.write_bytes(b"owned-stage")
+    store._seal_owned_marker(marker, target)
+    original_validate = store._validate_owned_target
+    validations = 0
+
+    def replace_after_first_validation(*args, **kwargs) -> None:
+        nonlocal validations
+        validations += 1
+        original_validate(*args, **kwargs)
+        if validations == 1:
+            target.write_bytes(b"replacement-between-checks")
+
+    store._validate_owned_target = replace_after_first_validation
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert validations == 2
     assert target.exists()
     assert marker.exists()
     assert marker in report.rejected
