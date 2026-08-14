@@ -242,7 +242,10 @@ class ProspectivePrediction:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ProspectivePrediction:
         payload = dict(value)
-        explicit = bool(payload.pop("maturity_explicit", False))
+        # Pre-migration records serialized a maturity date but not its
+        # provenance.  Treat those as explicit conservatively so they require
+        # a trusted session calendar before re-registration.
+        explicit = bool(payload.pop("maturity_explicit", True))
         payload["prediction_at"] = datetime.fromisoformat(str(payload["prediction_at"]))
         payload["as_of"] = date.fromisoformat(str(payload["as_of"]))
         payload["maturity_date"] = date.fromisoformat(str(payload["maturity_date"]))

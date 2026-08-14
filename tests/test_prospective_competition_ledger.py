@@ -461,3 +461,16 @@ def test_automatic_maturity_remains_non_explicit_after_restart(tmp_path: Path) -
     assert restored.maturity_explicit is False
     restored_competition = ProspectiveCompetition(store=restored_store, now=NOW)
     assert restored_competition.append_prediction(restored) == restored
+
+
+def test_pre_migration_record_without_provenance_is_conservative() -> None:
+    prediction = ProspectivePrediction(
+        model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+        symbol="600001", name="示例", prediction_at=datetime(2026, 8, 19, 8, tzinfo=UTC),
+        as_of=date(2026, 8, 19), horizon=5, score=0.1, probability=0.5,
+        guidance_price_bands=_bands(),
+    )
+    legacy = prediction.to_dict()
+    legacy.pop("maturity_explicit")
+    restored = ProspectivePrediction.from_dict(legacy)
+    assert restored.maturity_explicit is True
