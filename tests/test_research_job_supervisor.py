@@ -1,12 +1,35 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
+
+
+@pytest.fixture
+def d_research_root() -> Path:
+    """Keep new lifecycle evidence on the governed D-drive test area."""
+
+    workspace = Path(__file__).resolve().parents[1]
+    assert workspace.drive.casefold() == "d:"
+    parent = workspace / ".runtime" / "temp"
+    parent.mkdir(parents=True, exist_ok=True)
+    root = parent / f"task8-research-supervisor-{uuid4().hex}"
+    root.mkdir()
+    try:
+        yield root
+    finally:
+        lexical = Path(os.path.normpath(os.path.abspath(root)))
+        assert lexical.parent == parent.resolve()
+        if lexical.exists():
+            shutil.rmtree(lexical)
 
 
 class FakeChild:
@@ -119,7 +142,7 @@ def test_default_schedule_respects_session_fingerprint_and_refresh_boundaries(tm
         data_fingerprint="dataset-a",
         data_refreshed=False,
         outcome_cutoff=now + timedelta(days=5),
-    ) == ("predict",)
+    ) == ()
 
     supervisor2 = ResearchJobSupervisor(tmp_path / "second", launcher=FakeLauncher())
     assert supervisor2.register_default_jobs(
@@ -205,3 +228,86 @@ def test_default_launcher_runs_allowlisted_worker_and_shutdown_owns_it(
     assert captured["kwargs"]["cwd"] == str(repo_root)
     assert Path(captured["kwargs"]["env"]["TEMP"]).is_relative_to(repo_root)
     assert result.children_stopped is True
+
+
+def test_task8_offline_supervisor_never_starts_network_jobs(
+    d_research_root: Path,
+) -> None:
+    launcher = FakeLauncher()
+    supervisor = ResearchJobSupervisor(
+        d_research_root,
+        launcher=launcher,
+        storage_policy=ProjectStoragePolicy(d_research_root),
+        network_enabled=False,
+    )
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    supervisor.register_default_jobs(
+        now=now,
+        session_completed=True,
+        data_fingerprint="verified-dataset-a",
+        data_refreshed=True,
+        outcome_cutoff=now + timedelta(days=1),
+    )
+
+    assert supervisor.start_due_jobs(now=now) == ("screen",)
+    assert [child for child in launcher.children] and len(launcher.children) == 1
+
+
+def test_task8_checkpoint_rebuilds_runnable_jobs_without_duplication(
+    d_research_root: Path,
+) -> None:
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    first = ResearchJobSupervisor(
+        d_research_root,
+        launcher=FakeLauncher(),
+        storage_policy=ProjectStoragePolicy(d_research_root),
+    )
+    first.register_job("screen", ("research", "screen"), due_at=now)
+    assert first.shutdown().checkpoint_saved is True
+
+    launcher = FakeLauncher()
+    restored = ResearchJobSupervisor(
+        d_research_root,
+        launcher=launcher,
+        storage_policy=ProjectStoragePolicy(d_research_root),
+    )
+
+    assert restored.resume_eligible_jobs() == ("screen",)
+    assert restored.resume_eligible_jobs() == ("screen",)
+    assert restored.start_due_jobs(now=now) == ("screen",)
+    assert len(launcher.children) == 1
+
+
+def test_task8_successful_child_is_not_relaunched_and_result_is_checkpointed(
+    d_research_root: Path,
+) -> None:
+    launcher = FakeLauncher()
+    policy = ProjectStoragePolicy(d_research_root)
+    supervisor = ResearchJobSupervisor(
+        d_research_root,
+        launcher=launcher,
+        storage_policy=policy,
+    )
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    supervisor.register_job("screen", ("research", "screen"), due_at=now)
+    assert supervisor.start_due_jobs(now=now) == ("screen",)
+    status = d_research_root / "screen-status.json"
+    status.write_text(
+        json.dumps(
+            {
+                "status": "SUCCESS",
+                "artifact_digest": "a" * 64,
+                "reason_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    launcher.children[0].running = False
+
+    assert supervisor.start_due_jobs(now=now + timedelta(minutes=1)) == ()
+    assert len(launcher.children) == 1
+    assert supervisor.shutdown().checkpoint_saved is True
+    checkpoint = json.loads((d_research_root / "research-checkpoint.json").read_text())
+    assert checkpoint["jobs"][0]["completed"] is True
+    assert checkpoint["jobs"][0]["process_exit_code"] == 0
+    assert checkpoint["jobs"][0]["artifact_digest"] == "a" * 64
