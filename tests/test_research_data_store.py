@@ -13,7 +13,7 @@ import time
 from collections import namedtuple
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -82,7 +82,7 @@ def test_history_contracts_are_frozen_and_validate_temporal_fields() -> None:
         path=Path("D:/contracts") / ("a" * 64 + ".parquet"),
         row_count=2,
         size_bytes=10,
-        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         schema_fingerprint="b" * 64,
     )
     assert artifact.row_count == 2
@@ -667,13 +667,15 @@ def test_verify_rejects_manifest_metadata_rewrite_even_when_record_is_resigned(
     assert not store.verify(artifact)
 
 
-def test_new_research_modules_avoid_python_311_datetime_utc_import() -> None:
+def test_new_research_code_avoids_python_311_datetime_utc_import() -> None:
+    forbidden_import = "from datetime import " + "UTC"
     for relative in (
         "src/a_share_quant/research/history_contracts.py",
         "src/a_share_quant/storage/research_data_store.py",
+        "tests/test_research_data_store.py",
     ):
         source = (ROOT / relative).read_text(encoding="utf-8")
-        assert "from datetime import UTC" not in source
+        assert forbidden_import not in source
 
 
 def test_blob_parquet_metadata_must_match_manifest(research_temp: Path) -> None:
@@ -966,7 +968,7 @@ def test_research_artifact_rejects_invalid_identity_and_path(
         "path": Path("D:/safe") / ("a" * 64 + ".parquet"),
         "row_count": 1,
         "size_bytes": 1,
-        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
         "schema_fingerprint": "b" * 64,
     }
     values.update(overrides)
