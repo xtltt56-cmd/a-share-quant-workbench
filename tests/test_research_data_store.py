@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -337,7 +338,7 @@ def test_windows_cross_process_lock_waits_instead_of_reading_locked_byte(
         )
         with store._locked():
             Path({str(ready)!r}).write_text("ready", encoding="utf-8")
-            time.sleep(2.5)
+            time.sleep(12)
         """
     )
     writer_code = textwrap.dedent(
@@ -379,15 +380,71 @@ def test_windows_cross_process_lock_waits_instead_of_reading_locked_byte(
         env=environment,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=25,
         check=False,
     )
     elapsed = time.monotonic() - started
-    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+    holder_stdout, holder_stderr = holder.communicate(timeout=8)
 
     assert holder.returncode == 0, (holder_stdout, holder_stderr)
     assert writer.returncode == 0, writer.stderr
-    assert elapsed >= 1.5
+    assert elapsed >= 10.5
+
+
+def test_windows_lock_non_contention_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows byte-range lock test")
+    import msvcrt
+
+    calls = 0
+
+    def fail_bad_descriptor(_fd: int, _mode: int, _count: int) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError(errno.EBADF, "bad descriptor")
+
+    class FakeHandle:
+        def seek(self, _offset: int) -> None:
+            return None
+
+        def fileno(self) -> int:
+            return 123
+
+    monkeypatch.setattr(msvcrt, "locking", fail_bad_descriptor)
+    with pytest.raises(OSError) as error:
+        research_store_module._lock_file(
+            FakeHandle(), timeout_seconds=1, poll_interval_seconds=0.01
+        )
+    assert error.value.errno == errno.EBADF
+    assert calls == 1
+
+
+def test_windows_lock_contention_timeout_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows byte-range lock test")
+    import msvcrt
+
+    def always_contended(_fd: int, _mode: int, _count: int) -> None:
+        raise OSError(errno.EACCES, "lock occupied")
+
+    class FakeHandle:
+        def seek(self, _offset: int) -> None:
+            return None
+
+        def fileno(self) -> int:
+            return 123
+
+    monkeypatch.setattr(msvcrt, "locking", always_contended)
+    with pytest.raises(
+        research_store_module.StorageLockTimeoutError, match="timed out"
+    ):
+        research_store_module._lock_file(
+            FakeHandle(), timeout_seconds=0, poll_interval_seconds=0.01
+        )
 
 
 @pytest.mark.parametrize("field,value", [("row_count", 999), ("schema_fingerprint", "c" * 64)])
@@ -454,6 +511,26 @@ def test_same_logical_version_with_changed_content_is_a_conflict(research_temp: 
 
     assert store.active_artifact("research_returns", "000001") == old
     assert store.manifest_count() == 1
+
+
+@pytest.mark.parametrize("limit", ["single", "total", "free"])
+def test_idempotent_replacement_still_enforces_current_storage_limits(
+    research_temp: Path, limit: str
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0)
+    old = store.replace_dataset("research_returns", "000001", frame(), "v1")
+    if limit == "single":
+        store.maximum_single_file_bytes = 1
+    elif limit == "total":
+        store.maximum_research_data_bytes = 1
+    else:
+        store.minimum_free_bytes = 1
+        store._disk_usage = lambda _path: DiskUsage(100, 100, 0)
+
+    with pytest.raises(StorageQuotaError):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+
+    assert store.active_artifact("research_returns", "000001") == old
 
 
 def test_manifest_rejects_conflicting_duplicate_logical_version(research_temp: Path) -> None:
@@ -525,6 +602,70 @@ def test_fake_ownership_marker_never_authorizes_deletion(research_temp: Path) ->
     assert fake in report.rejected
 
 
+def test_allocated_unsealed_marker_never_authorizes_cleanup(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    target = store.blob_directory / f".research-stage-{uuid4().hex}.parquet"
+    marker = store._create_owned_marker("stage", target)
+    target.write_bytes(b"unsealed")
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert target.exists()
+    assert marker.exists()
+    assert marker in report.rejected
+
+
+def test_sealed_stage_cleanup_requires_matching_hash_and_size(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    target = store.blob_directory / f".research-stage-{uuid4().hex}.parquet"
+    marker = store._create_owned_marker("stage", target)
+    target.write_bytes(b"owned-stage")
+    store._seal_owned_marker(marker, target)
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert target in report.removed
+    assert not target.exists()
+    assert not marker.exists()
+
+
+def test_sealed_stage_replaced_with_foreign_content_is_rejected(research_temp: Path) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    target = store.blob_directory / f".research-stage-{uuid4().hex}.parquet"
+    marker = store._create_owned_marker("stage", target)
+    target.write_bytes(b"owned-stage")
+    store._seal_owned_marker(marker, target)
+    target.write_bytes(b"foreign-replacement")
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert target.exists()
+    assert marker.exists()
+    assert marker in report.rejected
+
+
+def test_owned_orphan_replaced_with_foreign_content_is_rejected(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("manifest publish failed")
+
+    store._manifest_replace = fail_replace
+    with pytest.raises(OSError, match="manifest publish"):
+        store.replace_dataset("research_returns", "000001", frame(), "v1")
+    orphan = next(store.blob_directory.glob("[0-9a-f]*.parquet"))
+    marker = next(store.ownership_directory.glob("*.owned.json"))
+    orphan.write_bytes(b"foreign-replacement")
+
+    report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert orphan.exists()
+    assert marker.exists()
+    assert marker in report.rejected
+
+
 def test_stale_owned_marker_for_referenced_blob_removes_only_marker(
     research_temp: Path,
 ) -> None:
@@ -533,12 +674,31 @@ def test_stale_owned_marker_for_referenced_blob_removes_only_marker(
     marker = store._create_owned_marker(
         "orphan_blob", artifact.path, digest=artifact.sha256
     )
+    store._seal_owned_marker(marker, artifact.path)
 
     report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
 
     assert artifact.path.exists()
     assert artifact.path not in report.removed
     assert not marker.exists()
+
+
+def test_corrupt_referenced_blob_does_not_hide_damage_by_removing_marker(
+    research_temp: Path,
+) -> None:
+    store = store_at(research_temp, minimum_free_bytes=0, orphan_grace_seconds=0)
+    artifact = store.replace_dataset("research_returns", "000001", frame(), "v1")
+    marker = store._create_owned_marker(
+        "orphan_blob", artifact.path, digest=artifact.sha256
+    )
+    store._seal_owned_marker(marker, artifact.path)
+    artifact.path.write_bytes(b"corrupt-referenced-content")
+
+    with pytest.raises(ManifestIntegrityError):
+        store.cleanup_rebuildable_temporary_files(grace_seconds=0)
+
+    assert marker.exists()
+    assert artifact.path.exists()
 
 
 def test_recursive_quota_counts_old_stage_and_unknown_files(research_temp: Path) -> None:

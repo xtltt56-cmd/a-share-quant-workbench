@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -35,6 +36,10 @@ class ManifestIntegrityError(RuntimeError):
 
 class ManifestConflictError(ManifestIntegrityError):
     """Raised when one logical dataset version maps to different content."""
+
+
+class StorageLockTimeoutError(TimeoutError):
+    """Raised when the governed storage lock cannot be acquired in time."""
 
 
 class ResearchDataset(str, Enum):
@@ -151,6 +156,7 @@ class ResearchDataStore:
                 size_bytes = stage.stat().st_size
                 self.policy.revalidate(stage)
                 digest = self._sha256(stage)
+                self._seal_owned_marker(stage_marker, stage)
                 self.policy.revalidate(stage)
                 parquet_file = pq.ParquetFile(stage)
                 try:
@@ -162,6 +168,7 @@ class ResearchDataStore:
 
                 existing = self._find_idempotent(records, dataset_value, key, data_version, digest)
                 if existing is not None:
+                    self._enforce_limits(size_bytes, digest, 0)
                     return self._artifact_from_record(existing)
                 if any(
                     record["dataset"] == dataset_value
@@ -206,6 +213,9 @@ class ResearchDataStore:
                     self._directory_fsync(self.blob_directory)
                     self.policy.revalidate(blob)
                     self._file_fsync(blob)
+                    if blob_marker is None:
+                        raise ManifestIntegrityError("blob ownership marker is missing")
+                    self._seal_owned_marker(blob_marker, blob)
                 else:
                     self._validate_blob(
                         blob, digest, size_bytes, row_count, schema_fingerprint
@@ -292,19 +302,19 @@ class ResearchDataStore:
                     if marker.stat().st_mtime > cutoff:
                         continue
                     ownership = self._read_owned_marker(marker)
+                    if ownership["state"] != "sealed":
+                        raise ManifestIntegrityError(
+                            "allocated ownership marker is not cleanup-authorized"
+                        )
                     target = self._owned_marker_target(ownership)
                     is_referenced = (
                         ownership["kind"] == "orphan_blob"
                         and ownership["digest"] in referenced
                     )
-                    if not is_referenced:
-                        self.policy.revalidate(target)
-                        if target.exists():
-                            self.policy.revalidate(target)
-                            if not target.is_file():
-                                raise ManifestIntegrityError(
-                                    "owned cleanup target is not a regular file"
-                                )
+                    self.policy.revalidate(target)
+                    if target.exists():
+                        self._validate_owned_target(ownership, target)
+                        if not is_referenced:
                             candidates.append(target)
                     marker_targets.append((marker, target, is_referenced))
                 except (OSError, StorageBoundaryError, ManifestIntegrityError, ValueError):
@@ -321,6 +331,22 @@ class ResearchDataStore:
                     self._remove_owned_marker(marker)
             return CleanupReport(
                 tuple(candidates), tuple(removed), dry_run, tuple(rejected)
+            )
+
+    def _validate_owned_target(self, ownership: dict[str, Any], target: Path) -> None:
+        self.policy.revalidate(target)
+        if not target.is_file():
+            raise ManifestIntegrityError("owned cleanup target is not a regular file")
+        self.policy.revalidate(target)
+        actual_size = target.stat().st_size
+        self.policy.revalidate(target)
+        actual_sha256 = self._sha256(target)
+        if (
+            actual_size != ownership["target_size_bytes"]
+            or actual_sha256 != ownership["target_sha256"]
+        ):
+            raise ManifestIntegrityError(
+                "owned cleanup target hash or size no longer matches sealed marker"
             )
 
     def _prepare_owned_directories(self) -> None:
@@ -602,6 +628,9 @@ class ResearchDataStore:
             "marker_id": marker_id,
             "relative_path": relative_path,
             "schema": "a-share-quant.research-owned-object",
+            "state": "allocated",
+            "target_sha256": None,
+            "target_size_bytes": None,
             "version": 1,
         }
         ownership["marker_sha256"] = self._canonical_marker_sha256(ownership)
@@ -656,6 +685,9 @@ class ResearchDataStore:
             "marker_sha256",
             "relative_path",
             "schema",
+            "state",
+            "target_sha256",
+            "target_size_bytes",
             "version",
         }
         if not isinstance(ownership, dict) or set(ownership) != required:
@@ -669,6 +701,25 @@ class ResearchDataStore:
             != self._canonical_marker_sha256(ownership)
         ):
             raise ManifestIntegrityError("ownership marker integrity check failed")
+        state = ownership["state"]
+        if state == "allocated":
+            if ownership["target_sha256"] is not None or ownership["target_size_bytes"] is not None:
+                raise ManifestIntegrityError("allocated marker cannot bind target content")
+        elif state == "sealed":
+            if (
+                not isinstance(ownership["target_sha256"], str)
+                or not _DIGEST_PATTERN.fullmatch(ownership["target_sha256"])
+                or not isinstance(ownership["target_size_bytes"], int)
+                or ownership["target_size_bytes"] < 0
+            ):
+                raise ManifestIntegrityError("sealed marker target metadata is invalid")
+            if (
+                ownership["kind"] == "orphan_blob"
+                and ownership["digest"] != ownership["target_sha256"]
+            ):
+                raise ManifestIntegrityError("orphan marker digest does not match target")
+        else:
+            raise ManifestIntegrityError("ownership marker state is invalid")
         try:
             created_at = datetime.fromisoformat(
                 ownership["created_at"].replace("Z", "+00:00")
@@ -678,6 +729,55 @@ class ResearchDataStore:
         if created_at.utcoffset() != UTC.utcoffset(created_at):
             raise ManifestIntegrityError("ownership marker created_at must be UTC")
         return ownership
+
+    def _seal_owned_marker(self, marker: Path, target: Path) -> None:
+        ownership = self._read_owned_marker(marker)
+        if ownership["state"] != "allocated":
+            raise ManifestIntegrityError("ownership marker is already sealed")
+        expected_target = self._owned_marker_target(ownership)
+        if target != expected_target:
+            raise ManifestIntegrityError("ownership marker target changed before seal")
+        self.policy.revalidate(target)
+        if not target.is_file():
+            raise ManifestIntegrityError("ownership target is not a regular file")
+        self.policy.revalidate(target)
+        target_size = target.stat().st_size
+        self.policy.revalidate(target)
+        target_sha256 = self._sha256(target)
+        if ownership["kind"] == "orphan_blob" and ownership["digest"] != target_sha256:
+            raise ManifestIntegrityError("orphan ownership digest mismatch")
+        ownership["state"] = "sealed"
+        ownership["target_sha256"] = target_sha256
+        ownership["target_size_bytes"] = target_size
+        ownership["marker_sha256"] = self._canonical_marker_sha256(ownership)
+        self._replace_owned_marker(marker, ownership)
+
+    def _replace_owned_marker(self, marker: Path, ownership: dict[str, Any]) -> None:
+        marker_id = ownership["marker_id"]
+        temp = self.policy.authorize(
+            self.ownership_directory / f".marker-{marker_id}.tmp"
+        )
+        payload = (
+            json.dumps(
+                ownership, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            self.policy.revalidate(temp)
+            with temp.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+            self.policy.revalidate(temp)
+            self._file_fsync(temp)
+            self.policy.revalidate(temp)
+            self.policy.revalidate(marker)
+            os.replace(temp, marker)
+            self.policy.revalidate(self.ownership_directory)
+            self._directory_fsync(self.ownership_directory)
+        finally:
+            self.policy.revalidate(temp)
+            temp.unlink(missing_ok=True)
 
     def _owned_marker_target(self, ownership: dict[str, Any]) -> Path:
         relative_path = ownership["relative_path"]
@@ -731,8 +831,10 @@ class ResearchDataStore:
                 )
                 rollback_marker = self._create_owned_marker("manifest_temp", rollback)
                 self._write_fsynced_file(rollback, previous, self._manifest_fsync)
+                self._seal_owned_marker(rollback_marker, rollback)
             self.policy.revalidate(temp)
             self._write_fsynced_file(temp, payload, self._manifest_fsync)
+            self._seal_owned_marker(marker, temp)
             if self._tree_size(self.root_directory) > self.maximum_research_data_bytes:
                 raise StorageQuotaError("研究数据总量超过配额")
             self.policy.revalidate(temp)
@@ -847,12 +949,34 @@ class ResearchDataStore:
                     _unlock_file(handle)
 
 
-def _lock_file(handle: Any) -> None:
+def _lock_file(
+    handle: Any,
+    *,
+    timeout_seconds: float = 300,
+    poll_interval_seconds: float = 0.05,
+) -> None:
+    if timeout_seconds < 0 or poll_interval_seconds <= 0:
+        raise ValueError("lock timeout and poll interval must be positive")
     if os.name == "nt":
         import msvcrt
 
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                is_contention = exc.errno in {errno.EACCES, errno.EDEADLK} or getattr(
+                    exc, "winerror", None
+                ) in {33, 36}
+                if not is_contention:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise StorageLockTimeoutError(
+                        f"research storage lock timed out after {timeout_seconds:g} seconds"
+                    ) from exc
+                time.sleep(poll_interval_seconds)
     else:
         import fcntl
 
