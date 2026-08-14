@@ -210,6 +210,7 @@ class ScreeningTrial:
     pbo: float
     deflated_sharpe: float
     cpcv: Mapping[str, Any]
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def metrics(self) -> tuple[WindowMetrics, ...]:
@@ -459,6 +460,11 @@ class HistoricalEngineeringScreen:
                 "embargo_sessions": self.config.embargo_sessions,
                 "status": "DIAGNOSTIC_ONLY",
             },
+            diagnostics={
+                "dropped_nonfinite_label_count": int(
+                    labels.attrs.get("dropped_nonfinite_label_count", 0)
+                )
+            },
         )
 
     def _scores(
@@ -606,6 +612,19 @@ def _prepare_inputs(
         label_frame["_session_date"] = pd.to_datetime(
             label_frame[label_date], errors="coerce"
         ).dt.date
+        label_column = next(
+            (name for name in _LABEL_COLUMNS if name in label_frame.columns), None
+        )
+        if label_column is None:
+            raise ValueError("labels requires a forward return label")
+        label_frame["_label"] = pd.to_numeric(
+            label_frame[label_column], errors="coerce"
+        )
+        finite_labels = np.isfinite(label_frame["_label"])
+        label_frame.attrs["dropped_nonfinite_label_count"] = int((~finite_labels).sum())
+        # Tail NaNs are an expected property of forward labels.  They do not
+        # participate in screening and must not make maturity validation fail.
+        label_frame = label_frame.loc[finite_labels].copy()
         maturity_column = next(
             (
                 name
@@ -652,10 +671,6 @@ def _prepare_inputs(
             label_frame["_maturity_error"] = True
         if label_frame["_maturity_error"].astype(bool).any():
             leakage.append("invalid_label_maturity")
-        label_column = next((name for name in _LABEL_COLUMNS if name in label_frame.columns), None)
-        if label_column is None:
-            raise ValueError("labels requires a forward return label")
-        label_frame["_label"] = pd.to_numeric(label_frame[label_column], errors="coerce")
     return prepared, label_frame, tuple(sorted(set(leakage)))
 
 
@@ -1039,7 +1054,8 @@ def _trial_dict(trial: ScreeningTrial) -> dict[str, Any]:
         "reproducible": trial.reproducible,
         "pbo": _json_safe(trial.pbo),
         "deflated_sharpe": _json_safe(trial.deflated_sharpe),
-        "cpcv": _json_safe(trial.cpcv),
+            "cpcv": _json_safe(trial.cpcv),
+        "diagnostics": _json_safe(trial.diagnostics),
     }
 
 

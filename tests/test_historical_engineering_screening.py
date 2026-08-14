@@ -386,3 +386,40 @@ def test_invalid_maturity_in_test_segment_blocks_before_window_execution():
     assert result.status == "ENGINEERING_BLOCKED"
     assert result.trials[0].status == "ENGINEERING_BLOCKED"
     assert "invalid_label_maturity" in result.trials[0].leakage_flags
+
+
+def test_nonfinite_tail_label_is_dropped_before_maturity_validation():
+    snapshot = _snapshot()
+    changed_labels = snapshot.labels.copy()
+    last = changed_labels.index[-1]
+    changed_labels.loc[last, "forward_excess_return_5"] = float("nan")
+    changed_labels.loc[last, "horizon_days"] = 0
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("nan-tail")]
+    )
+    assert result.trials[0].status != "ENGINEERING_BLOCKED"
+    assert result.trials[0].diagnostics["dropped_nonfinite_label_count"] == 1
+
+
+def test_finite_label_with_invalid_maturity_still_blocks():
+    snapshot = _snapshot()
+    changed_labels = snapshot.labels.copy()
+    changed_labels.loc[changed_labels.index[-1], "horizon_days"] = 0
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("finite-invalid")]
+    )
+    assert result.trials[0].status == "ENGINEERING_BLOCKED"
