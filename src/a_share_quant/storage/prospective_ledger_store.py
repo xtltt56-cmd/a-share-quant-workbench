@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -66,11 +67,13 @@ class ProspectiveLedgerStore:
             if path is None:
                 raise ValueError("path or policy is required")
             self.policy = None
-            self.path = Path(path).expanduser().resolve()
+            self.path = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
             if self.path.drive.casefold() != "d:":
                 raise StorageBoundaryError("前瞻预测账本必须位于D盘")
-            self.lock_path = self.path.with_name(f".{self.path.name}.lock").resolve()
+            self.lock_path = self.path.with_name(f".{self.path.name}.lock")
             self.root_directory = self.path.parent
+            _reject_reparse_components(self.path)
+            _reject_reparse_components(self.lock_path)
         self._prepare_paths()
         key = os.path.normcase(os.fspath(self.path))
         with _PROCESS_LOCKS_GUARD:
@@ -99,6 +102,7 @@ class ProspectiveLedgerStore:
         """Append a validated mature outcome, idempotently by outcome id."""
 
         with self._locked_append():
+            self._validate_outcome(outcome)
             existing = self._settlements.get(outcome.prediction_id)
             if existing is not None:
                 if existing == outcome:
@@ -116,6 +120,7 @@ class ProspectiveLedgerStore:
         if not reason_value:
             raise ValueError("pending reason is required")
         with self._locked_append():
+            self._validate_outcome(outcome)
             key = f"{outcome.id}:{reason_value}"
             if key not in self._pending:
                 self._append_record(
@@ -137,6 +142,15 @@ class ProspectiveLedgerStore:
 
     def pending(self) -> tuple[tuple[OutcomeObservation, str], ...]:
         return tuple(self._pending.values())
+
+    def _validate_outcome(self, outcome: OutcomeObservation) -> None:
+        prediction = self._predictions.get(outcome.prediction_id)
+        if prediction is None:
+            raise KeyError("outcome prediction does not exist")
+        if prediction.symbol != outcome.symbol:
+            raise ValueError("outcome symbol does not match prediction")
+        if prediction.maturity_date != outcome.maturity_date:
+            raise ValueError("outcome maturity date does not match prediction")
 
     @property
     def matured_predictions(self) -> int:
@@ -307,6 +321,21 @@ def _unlock_file(handle: Any) -> None:
         import fcntl
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _reject_reparse_components(path: Path) -> None:
+    current = Path(path.anchor) if path.anchor else Path.cwd()
+    for part in path.parts[1:] if path.anchor else path.parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        if stat.S_ISLNK(metadata.st_mode) or attributes & getattr(
+            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+        ):
+            raise StorageBoundaryError("前瞻预测账本路径不能包含符号链接或reparse point")
 
 
 __all__ = [

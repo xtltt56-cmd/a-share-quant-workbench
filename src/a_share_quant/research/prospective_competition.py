@@ -183,6 +183,8 @@ class ProspectivePrediction:
         )
         if maturity <= as_of:
             raise ValueError("maturity_date must be after as_of")
+        if prediction_at.date() >= maturity:
+            raise ValueError("prediction_at must precede maturity_date")
         object.__setattr__(self, "maturity_date", maturity)
         provided_id = str(self.prediction_id).strip()
         object.__setattr__(self, "prediction_id", provided_id or self._computed_id())
@@ -353,12 +355,57 @@ class ProspectiveMetrics:
     regime_stability: float | None = None
 
 
+def _expected_calibration_error(probabilities: list[float], labels: list[float]) -> float:
+    bins: list[list[tuple[float, float]]] = [[] for _ in range(10)]
+    for probability, label in zip(probabilities, labels):
+        bins[min(9, int(probability * 10))].append((probability, label))
+    total = len(labels)
+    return sum(
+        len(bucket) / total * abs(
+            sum(item[0] for item in bucket) / len(bucket)
+            - sum(item[1] for item in bucket) / len(bucket)
+        )
+        for bucket in bins if bucket
+    )
+
+
+def _rank_correlation(left: list[float], right: list[float]) -> float | None:
+    if len(left) < 2 or len(left) != len(right):
+        return None
+    left_order = {value: rank for rank, value in enumerate(sorted(left))}
+    right_order = {value: rank for rank, value in enumerate(sorted(right))}
+    left_ranks = [left_order[value] for value in left]
+    right_ranks = [right_order[value] for value in right]
+    left_mean = sum(left_ranks) / len(left_ranks)
+    right_mean = sum(right_ranks) / len(right_ranks)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left_ranks, right_ranks))
+    denominator = math.sqrt(
+        sum((a - left_mean) ** 2 for a in left_ranks)
+        * sum((b - right_mean) ** 2 for b in right_ranks)
+    )
+    return numerator / denominator if denominator else 0.0
+
+
 class ProspectiveCompetition:
     """Append predictions and settle only quality-approved future observations."""
 
-    def __init__(self, *, store: ProspectiveLedgerStore, now: datetime | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        store: ProspectiveLedgerStore,
+        contest: ProspectiveContest | None = None,
+        now: datetime | None = None,
+        session_calendar: Iterable[date] | None = None,
+    ) -> None:
         self.store = store
+        self.contest = contest
         self.now = _utc(now or datetime.now(timezone.utc), field="now")
+        self.session_calendar = (
+            frozenset(_as_date(item, field="session_calendar"))
+            for item in session_calendar
+        ) if session_calendar is not None else None
+        if self.session_calendar is not None:
+            self.session_calendar = frozenset(self.session_calendar)
 
     def append_prediction(
         self,
@@ -367,11 +414,39 @@ class ProspectiveCompetition:
     ) -> ProspectivePrediction:
         if prediction is not None and fields:
             raise TypeError("provide prediction or prediction fields, not both")
+        if prediction is None and "prediction_at" in fields:
+            raw_timestamp = fields["prediction_at"]
+            if isinstance(raw_timestamp, str):
+                raw_timestamp = datetime.fromisoformat(raw_timestamp)
+            if _utc(raw_timestamp, field="prediction_at") > self.now:
+                raise FutureTimestampError("prediction timestamp is in the future")
         candidate = prediction if prediction is not None else ProspectivePrediction(**fields)
         if not isinstance(candidate, ProspectivePrediction):
             raise TypeError("prediction must be ProspectivePrediction")
         if candidate.prediction_at > self.now:
             raise FutureTimestampError("prediction timestamp is in the future")
+        if (
+            self.session_calendar is not None
+            and candidate.maturity_date not in self.session_calendar
+        ):
+            raise ValueError("maturity_date is not in the supplied session calendar")
+        if self.contest is not None:
+            if not self.contest.started:
+                raise FrozenContestError("contest has not started")
+            expected = (
+                self.contest.model_id,
+                self.contest.model_version,
+                self.contest.config_hash,
+                self.contest.training_snapshot_hash,
+            )
+            actual = (
+                candidate.model_id,
+                candidate.model_version,
+                candidate.config_hash,
+                candidate.training_snapshot_hash,
+            )
+            if actual != expected or candidate.evidence_mode != "PROSPECTIVE":
+                raise ValueError("prediction does not match frozen contest")
         return self.store.append_prediction(candidate)
 
     def read(self, prediction_id: str) -> ProspectivePrediction:
@@ -386,6 +461,48 @@ class ProspectiveCompetition:
     @property
     def matured_predictions(self) -> int:
         return self.store.matured_predictions
+
+    def compute_metrics(self, *, cost_bps: float = 20.0) -> ProspectiveMetrics:
+        """Compute future-only metrics from settled ledger records."""
+
+        if cost_bps < 0 or not math.isfinite(float(cost_bps)):
+            raise ValueError("cost_bps must be finite and non-negative")
+        predictions = {item.id: item for item in self.store.predictions()}
+        outcomes = [item for item in self.store.settlements() if item.prediction_id in predictions]
+        total = len(predictions)
+        coverage = len(outcomes) / total if total else 0.0
+        if not outcomes:
+            return ProspectiveMetrics(coverage=coverage, rejection_rate=1.0)
+        returns = [
+            float(item.realized_return)
+            for item in outcomes
+            if item.realized_return is not None
+        ]
+        scores = [predictions[item.prediction_id].score for item in outcomes]
+        probabilities = [predictions[item.prediction_id].probability for item in outcomes]
+        labels = [1.0 if value > 0 else 0.0 for value in returns]
+        turnover = len(outcomes) / max(total, 1)
+        net = sum(returns) / len(returns) - float(cost_bps) / 10000.0 * turnover
+        running = peak = drawdown = 0.0
+        for value in returns:
+            running += value - float(cost_bps) / 10000.0 * turnover / len(returns)
+            peak = max(peak, running)
+            drawdown = max(drawdown, peak - running)
+        brier = sum(
+            (probability - label) ** 2
+            for probability, label in zip(probabilities, labels)
+        ) / len(labels)
+        ece = _expected_calibration_error(probabilities, labels)
+        rank_ic = _rank_correlation(scores, returns)
+        return ProspectiveMetrics(
+            directional_hit_rate=sum(
+                (score >= 0.5) == bool(label)
+                for score, label in zip(probabilities, labels)
+            ) / len(labels),
+            brier=brier, ece=ece, rank_ic=rank_ic, net_cost_return=net,
+            max_drawdown=drawdown, turnover=turnover, coverage=coverage,
+            rejection_rate=1.0 - coverage,
+        )
 
     def delete(self, _prediction_id: str) -> None:
         raise ImmutablePredictionError("失败预测也必须保留，预测不可删除")
@@ -464,20 +581,14 @@ class ProspectiveContest:
     ) -> None:
         self.champion_id = champion_id
         self.now = _utc(now or datetime.now(timezone.utc), field="now")
-        self.provisional_sessions = int(provisional_sessions)
-        self.provisional_predictions = int(provisional_predictions)
-        self.approval_sessions = int(approval_sessions)
-        self.approval_predictions = int(approval_predictions)
-        if (
-            min(
-                self.provisional_sessions,
-                self.provisional_predictions,
-                self.approval_sessions,
-                self.approval_predictions,
-            )
-            < 1
-        ):
-            raise ValueError("contest thresholds must be positive")
+        thresholds = (
+            int(provisional_sessions), int(provisional_predictions),
+            int(approval_sessions), int(approval_predictions),
+        )
+        if thresholds != (20, 100, 60, 200):
+            raise ValueError("contest thresholds are fixed at 20/100 and 60/200")
+        self._provisional_sessions, self._provisional_predictions = thresholds[:2]
+        self._approval_sessions, self._approval_predictions = thresholds[2:]
         self._started = False
         self._started_at: datetime | None = None
         self._model_id: str | None = None
@@ -588,7 +699,7 @@ class ProspectiveContest:
         *,
         sessions: int,
         matured: int,
-        gates_pass: bool,
+        gates_pass: bool = False,
         historical_matured: int = 0,
         metrics: ProspectiveMetrics | None = None,
     ) -> None:
@@ -605,9 +716,11 @@ class ProspectiveContest:
         _ = historical_matured
         self._future_sessions = sessions_value
         self._matured_predictions = matured_value
-        self._gates_pass = bool(gates_pass)
         if metrics is not None and not isinstance(metrics, ProspectiveMetrics):
             raise TypeError("metrics must be ProspectiveMetrics")
+        if metrics is None and gates_pass:
+            raise ValueError("metrics are required to derive contest gates")
+        self._gates_pass = self._metrics_pass(metrics) if metrics is not None else False
         self._metrics = metrics
         self._refresh_status()
 
@@ -615,7 +728,7 @@ class ProspectiveContest:
         self,
         *,
         matured_predictions: int,
-        gates_pass: bool,
+        gates_pass: bool = False,
         metrics: ProspectiveMetrics | None = None,
     ) -> None:
         if not self._started:
@@ -634,18 +747,29 @@ class ProspectiveContest:
 
     def _refresh_status(self) -> None:
         if (
-            self._future_sessions >= self.approval_sessions
-            and self._matured_predictions >= self.approval_predictions
+            self._future_sessions >= self._approval_sessions
+            and self._matured_predictions >= self._approval_predictions
             and self._gates_pass
         ):
             self._status = "AWAITING_MANUAL_APPROVAL"
         elif self._gates_pass and (
-            self._future_sessions >= self.provisional_sessions
-            and self._matured_predictions >= self.provisional_predictions
+            self._future_sessions >= self._provisional_sessions
+            and self._matured_predictions >= self._provisional_predictions
         ):
             self._status = "PROVISIONAL_UNMATURED_OBSERVATION"
         else:
             self._status = "PROSPECTIVE_COLLECTING"
+
+    def _metrics_pass(self, metrics: ProspectiveMetrics) -> bool:
+        """Apply frozen conservative quality gates; no caller boolean override."""
+
+        required = (metrics.net_cost_return, metrics.max_drawdown, metrics.coverage)
+        return (
+            all(value is not None and math.isfinite(float(value)) for value in required)
+            and float(metrics.net_cost_return) > 0
+            and 0 <= float(metrics.max_drawdown) <= 0.35
+            and float(metrics.coverage) >= 0.8
+        )
 
     def change_primary_metric(self, _metric: str) -> None:
         raise FrozenContestError("primary_metric is frozen after contest start")
@@ -656,6 +780,30 @@ class ProspectiveContest:
     @property
     def status(self) -> str:
         return self._status
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    @property
+    def model_id(self) -> str | None:
+        return self._model_id
+
+    @property
+    def provisional_sessions(self) -> int:
+        return self._provisional_sessions
+
+    @property
+    def provisional_predictions(self) -> int:
+        return self._provisional_predictions
+
+    @property
+    def approval_sessions(self) -> int:
+        return self._approval_sessions
+
+    @property
+    def approval_predictions(self) -> int:
+        return self._approval_predictions
 
     @property
     def future_sessions(self) -> int:

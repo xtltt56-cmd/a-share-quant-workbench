@@ -11,6 +11,7 @@ from a_share_quant.research.prospective_competition import (
     OutcomeObservation,
     ProspectiveCompetition,
     ProspectiveContest,
+    ProspectiveMetrics,
     ProspectivePrediction,
 )
 from a_share_quant.storage.prospective_ledger_store import (
@@ -45,8 +46,8 @@ def _prediction(
         training_snapshot_hash="train-v1",
         symbol="600001",
         name="示例股份",
-        prediction_at=NOW - timedelta(minutes=1),
-        as_of=date(2026, 8, 13),
+        prediction_at=datetime(2026, 8, 12, 8, 0, tzinfo=UTC),
+        as_of=date(2026, 8, 12),
         horizon=5,
         score=0.73,
         probability=0.68,
@@ -97,7 +98,7 @@ def test_prediction_requires_complete_prospective_metadata() -> None:
             symbol="600001",
             name="示例",
             prediction_at=NOW,
-            as_of=date(2026, 8, 13),
+            as_of=date(2026, 8, 12),
             horizon=5,
             score=0.1,
             probability=0.5,
@@ -117,7 +118,7 @@ def test_future_prediction_timestamp_and_mutating_duplicate_are_rejected(tmp_pat
             symbol="600001",
             name="示例股份",
             prediction_at=NOW + timedelta(seconds=1),
-            as_of=date(2026, 8, 13),
+            as_of=date(2026, 8, 12),
             horizon=5,
             score=0.73,
             probability=0.68,
@@ -175,6 +176,10 @@ def test_valid_settlement_is_hashed_idempotent_and_changed_result_rejected(tmp_p
     assert repeated.matured is True
     assert repeated.idempotent is True
     assert ledger.matured_predictions == 1
+    metrics = ledger.compute_metrics()
+    assert metrics.net_cost_return is not None
+    assert metrics.coverage == 1.0
+    assert metrics.brier is not None
     changed = OutcomeObservation(**{**outcome.to_dict(), "realized_return": 0.09})
     with pytest.raises(ValueError, match="different"):
         ledger.settle_due(changed)
@@ -208,11 +213,12 @@ def test_twenty_sessions_is_observation_only_and_sixty_requires_manual_approval(
         tie_break=("max_drawdown", "brier"),
     )
 
-    contest.record_observations(sessions=20, matured=100, gates_pass=True)
+    metrics = ProspectiveMetrics(net_cost_return=0.1, max_drawdown=0.1, coverage=1.0)
+    contest.record_observations(sessions=20, matured=100, gates_pass=True, metrics=metrics)
     assert contest.status == "PROVISIONAL_UNMATURED_OBSERVATION"
     assert contest.can_replace_champion is False
     assert contest.can_issue_approval is False
-    contest.record_observations(sessions=60, matured=200, gates_pass=True)
+    contest.record_observations(sessions=60, matured=200, gates_pass=True, metrics=metrics)
     assert contest.status == "AWAITING_MANUAL_APPROVAL"
     assert contest.can_replace_champion is False
     assert contest.can_issue_approval is True
@@ -244,7 +250,10 @@ def test_new_version_resets_future_counts_and_metrics_are_immutable_after_start(
         primary_metric="net_cost_return",
         tie_break=("max_drawdown", "brier"),
     )
-    contest.record_observations(sessions=20, matured=100, gates_pass=True)
+    contest.record_observations(
+        sessions=20, matured=100, gates_pass=True,
+        metrics=ProspectiveMetrics(net_cost_return=0.1, max_drawdown=0.1, coverage=1.0),
+    )
     contest.register_version(
         model_version="v2",
         config_hash="changed",
@@ -271,7 +280,7 @@ def test_historical_results_never_qualify_prospective_contest() -> None:
     contest.record_observations(
         sessions=0,
         matured=0,
-        gates_pass=True,
+        gates_pass=False,
         historical_matured=10_000,
     )
     assert contest.status == "PROSPECTIVE_COLLECTING"
@@ -297,3 +306,51 @@ def test_store_rejects_delete_and_non_project_path(tmp_path: Path) -> None:
     store = ProspectiveLedgerStore(tmp_path / "ledger.jsonl")
     with pytest.raises(ImmutableLedgerError):
         store.delete("anything")
+
+
+def test_prediction_cannot_be_registered_after_its_cutoff(tmp_path: Path) -> None:
+    store = ProspectiveLedgerStore(tmp_path / "ledger.jsonl")
+    with pytest.raises(ValueError, match="maturity"):
+        ProspectiveCompetition(store=store, now=NOW).append_prediction(
+            model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+            symbol="600001", name="示例", prediction_at=NOW,
+            as_of=NOW.date(), horizon=5, score=0.1, probability=0.5,
+            guidance_price_bands=_bands(), maturity_date=NOW.date(),
+        )
+
+
+def test_store_rejects_orphan_or_mismatched_outcome(tmp_path: Path) -> None:
+    store = ProspectiveLedgerStore(tmp_path / "ledger.jsonl")
+    outcome = OutcomeObservation(
+        prediction_id="missing", symbol="600001", maturity_date=date(2026, 8, 20),
+        outcome_at=NOW, realized_price=10, realized_return=0, data_version="v1",
+        data_sha256="a" * 64,
+    )
+    with pytest.raises(KeyError):
+        store.append_settlement(outcome)
+
+
+def test_contest_thresholds_are_frozen_and_metrics_drive_gates() -> None:
+    contest = ProspectiveContest(now=NOW)
+    with pytest.raises(AttributeError):
+        contest.provisional_sessions = 1
+    contest.start(model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t")
+    with pytest.raises(ValueError, match="metrics"):
+        contest.record_observations(sessions=60, matured=200, gates_pass=True)
+    metrics = ProspectiveMetrics(net_cost_return=0.1, max_drawdown=0.1, brier=0.1, coverage=1.0)
+    contest.record_observations(sessions=60, matured=200, metrics=metrics)
+    assert contest.status == "AWAITING_MANUAL_APPROVAL"
+
+
+def test_competition_binds_predictions_to_started_contest(tmp_path: Path) -> None:
+    contest = ProspectiveContest(now=NOW)
+    contest.start(model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t")
+    ledger = ProspectiveLedgerStore(tmp_path / "ledger.jsonl")
+    competition = ProspectiveCompetition(store=ledger, contest=contest, now=NOW)
+    with pytest.raises(ValueError, match="contest"):
+        competition.append_prediction(
+            model_id="other", model_version="v1", config_hash="c", training_snapshot_hash="t",
+            symbol="600001", name="示例", prediction_at=NOW - timedelta(minutes=1),
+            as_of=NOW.date(), horizon=5, score=0.1, probability=0.5,
+            guidance_price_bands=_bands(),
+        )
