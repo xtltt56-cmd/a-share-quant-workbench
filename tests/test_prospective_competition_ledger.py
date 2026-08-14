@@ -46,12 +46,13 @@ def _prediction(
         training_snapshot_hash="train-v1",
         symbol="600001",
         name="示例股份",
-        prediction_at=datetime(2026, 8, 12, 8, 0, tzinfo=UTC),
-        as_of=date(2026, 8, 12),
+        prediction_at=datetime(2026, 8, 19, 8, 0, tzinfo=UTC),
+        as_of=date(2026, 8, 19),
         horizon=5,
         score=0.73,
         probability=0.68,
         guidance_price_bands=_bands(),
+        maturity_date=date(2026, 8, 26),
         evidence_mode="PROSPECTIVE",
     )
 
@@ -61,7 +62,7 @@ def _valid_outcome(prediction: ProspectivePrediction) -> OutcomeObservation:
         prediction_id=prediction.id,
         symbol=prediction.symbol,
         maturity_date=prediction.maturity_date,
-        outcome_at=NOW,
+        outcome_at=datetime(2026, 8, 30, 8, 0, tzinfo=UTC),
         realized_price=10.8,
         realized_return=0.08,
         data_version="bars-v3",
@@ -72,6 +73,10 @@ def _valid_outcome(prediction: ProspectivePrediction) -> OutcomeObservation:
         session_aligned=True,
         corporate_action_ok=True,
     )
+
+
+def _mature(ledger: ProspectiveCompetition) -> None:
+    ledger.now = datetime(2026, 8, 30, 8, 0, tzinfo=UTC)
 
 
 def test_prediction_is_atomically_appended_before_outcome_and_never_deleted(tmp_path: Path) -> None:
@@ -139,11 +144,12 @@ def test_future_prediction_timestamp_and_mutating_duplicate_are_rejected(tmp_pat
 def test_missing_suspended_or_stale_outcome_delays_settlement(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     prediction = _prediction(ledger)
+    _mature(ledger)
     delayed = OutcomeObservation(
         prediction_id=prediction.id,
         symbol=prediction.symbol,
         maturity_date=prediction.maturity_date,
-        outcome_at=NOW,
+            outcome_at=datetime(2026, 8, 30, 8, 0, tzinfo=UTC),
         realized_price=None,
         realized_return=None,
         data_version="bars-v3",
@@ -166,6 +172,7 @@ def test_missing_suspended_or_stale_outcome_delays_settlement(tmp_path: Path) ->
 def test_valid_settlement_is_hashed_idempotent_and_changed_result_rejected(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     prediction = _prediction(ledger)
+    _mature(ledger)
     outcome = _valid_outcome(prediction)
 
     result = ledger.settle_due(outcome)
@@ -188,6 +195,7 @@ def test_valid_settlement_is_hashed_idempotent_and_changed_result_rejected(tmp_p
 def test_invalid_quality_flags_are_pending_not_failures(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     prediction = _prediction(ledger)
+    _mature(ledger)
     for field, reason in (
         ("fresh", "STALE"),
         ("complete", "INCOMPLETE"),
@@ -292,6 +300,7 @@ def test_ledger_reloads_append_only_records(tmp_path: Path) -> None:
     path = tmp_path / "prospective-ledger.jsonl"
     first = _ledger(tmp_path)
     prediction = _prediction(first)
+    _mature(first)
     first.settle_due(_valid_outcome(prediction))
 
     restored = ProspectiveCompetition(
@@ -354,3 +363,52 @@ def test_competition_binds_predictions_to_started_contest(tmp_path: Path) -> Non
             as_of=NOW.date(), horizon=5, score=0.1, probability=0.5,
             guidance_price_bands=_bands(),
         )
+
+
+def test_calendar_requires_exact_horizon_and_rejects_cutoff_or_late_binding(tmp_path: Path) -> None:
+    calendar = [date(2026, 8, 13), date(2026, 8, 14), date(2026, 8, 17), date(2026, 8, 18)]
+    store = ProspectiveLedgerStore(tmp_path / "ledger.jsonl")
+    competition = ProspectiveCompetition(
+        store=store, now=datetime(2026, 8, 12, 8, 0, tzinfo=UTC), session_calendar=calendar
+    )
+    with pytest.raises(ValueError, match="horizon|insufficient"):
+        competition.append_prediction(
+            model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+            symbol="600001", name="示例", prediction_at=datetime(2026, 8, 12, 8, 0, tzinfo=UTC),
+            as_of=date(2026, 8, 12), horizon=5, score=0.1, probability=0.5,
+            guidance_price_bands=_bands(), maturity_date=date(2026, 8, 18),
+        )
+    with pytest.raises(ValueError, match="cutoff"):
+        ProspectiveCompetition(store=store, now=NOW, session_calendar=calendar).append_prediction(
+            model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+            symbol="600001", name="示例", prediction_at=datetime(2026, 8, 12, 8, 0, tzinfo=UTC),
+            as_of=date(2026, 8, 12), horizon=5, score=0.1, probability=0.5,
+            guidance_price_bands=_bands(), maturity_date=date(2026, 8, 20),
+        )
+
+
+def test_pending_quality_record_never_enters_settlements_or_metrics(tmp_path: Path) -> None:
+    competition = _ledger(tmp_path)
+    prediction = _prediction(competition)
+    _mature(competition)
+    pending = OutcomeObservation(**{**_valid_outcome(prediction).to_dict(), "status": "SUSPENDED"})
+    competition.settle_due(pending)
+    assert competition.store.settlements() == ()
+    assert competition.compute_metrics().coverage == 0
+    competition.store.append_pending(pending, "SUSPENDED")
+    competition.store.append_settlement(_valid_outcome(prediction))
+    assert competition.store.pending() == ()
+
+
+def test_valid_unterminated_tail_is_recovered_but_middle_corruption_fails(tmp_path: Path) -> None:
+    competition = _ledger(tmp_path)
+    prediction = _prediction(competition)
+    path = competition.store.path
+    with path.open("ab") as handle:
+        handle.write(b'{"kind":"crash"')
+    restored = ProspectiveLedgerStore(path)
+    assert restored.read(prediction.id) == prediction
+    with path.open("ab") as handle:
+        handle.write(b'\nnot-json\n')
+    with pytest.raises(Exception, match="完整性"):
+        ProspectiveLedgerStore(path)

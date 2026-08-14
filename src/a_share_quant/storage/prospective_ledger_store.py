@@ -103,6 +103,7 @@ class ProspectiveLedgerStore:
 
         with self._locked_append():
             self._validate_outcome(outcome)
+            self._validate_settlement_quality(outcome)
             existing = self._settlements.get(outcome.prediction_id)
             if existing is not None:
                 if existing == outcome:
@@ -110,7 +111,13 @@ class ProspectiveLedgerStore:
                 raise ValueError("prediction already has a different settlement")
             self._append_record({"kind": "settlement", **outcome.to_dict()})
             self._settlements[outcome.prediction_id] = outcome
-            self._pending.pop(outcome.prediction_id, None)
+            for key in tuple(self._pending):
+                pending_outcome = self._pending[key][0]
+                if (
+                    key.startswith(f"{outcome.id}:")
+                    or pending_outcome.prediction_id == outcome.prediction_id
+                ):
+                    self._pending.pop(key, None)
         return outcome
 
     def append_pending(self, outcome: OutcomeObservation, reason: str) -> None:
@@ -152,6 +159,19 @@ class ProspectiveLedgerStore:
         if prediction.maturity_date != outcome.maturity_date:
             raise ValueError("outcome maturity date does not match prediction")
 
+    @staticmethod
+    def _validate_settlement_quality(outcome: OutcomeObservation) -> None:
+        if (
+            outcome.status != "OK"
+            or not outcome.fresh
+            or not outcome.complete
+            or not outcome.session_aligned
+            or not outcome.corporate_action_ok
+            or outcome.realized_price is None
+            or outcome.realized_return is None
+        ):
+            raise ValueError("only complete OK outcomes can be settlements")
+
     @property
     def matured_predictions(self) -> int:
         return len(self._settlements)
@@ -169,7 +189,9 @@ class ProspectiveLedgerStore:
             self.policy.revalidate(self.path)
             self.policy.revalidate(self.lock_path)
         else:
+            _reject_reparse_components(self.root_directory)
             self.root_directory.mkdir(parents=True, exist_ok=True)
+            _reject_reparse_components(self.root_directory)
         if self.path.exists() and not self.path.is_file():
             raise LedgerIntegrityError("前瞻账本路径不是普通文件")
         # The byte-sized sentinel is required by Windows ``msvcrt.locking``.
@@ -190,10 +212,12 @@ class ProspectiveLedgerStore:
         if not self.path.exists():
             return
         try:
-            raw_lines = self.path.read_bytes().splitlines()
+            raw_bytes = self.path.read_bytes()
         except OSError as exc:
             raise LedgerIntegrityError("前瞻预测账本不可读") from exc
-        for line in raw_lines:
+        raw_lines = raw_bytes.splitlines(keepends=True)
+        for index, raw_line in enumerate(raw_lines):
+            line = raw_line.rstrip(b"\r\n")
             if not line:
                 continue
             try:
@@ -209,7 +233,22 @@ class ProspectiveLedgerStore:
                     raise ValueError
                 self._restore_record(record)
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                if index == len(raw_lines) - 1 and not raw_line.endswith((b"\n", b"\r")):
+                    try:
+                        with self.path.open("r+b") as handle:
+                            handle.truncate(sum(len(item) for item in raw_lines[:index]))
+                        break
+                    except OSError as truncate_error:
+                        raise LedgerIntegrityError("前瞻预测账本尾部恢复失败") from truncate_error
                 raise LedgerIntegrityError("前瞻预测账本完整性校验失败") from exc
+        for outcome in tuple(self._settlements.values()):
+            for key in tuple(self._pending):
+                pending_outcome = self._pending[key][0]
+                if (
+                    key.startswith(f"{outcome.id}:")
+                    or pending_outcome.prediction_id == outcome.prediction_id
+                ):
+                    self._pending.pop(key, None)
 
     def _restore_record(self, record: dict[str, Any]) -> None:
         from a_share_quant.research.prospective_competition import (
@@ -228,7 +267,16 @@ class ProspectiveLedgerStore:
         elif kind in {"settlement", "pending"}:
             reason = str(record.pop("delay_reason", "")).strip().upper()
             outcome = OutcomeObservation.from_dict(record)
+            if outcome.prediction_id not in self._predictions:
+                raise LedgerIntegrityError("结算记录引用未知预测")
+            prediction = self._predictions[outcome.prediction_id]
+            if (
+                prediction.symbol != outcome.symbol
+                or prediction.maturity_date != outcome.maturity_date
+            ):
+                raise LedgerIntegrityError("结算记录与预测不匹配")
             if kind == "settlement":
+                self._validate_settlement_quality(outcome)
                 existing = self._settlements.get(outcome.prediction_id)
                 if existing is not None and existing != outcome:
                     raise LedgerIntegrityError("重复结算记录内容不一致")
@@ -277,6 +325,9 @@ class ProspectiveLedgerStore:
             # The thread lock covers in-process read/append state.  The file
             # lock covers independent worker processes, so each JSONL record
             # is appended only after the latest ledger state is observed.
+            if self.policy is None:
+                _reject_reparse_components(self.path)
+                _reject_reparse_components(self.lock_path)
             with self.lock_path.open("a+b") as handle:
                 _lock_file(handle)
                 try:

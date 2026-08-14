@@ -400,12 +400,12 @@ class ProspectiveCompetition:
         self.store = store
         self.contest = contest
         self.now = _utc(now or datetime.now(timezone.utc), field="now")
+        if isinstance(session_calendar, date):
+            raise ValueError("session_calendar must be an iterable of dates")
         self.session_calendar = (
-            frozenset(_as_date(item, field="session_calendar"))
-            for item in session_calendar
-        ) if session_calendar is not None else None
-        if self.session_calendar is not None:
-            self.session_calendar = frozenset(self.session_calendar)
+            frozenset(_as_date(item, field="session_calendar") for item in session_calendar)
+            if session_calendar is not None else None
+        )
 
     def append_prediction(
         self,
@@ -425,11 +425,21 @@ class ProspectiveCompetition:
             raise TypeError("prediction must be ProspectivePrediction")
         if candidate.prediction_at > self.now:
             raise FutureTimestampError("prediction timestamp is in the future")
+        if candidate.maturity_date <= self.now.date():
+            raise ValueError("prediction maturity is past the competition cutoff")
         if (
             self.session_calendar is not None
             and candidate.maturity_date not in self.session_calendar
         ):
             raise ValueError("maturity_date is not in the supplied session calendar")
+        if self.session_calendar is not None:
+            future_sessions = sorted(
+                day for day in self.session_calendar if day > candidate.as_of
+            )
+            if len(future_sessions) < candidate.horizon:
+                raise ValueError("session calendar is insufficient for horizon")
+            if future_sessions[candidate.horizon - 1] != candidate.maturity_date:
+                raise ValueError("maturity_date does not match calendar horizon")
         if self.contest is not None:
             if not self.contest.started:
                 raise FrozenContestError("contest has not started")
@@ -447,6 +457,8 @@ class ProspectiveCompetition:
             )
             if actual != expected or candidate.evidence_mode != "PROSPECTIVE":
                 raise ValueError("prediction does not match frozen contest")
+            if candidate.prediction_at < self.contest.contest_started_at:
+                raise ValueError("prediction_at precedes contest start")
         return self.store.append_prediction(candidate)
 
     def read(self, prediction_id: str) -> ProspectivePrediction:
