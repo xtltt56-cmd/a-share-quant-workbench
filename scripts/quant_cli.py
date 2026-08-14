@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from a_share_quant.data.realtime.diagnostics import (
 )
 from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
 from a_share_quant.research.evolution import EvolutionRegistry
+from a_share_quant.runtime import research_worker
 from a_share_quant.runtime.historical_backfill import HistoricalBackfillCoordinator
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import (
@@ -187,13 +189,50 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="显式允许本批次访问免费历史数据源",
     )
+
+    research = subcommands.add_parser("research", help="受工作台生命周期管理的研究任务")
+    research_subcommands = research.add_subparsers(
+        dest="research_command", required=True
+    )
+    research_subcommands.add_parser(
+        "status", help="离线查看研究任务、检查点和未来竞赛状态"
+    )
+    research_subcommands.add_parser(
+        "screen", help="执行仅用于工程筛查的研究任务，不得晋级模型"
+    )
+    contest_start = research_subcommands.add_parser(
+        "contest-start", help="冻结未来预测竞赛版本；结果只能由未来观测决定"
+    )
+    contest_start.add_argument(
+        "--version",
+        default=None,
+        help="要冻结的模型/策略版本；不提供时使用当前固定冠军版本",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "research":
+        repo_root = _project_root()
+        if args.research_command == "status":
+            print(json.dumps(_research_status(repo_root), ensure_ascii=False, indent=2))
+            return 0
+        if args.research_command == "screen":
+            exit_code = research_worker.run_job("screen", repo_root)
+            status_path = repo_root / ".runtime" / "research" / "screen-status.json"
+            payload = _read_local_json(status_path)
+            payload["worker_exit_code"] = exit_code
+            # A blocked engineering screen is an auditable result, not a CLI
+            # crash. It must never be interpreted as a promotion.
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        version = args.version or "champion-v1"
+        payload = _freeze_contest(repo_root, version)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "history":
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = _project_root()
         if args.history_command == "backfill" and not args.network:
             raise SystemExit("history backfill requires explicit --network authorization")
         coordinator = _create_history_coordinator(
@@ -221,19 +260,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0
     if args.command == "workbench":
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = _project_root()
         official_signal_path = _inside(repo_root, args.official_signal_path)
         account_import_dir = _operator_path(repo_root, args.account_import_dir)
         account_snapshot_path = _operator_path(repo_root, args.account_snapshot_path)
         price_guidance_path = _inside(repo_root, args.price_guidance_path)
         research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
-        research_supervisor = ResearchJobSupervisor(research_checkpoint_path.parent)
+        storage_policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+        research_supervisor = ResearchJobSupervisor(
+            research_checkpoint_path.parent, storage_policy=storage_policy
+        )
         governance = EvolutionRegistry(
             state_path=repo_root / ".runtime" / "research" / "evolution-registry.json"
         )
         research_supervisor.register_job(
             "forecast-on-launch",
-            ("research", "forecast"),
+            ("research", "predict"),
             due_at=datetime.now(timezone.utc),
         )
         research_supervisor.start_due_jobs(now=datetime.now(timezone.utc))
@@ -384,6 +426,92 @@ def main(argv: list[str] | None = None) -> int:
     service.refresh()
     print(json.dumps(service.snapshot(), ensure_ascii=False, indent=2, default=str))
     return 0
+
+
+def _project_root() -> Path:
+    """Return the fixed repository root; CLI callers cannot redirect workers."""
+
+    return Path(__file__).resolve().parents[1]
+
+
+def _research_status(repo_root: Path) -> dict[str, object]:
+    """Read local research state without constructing or calling a provider."""
+
+    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    checkpoint_path = policy.authorize(".runtime/research/research-checkpoint.json")
+    supervisor = ResearchJobSupervisor(
+        checkpoint_path.parent,
+        storage_policy=policy,
+    )
+    contest_path = policy.authorize(".runtime/research/prospective-contest.json")
+    contest = _read_local_json(contest_path) if contest_path.exists() else None
+    return {
+        "状态": "离线",
+        "网络访问": False,
+        "D盘项目根": str(policy.repo_root),
+        "检查点": str(checkpoint_path),
+        "可恢复任务": list(supervisor.resume_eligible_jobs()),
+        "未来竞赛": contest,
+    }
+
+
+def _freeze_contest(repo_root: Path, version: str) -> dict[str, object]:
+    """Freeze one version for prospective-only observation, idempotently."""
+
+    normalized = str(version).strip()
+    if (
+        not normalized
+        or len(normalized) > 128
+        or any(token in normalized for token in ("..", "/", "\\", "--"))
+    ):
+        raise SystemExit("contest version is not safe")
+    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    destination = policy.authorize(".runtime/research/prospective-contest.json")
+    if destination.exists():
+        existing = _read_local_json(destination)
+        _verify_frozen_contest(existing)
+        if existing.get("contest_version") != normalized:
+            raise SystemExit("future contest is already frozen to a different version")
+        return existing
+    body: dict[str, object] = {
+        "format_version": 1,
+        "contest_version": normalized,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "evidence_mode": "PROSPECTIVE_ONLY",
+        "status": "OBSERVING",
+        "promotion": "NEVER",
+    }
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    payload = {**body, "sha256": hashlib.sha256(encoded).hexdigest()}
+    policy.revalidate(destination.parent)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    policy.revalidate(temporary)
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    policy.revalidate(destination)
+    temporary.replace(destination)
+    return payload
+
+
+def _read_local_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("本地研究状态不可读取") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("本地研究状态格式无效")
+    return payload
+
+
+def _verify_frozen_contest(payload: dict[str, object]) -> None:
+    digest = payload.get("sha256")
+    body = {key: value for key, value in payload.items() if key != "sha256"}
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    if not isinstance(digest, str) or digest != hashlib.sha256(encoded).hexdigest():
+        raise SystemExit("未来竞赛冻结文件校验失败")
 
 
 def _load_default_instrument_map() -> dict[str, str]:

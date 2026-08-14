@@ -121,14 +121,54 @@ def test_daily_candidates_cli_exposes_explicit_stale_data_escape_hatch() -> None
     assert args.allow_stale is True
 
 
+def test_research_cli_exposes_offline_status_screen_and_frozen_contest() -> None:
+    assert build_parser().parse_args(["research", "status"]).research_command == "status"
+    assert build_parser().parse_args(["research", "screen"]).research_command == "screen"
+    contest = build_parser().parse_args(
+        ["research", "contest-start", "--version", "candidate-v2"]
+    )
+    assert contest.research_command == "contest-start"
+    assert contest.version == "candidate-v2"
+
+
+def test_research_status_is_offline(capsys, monkeypatch) -> None:
+    def fail_network(*args, **kwargs):
+        raise AssertionError("research status must not access a provider")
+
+    monkeypatch.setattr("scripts.quant_cli.BaoStockDataProvider", fail_network)
+    assert main(["research", "status"]) == 0
+    assert "网络访问" in capsys.readouterr().out
+
+
+def test_research_screen_cannot_promote_and_contest_freezes_version(capsys) -> None:
+    assert main(["research", "screen"]) == 0
+    screen_payload = capsys.readouterr().out
+    assert "NEVER" in screen_payload
+
+    assert main(["research", "contest-start", "--version", "candidate-v2"]) == 0
+    contest_payload = capsys.readouterr().out
+    assert "candidate-v2" in contest_payload
+    frozen = (
+        Path(__file__).resolve().parents[1]
+        / ".runtime"
+        / "research"
+        / "prospective-contest.json"
+    )
+    assert frozen.exists()
+    assert main(["research", "contest-start", "--version", "candidate-v2"]) == 0
+    with pytest.raises(SystemExit):
+        main(["research", "contest-start", "--version", "candidate-v3"])
+
+
 def test_workbench_cli_persists_governance_and_starts_owned_research_job(
     tmp_path, monkeypatch
 ) -> None:
     captured: dict[str, object] = {}
 
     class Supervisor:
-        def __init__(self, root):
+        def __init__(self, root, **kwargs):
             captured["research_root"] = root
+            captured["storage_policy"] = kwargs.get("storage_policy")
 
         def register_job(self, job_id, command, *, due_at):
             captured["job"] = (job_id, command, due_at)
@@ -164,14 +204,14 @@ def test_workbench_cli_persists_governance_and_starts_owned_research_job(
     assert str(governance["state_path"]).endswith(
         ".runtime\\research\\evolution-registry.json"
     )
-    assert captured["job"][:2] == ("forecast-on-launch", ("research", "forecast"))
+    assert captured["job"][:2] == ("forecast-on-launch", ("research", "predict"))
     assert "started_at" in captured
 
 
 def test_workbench_cli_does_not_block_http_startup_on_daily_network_refresh(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setattr("scripts.quant_cli.ResearchJobSupervisor", lambda root: type(
+    monkeypatch.setattr("scripts.quant_cli.ResearchJobSupervisor", lambda root, **kwargs: type(
         "Supervisor",
         (),
         {
