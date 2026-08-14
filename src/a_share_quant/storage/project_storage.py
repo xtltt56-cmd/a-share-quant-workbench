@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 _MANAGED_DIRECTORIES = {
     "TEMP": Path(".runtime/tmp"),
@@ -15,6 +15,11 @@ _MANAGED_DIRECTORIES = {
     "XDG_CACHE_HOME": Path(".runtime/cache/xdg"),
     "MPLCONFIGDIR": Path(".runtime/cache/matplotlib"),
 }
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    ("CON", "PRN", "AUX", "NUL", "CLOCK$", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³")
+    + tuple(f"COM{index}" for index in range(1, 10))
+    + tuple(f"LPT{index}" for index in range(1, 10))
+)
 
 
 class StorageBoundaryError(ValueError):
@@ -54,6 +59,7 @@ class ProjectStoragePolicy:
         normalized = _lexically_normalized_absolute_path(candidate)
         if not _is_within(normalized, self.repo_root):
             raise StorageBoundaryError("存储路径必须位于项目目录内")
+        _validate_windows_path_components(normalized.relative_to(self.repo_root))
         self._validate_no_reparse_components(normalized)
         return normalized
 
@@ -99,7 +105,10 @@ class ProjectStoragePolicy:
 
 
 def _lexically_normalized_absolute_path(path: Path) -> Path:
-    return Path(os.path.normpath(os.path.abspath(os.fspath(path))))
+    raw_path = os.fspath(path)
+    if not os.path.isabs(raw_path):
+        raw_path = os.path.join(os.getcwd(), raw_path)
+    return Path(os.path.normpath(raw_path))
 
 
 def _is_within(candidate: Path, repo_root: Path) -> bool:
@@ -108,6 +117,17 @@ def _is_within(candidate: Path, repo_root: Path) -> bool:
     except ValueError:
         return False
     return os.path.normcase(common) == os.path.normcase(os.fspath(repo_root))
+
+
+def _validate_windows_path_components(relative: Path) -> None:
+    for component in PureWindowsPath(os.fspath(relative)).parts:
+        if ":" in component:
+            raise StorageBoundaryError("项目目录路径不能包含 Windows ADS 冒号")
+        if component.endswith((".", " ")):
+            raise StorageBoundaryError("项目目录路径组件不能以点或空格结尾")
+        normalized_base = component.rstrip(" .").split(".", maxsplit=1)[0].rstrip(" .")
+        if normalized_base.upper() in _WINDOWS_RESERVED_DEVICE_NAMES:
+            raise StorageBoundaryError("项目目录路径不能使用 Windows 保留设备名")
 
 
 def _reject_reparse_component(path: Path) -> None:

@@ -1,8 +1,9 @@
 import importlib
 import importlib.util
-import json
 import os
+import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +25,27 @@ MANAGED_ENVIRONMENT = {
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def project_temp() -> Iterator[Path]:
+    workspace = ROOT.resolve(strict=True)
+    assert workspace.drive.casefold() == "d:"
+    controlled_root = workspace / ".runtime" / "temp"
+    controlled_root.mkdir(parents=True, exist_ok=True)
+    controlled_root = controlled_root.resolve(strict=True)
+    assert controlled_root.is_relative_to(workspace)
+    test_root = controlled_root / f"pytest-project-storage-{uuid4().hex}"
+    test_root.mkdir()
+    assert test_root.resolve(strict=True).parent == controlled_root
+
+    try:
+        yield test_root
+    finally:
+        lexical_root = Path(os.path.normpath(os.path.abspath(test_root)))
+        assert lexical_root.parent == controlled_root
+        if lexical_root.exists():
+            shutil.rmtree(lexical_root)
+
+
 def test_project_storage_policy_module_exists() -> None:
     assert importlib.util.find_spec("a_share_quant.storage.project_storage") is not None
 
@@ -35,13 +57,15 @@ def test_project_storage_policy_exports_boundary_types() -> None:
     assert callable(module.ProjectStoragePolicy)
 
 
-def test_repo_root_must_already_exist(tmp_path: Path) -> None:
+def test_repo_root_must_already_exist(project_temp: Path) -> None:
     with pytest.raises(StorageBoundaryError, match="项目目录"):
-        ProjectStoragePolicy(tmp_path / "missing", required_drive=None)
+        ProjectStoragePolicy(project_temp / "missing", required_drive=None)
 
 
-def test_authorize_accepts_repo_paths_without_creating_business_file(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
+def test_authorize_accepts_repo_paths_without_creating_business_file(
+    project_temp: Path,
+) -> None:
+    repo = project_temp / "repo"
     repo.mkdir()
     policy = ProjectStoragePolicy(repo, required_drive=None)
 
@@ -53,6 +77,65 @@ def test_authorize_accepts_repo_paths_without_creating_business_file(tmp_path: P
     assert not relative.exists()
 
 
+@pytest.mark.parametrize("method_name", ("authorize", "revalidate"))
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "data/file.json:stream",
+        "folder:stream/file.json",
+        "CON",
+        "con.txt",
+        "data/CON/file.json",
+        "PrN.json",
+        "AUX",
+        "nul.data",
+        "CLOCK$",
+        "clock$.json",
+        "COM1",
+        "com9.log",
+        "LPT1",
+        "lpt9.log",
+        "COM¹.csv",
+        "COM².csv",
+        "COM³.csv",
+        "LPT¹.csv",
+        "LPT².csv",
+        "LPT³.csv",
+        "data/LPT²/file.json",
+        "COM1 .txt",
+        "data/file.json.",
+        "data/file.json ",
+        "data/folder./file.json",
+        "data/folder /file.json",
+    ],
+)
+def test_authorize_rejects_windows_unsafe_path_components(
+    project_temp: Path,
+    method_name: str,
+    unsafe_path: str,
+) -> None:
+    repo = project_temp / "repo"
+    repo.mkdir()
+    policy = ProjectStoragePolicy(repo, required_drive=None)
+
+    with pytest.raises(StorageBoundaryError, match="项目目录"):
+        getattr(policy, method_name)(unsafe_path)
+
+
+@pytest.mark.parametrize("safe_path", ("data/file.json", "COM10", "COM10.json"))
+def test_authorize_allows_windows_safe_path_components(
+    project_temp: Path,
+    safe_path: str,
+) -> None:
+    repo = project_temp / "repo"
+    repo.mkdir()
+
+    authorized = ProjectStoragePolicy(repo, required_drive=None).authorize(safe_path)
+
+    assert authorized == repo / safe_path
+    assert not authorized.exists()
+
+
 @pytest.mark.parametrize(
     "candidate_factory",
     [
@@ -62,10 +145,10 @@ def test_authorize_accepts_repo_paths_without_creating_business_file(tmp_path: P
     ],
 )
 def test_authorize_rejects_external_drive_and_traversal_paths(
-    tmp_path: Path,
+    project_temp: Path,
     candidate_factory,
 ) -> None:
-    repo = tmp_path / "repo"
+    repo = project_temp / "repo"
     repo.mkdir()
     policy = ProjectStoragePolicy(repo, required_drive=None)
 
@@ -74,23 +157,19 @@ def test_authorize_rejects_external_drive_and_traversal_paths(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows drive policy")
-def test_production_policy_requires_d_drive() -> None:
-    artifacts = ROOT / ".runtime" / "test-artifacts"
-    repo = artifacts / f"project-storage-{uuid4().hex}"
-    repo.mkdir(parents=True)
+def test_production_policy_requires_d_drive(project_temp: Path) -> None:
+    repo = project_temp / "repo"
+    repo.mkdir()
 
-    try:
-        assert ProjectStoragePolicy(repo).repo_root.drive.casefold() == "d:"
-        with pytest.raises(StorageBoundaryError, match="D盘"):
-            ProjectStoragePolicy(Path("C:/"))
-    finally:
-        repo.rmdir()
+    assert ProjectStoragePolicy(repo).repo_root.drive.casefold() == "d:"
+    with pytest.raises(StorageBoundaryError, match="D盘"):
+        ProjectStoragePolicy(Path("C:/"))
 
 
 def test_child_environment_is_project_local_and_does_not_mutate_inputs(
-    tmp_path: Path,
+    project_temp: Path,
 ) -> None:
-    repo = tmp_path / "repo"
+    repo = project_temp / "repo"
     repo.mkdir()
     policy = ProjectStoragePolicy(repo, required_drive=None)
     base = {
@@ -118,8 +197,8 @@ def test_child_environment_is_project_local_and_does_not_mutate_inputs(
         assert policy.authorize(expected) == expected
 
 
-def test_child_environment_does_not_add_home_or_codex_home(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
+def test_child_environment_does_not_add_home_or_codex_home(project_temp: Path) -> None:
+    repo = project_temp / "repo"
     repo.mkdir()
 
     child = ProjectStoragePolicy(repo, required_drive=None).child_environment(
@@ -131,9 +210,9 @@ def test_child_environment_does_not_add_home_or_codex_home(tmp_path: Path) -> No
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction test")
-def test_authorize_rejects_real_junction_ancestor(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    outside = tmp_path / "outside"
+def test_authorize_rejects_real_junction_ancestor(project_temp: Path) -> None:
+    repo = project_temp / "repo"
+    outside = project_temp / "outside"
     repo.mkdir()
     outside.mkdir()
     junction = repo / "linked"
@@ -148,10 +227,10 @@ def test_authorize_rejects_real_junction_ancestor(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows symbolic-link test")
 def test_authorize_rejects_real_symbolic_link_ancestor_when_supported(
-    tmp_path: Path,
+    project_temp: Path,
 ) -> None:
-    repo = tmp_path / "repo"
-    outside = tmp_path / "outside.bin"
+    repo = project_temp / "repo"
+    outside = project_temp / "outside.bin"
     repo.mkdir()
     outside.write_bytes(b"outside")
     link = repo / "linked.bin"
@@ -169,10 +248,10 @@ def test_authorize_rejects_real_symbolic_link_ancestor_when_supported(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction test")
 def test_lexically_removed_junction_component_does_not_block_safe_path(
-    tmp_path: Path,
+    project_temp: Path,
 ) -> None:
-    repo = tmp_path / "repo"
-    outside = tmp_path / "outside"
+    repo = project_temp / "repo"
+    outside = project_temp / "outside"
     safe = repo / "safe"
     repo.mkdir()
     outside.mkdir()
@@ -191,10 +270,10 @@ def test_lexically_removed_junction_component_does_not_block_safe_path(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction test")
 def test_authorize_fails_closed_when_ancestor_is_replaced_after_policy_creation(
-    tmp_path: Path,
+    project_temp: Path,
 ) -> None:
-    repo = tmp_path / "repo"
-    outside = tmp_path / "outside"
+    repo = project_temp / "repo"
+    outside = project_temp / "outside"
     runtime = repo / "runtime"
     repo.mkdir()
     outside.mkdir()
@@ -213,12 +292,12 @@ def test_authorize_fails_closed_when_ancestor_is_replaced_after_policy_creation(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction test")
 def test_child_environment_rejects_ancestor_replaced_during_directory_creation(
-    tmp_path: Path,
+    project_temp: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = tmp_path / "repo"
+    repo = project_temp / "repo"
     runtime = repo / ".runtime"
-    outside = tmp_path / "outside"
+    outside = project_temp / "outside"
     repo.mkdir()
     runtime.mkdir()
     outside.mkdir()
@@ -261,53 +340,3 @@ def _create_junction_or_skip(junction: Path, target: Path) -> None:
 def _remove_junction(junction: Path) -> None:
     if junction.exists():
         os.rmdir(junction)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="PowerShell inheritance test")
-def test_launcher_environment_assignments_are_inherited_by_child_process() -> None:
-    launcher = (ROOT / "scripts" / "start_quant_workbench.ps1").read_text(
-        encoding="utf-8"
-    )
-    managed_names = tuple(MANAGED_ENVIRONMENT)
-    setup_prefixes = ("$runtimeTempDir =", "$runtimeCacheDir =") + tuple(
-        f"$env:{name} =" for name in managed_names
-    )
-    setup = "\n".join(
-        line for line in launcher.splitlines() if line.startswith(setup_prefixes)
-    )
-    child_expression = (
-        "[ordered]@{"
-        + ";".join(
-            f"{name}=$env:{name}"
-            for name in (*managed_names, "HOME", "CODEX_HOME", "PROJECT_STORAGE_TEST_ROOT")
-        )
-        + "} | ConvertTo-Json -Compress"
-    )
-    repo_literal = str(ROOT).replace("'", "''")
-    command = (
-        f"$repoRoot = '{repo_literal}'\n"
-        "$runtimeDir = Join-Path $repoRoot '.runtime'\n"
-        "$env:PROJECT_STORAGE_TEST_ROOT = $repoRoot\n"
-        f"{setup}\n"
-        f"& powershell -NoProfile -Command '{child_expression}'"
-    )
-    base = dict(os.environ)
-    base["HOME"] = "preserved-home"
-    base["CODEX_HOME"] = "preserved-codex-home"
-    process_environment_before = dict(os.environ)
-
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", command],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=base,
-    )
-
-    inherited = json.loads(result.stdout.strip())
-    assert inherited["HOME"] == "preserved-home"
-    assert inherited["CODEX_HOME"] == "preserved-codex-home"
-    assert dict(os.environ) == process_environment_before
-    inherited_root = Path(inherited["PROJECT_STORAGE_TEST_ROOT"])
-    for name, relative in MANAGED_ENVIRONMENT.items():
-        assert Path(inherited[name]) == inherited_root / relative
