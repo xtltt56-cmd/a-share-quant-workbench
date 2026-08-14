@@ -291,3 +291,56 @@ def test_unknown_label_maturity_blocks_training_boundary():
         ChangedSnapshot(), [HistoricalCandidate("unknown-maturity")]
     )
     assert "missing_input" in result.trials[0].leakage_flags
+
+
+def test_horizon_uses_sessions_not_calendar_days_at_weekend_boundary():
+    snapshot = _snapshot()
+    sessions = pd.to_datetime(snapshot.features["date"]).dt.date
+    changed_labels = snapshot.labels.copy()
+    changed_labels["horizon_days"] = 5
+    changed_labels["date"] = sessions
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("session-horizon")]
+    )
+    assert result.trials[0].status in {"ENGINEERING_SCREENED", "ENGINEERING_BLOCKED"}
+
+
+def test_illegal_horizon_is_blocked():
+    snapshot = _snapshot()
+    changed_labels = snapshot.labels.assign(horizon_days=0)
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("bad-horizon")]
+    )
+    assert result.trials[0].status == "ENGINEERING_BLOCKED"
+
+
+def test_maturity_date_must_be_strictly_after_label_date():
+    snapshot = _snapshot()
+    changed_labels = snapshot.labels.drop(columns=["horizon_days"]).assign(
+        maturity_date=lambda frame: frame["date"]
+    )
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = changed_labels
+        features = snapshot.features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("same-day-maturity")]
+    )
+    assert result.trials[0].status == "ENGINEERING_BLOCKED"

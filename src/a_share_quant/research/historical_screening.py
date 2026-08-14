@@ -608,18 +608,43 @@ def _prepare_inputs(
             ),
             None,
         )
+        label_frame["_maturity_error"] = False
+        session_dates = sorted(
+            prepared["_session_date"].dropna().unique().tolist()
+        )
         if maturity_column is not None:
             label_frame["_maturity_date"] = pd.to_datetime(
                 label_frame[maturity_column], errors="coerce"
             ).dt.date
+            label_frame["_maturity_error"] = (
+                label_frame["_maturity_date"].isna()
+                | (label_frame["_maturity_date"] <= label_frame["_session_date"])
+            )
         elif "horizon_days" in label_frame.columns:
-            horizon = pd.to_numeric(label_frame["horizon_days"], errors="coerce")
-            session = pd.to_datetime(label_frame["_session_date"])
-            label_frame["_maturity_date"] = (
-                session + pd.to_timedelta(horizon, unit="D")
-            ).dt.date
+            label_frame["_maturity_date"] = None
+            for row_index, row in label_frame.iterrows():
+                raw_horizon = pd.to_numeric(
+                    pd.Series([row["horizon_days"]]), errors="coerce"
+                ).iloc[0]
+                valid_horizon = (
+                    pd.notna(raw_horizon)
+                    and float(raw_horizon).is_integer()
+                    and int(raw_horizon) in {5, 10, 20}
+                )
+                try:
+                    date_index = session_dates.index(row["_session_date"])
+                except ValueError:
+                    date_index = -1
+                maturity_index = date_index + int(raw_horizon) if valid_horizon else -1
+                if maturity_index < 0 or maturity_index >= len(session_dates):
+                    label_frame.at[row_index, "_maturity_error"] = True
+                else:
+                    label_frame.at[row_index, "_maturity_date"] = session_dates[
+                        maturity_index
+                    ]
         else:
             label_frame["_maturity_date"] = None
+            label_frame["_maturity_error"] = True
         label_column = next((name for name in _LABEL_COLUMNS if name in label_frame.columns), None)
         if label_column is None:
             raise ValueError("labels requires a forward return label")
@@ -636,7 +661,9 @@ def _merge_features_labels(
     left = features[["symbol", "_session_date", *feature_columns]].copy()
     if labels.empty:
         return pd.DataFrame()
-    right = labels[["symbol", "_session_date", "_label", "_maturity_date"]].copy()
+    right = labels[
+        ["symbol", "_session_date", "_label", "_maturity_date", "_maturity_error"]
+    ].copy()
     merged = left.merge(right, on=["symbol", "_session_date"], how="inner", validate="one_to_one")
     merged["_label"] = pd.to_numeric(merged["_label"], errors="coerce")
     merged = merged.loc[np.isfinite(merged["_label"])].copy()
@@ -647,7 +674,7 @@ def _mature_training_labels(frame: pd.DataFrame, train_end: date) -> pd.DataFram
     """Keep only outcomes known by the end of the training window."""
 
     maturity = pd.to_datetime(frame["_maturity_date"], errors="coerce").dt.date
-    if maturity.isna().any():
+    if frame["_maturity_error"].astype(bool).any() or maturity.isna().any():
         raise ValueError("unknown label maturity at training boundary")
     return frame.loc[maturity.le(train_end)].copy()
 
