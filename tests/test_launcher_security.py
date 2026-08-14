@@ -84,3 +84,34 @@ def test_launch_metadata_code_has_no_account_or_secret_fields() -> None:
         "account-ledger",
     ):
         assert forbidden not in helper
+
+
+def test_start_launcher_uses_only_process_scoped_project_runtime_environment() -> None:
+    launcher = (ROOT / "scripts" / "start_quant_workbench.ps1").read_text(
+        encoding="utf-8"
+    )
+    lower = launcher.lower()
+    start_process_index = launcher.index("$workbenchProcess = Start-Process")
+
+    assert "$runtimeTempDir = Join-Path $runtimeDir 'tmp'" in launcher
+    assert "$runtimeCacheDir = Join-Path $runtimeDir 'cache'" in launcher
+    expected_assignments = (
+        "$env:TEMP = $runtimeTempDir",
+        "$env:TMP = $runtimeTempDir",
+        "$env:PIP_CACHE_DIR = Join-Path $runtimeCacheDir 'pip'",
+        "$env:JOBLIB_TEMP_FOLDER = Join-Path $runtimeCacheDir 'joblib'",
+        "$env:XDG_CACHE_HOME = Join-Path $runtimeCacheDir 'xdg'",
+        "$env:MPLCONFIGDIR = Join-Path $runtimeCacheDir 'matplotlib'",
+    )
+    for assignment in expected_assignments:
+        assert assignment in launcher
+        assert launcher.index(assignment) < start_process_index
+
+    for forbidden in (
+        "setx ",
+        "setenvironmentvariable",
+        "registry::",
+        "$env:home",
+        "$env:codex_home",
+    ):
+        assert forbidden not in lower

@@ -13,6 +13,14 @@ param(
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $pythonPath = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $runtimeDir = Join-Path $repoRoot '.runtime'
+$runtimeTempDir = Join-Path $runtimeDir 'tmp'
+$runtimeCacheDir = Join-Path $runtimeDir 'cache'
+$env:TEMP = $runtimeTempDir
+$env:TMP = $runtimeTempDir
+$env:PIP_CACHE_DIR = Join-Path $runtimeCacheDir 'pip'
+$env:JOBLIB_TEMP_FOLDER = Join-Path $runtimeCacheDir 'joblib'
+$env:XDG_CACHE_HOME = Join-Path $runtimeCacheDir 'xdg'
+$env:MPLCONFIGDIR = Join-Path $runtimeCacheDir 'matplotlib'
 $pidPath = Join-Path $runtimeDir 'quant_workbench.pid'
 $launchMetadataPath = Join-Path $runtimeDir 'quant_workbench.launch.json'
 $launchHelpersPath = Join-Path $PSScriptRoot 'workbench_launch_helpers.ps1'
@@ -49,7 +57,7 @@ $ResearchCheckpointPath = Join-Path $runtimeDir 'research\research-checkpoint.js
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python environment not found: $pythonPath"
 }
-New-Item -ItemType Directory -Force -Path $runtimeDir, (Split-Path $stdoutPath), $AccountImportDirectory, (Split-Path $ResearchCheckpointPath) | Out-Null
+New-Item -ItemType Directory -Force -Path $runtimeDir, $runtimeTempDir, $env:PIP_CACHE_DIR, $env:JOBLIB_TEMP_FOLDER, $env:XDG_CACHE_HOME, $env:MPLCONFIGDIR, (Split-Path $stdoutPath), $AccountImportDirectory, (Split-Path $ResearchCheckpointPath) | Out-Null
 
 if (Test-Path -LiteralPath $pidPath) {
     $oldPidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
