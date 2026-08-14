@@ -35,6 +35,16 @@ _LABEL_COLUMNS = (
     "return",
     "label",
 )
+_REALIZED_LABEL_COLUMNS = frozenset(
+    {
+        *_LABEL_COLUMNS,
+        "_label",
+        "label",
+        "excess_return",
+        "forward_excess_return",
+        "forward_return",
+    }
+)
 _DATE_COLUMNS = ("date", "signal_date", "available_at")
 
 
@@ -346,14 +356,15 @@ class HistoricalEngineeringScreen:
 
         if base_leakage:
             return _blocked_trial(candidate, seed, base_leakage)
-        merged = _merge_features_labels(features, labels, candidate)
-        if merged.empty:
-            return _blocked_trial(candidate, seed, ("missing_or_invalid_labels",))
-
         fold_metrics: list[WindowMetrics] = []
         validation_scores: list[float] = []
         trial_flags: list[str] = []
         try:
+            merged = _merge_features_labels(features, labels, candidate)
+            if merged.empty:
+                return _blocked_trial(
+                    candidate, seed, ("missing_or_invalid_labels",)
+                )
             for fold in folds:
                 train = merged.loc[merged["_session_date"].le(fold.train_end)].copy()
                 validation = merged.loc[
@@ -385,7 +396,7 @@ class HistoricalEngineeringScreen:
                         cpcv_paths=len(folds),
                     )
                 )
-        except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        except Exception as exc:
             trial_flags.append(_safe_error_code(exc))
             return _blocked_trial(candidate, seed, tuple(sorted(set(trial_flags))))
 
@@ -454,7 +465,11 @@ class HistoricalEngineeringScreen:
         x_target = (x_target - means) / scales
 
         if candidate.scorer is not None:
-            values = _call_scorer(candidate.scorer, target, train)
+            values = _call_scorer(
+                candidate.scorer,
+                _without_realized_labels(target),
+                _without_realized_labels(train),
+            )
             scores = pd.Series(values, index=target.index, dtype="float64")
         elif candidate.model_family in {"rule-baseline", "rule", "momentum"}:
             direction = float(candidate.parameters.get("direction", 1.0))
@@ -586,12 +601,23 @@ def _feature_columns(frame: pd.DataFrame, candidate: HistoricalCandidate) -> lis
     if candidate.score_column is not None:
         if candidate.score_column not in frame.columns:
             raise KeyError(f"missing score column: {candidate.score_column}")
+        if _is_realized_label_column(candidate.score_column):
+            raise ValueError("score column cannot be a realized label")
         return [candidate.score_column]
-    blocked = {"symbol", "date", "signal_date", "available_at", "_session_date", "_label"}
+    blocked = {
+        "symbol",
+        "date",
+        "signal_date",
+        "available_at",
+        "_session_date",
+        "_label",
+        *_REALIZED_LABEL_COLUMNS,
+    }
     columns = [
         str(column)
         for column in frame.columns
         if str(column) not in blocked
+        and not _is_realized_label_column(str(column))
         and not str(column).startswith("forward_")
         and not str(column).startswith("label")
     ]
@@ -599,6 +625,22 @@ def _feature_columns(frame: pd.DataFrame, candidate: HistoricalCandidate) -> lis
     if not numeric:
         raise ValueError("features contain no numeric feature columns")
     return numeric
+
+
+def _is_realized_label_column(column: str) -> bool:
+    normalized = str(column).strip().lower()
+    return normalized in _REALIZED_LABEL_COLUMNS or normalized.startswith(
+        ("forward_", "excess_return")
+    )
+
+
+def _without_realized_labels(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return scorer-visible data without any realized outcome columns."""
+
+    columns = [
+        column for column in frame.columns if not _is_realized_label_column(str(column))
+    ]
+    return frame.loc[:, columns].copy(deep=True)
 
 
 def _make_folds(dates: Sequence[date], config: ScreeningConfig) -> tuple[ScreeningFold, ...]:

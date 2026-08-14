@@ -129,3 +129,76 @@ def test_config_matches_governed_windows():
     assert config.test_sessions == 126
     assert config.minimum_oos_windows == 3
     assert config.evidence_mode == "NON_PROMOTIONAL_ENGINEERING"
+
+
+def test_custom_scorer_cannot_observe_realized_labels():
+    def malicious(frame):
+        # A scorer must never receive the outcome column, even in historical
+        # engineering mode where the caller has already joined labels.
+        assert "_label" not in frame.columns
+        assert not any(
+            str(column) in {"label", "research_return"}
+            or str(column).startswith(("forward_", "excess_return"))
+            for column in frame.columns
+        )
+        return [0.0] * len(frame)
+
+    candidate = HistoricalCandidate("safe-scorer", scorer=malicious)
+    result = HistoricalEngineeringScreen().run(_snapshot(), [candidate])
+
+    assert result.trials[0].status == "ENGINEERING_SCREENED"
+    assert result.trials[0].leakage_flags == ()
+
+
+def test_malicious_scorer_that_requires_labels_is_blocked_without_aborting_others():
+    def malicious(frame):
+        return frame["_label"]
+
+    result = HistoricalEngineeringScreen().run(
+        _snapshot(),
+        [
+            HistoricalCandidate("malicious", scorer=malicious),
+            HistoricalCandidate("valid", model_family="rule-baseline"),
+        ],
+    )
+
+    trials = {trial.candidate_id: trial for trial in result.trials}
+    assert trials["malicious"].status == "ENGINEERING_BLOCKED"
+    assert trials["valid"].status in {"ENGINEERING_SCREENED", "ENGINEERING_BLOCKED"}
+    assert "candidate_execution_error" in trials["malicious"].leakage_flags
+
+
+def test_missing_score_column_blocks_only_that_candidate():
+    result = HistoricalEngineeringScreen().run(
+        _snapshot(),
+        [
+            HistoricalCandidate("missing", score_column="not_present"),
+            HistoricalCandidate("valid", model_family="rule-baseline"),
+        ],
+    )
+
+    trials = {trial.candidate_id: trial for trial in result.trials}
+    assert trials["missing"].status == "ENGINEERING_BLOCKED"
+    assert "missing_input" in trials["missing"].leakage_flags
+    assert trials["valid"].status in {"ENGINEERING_SCREENED", "ENGINEERING_BLOCKED"}
+
+
+def test_all_realized_label_columns_are_excluded_from_implicit_features():
+    snapshot = _snapshot()
+    changed_features = snapshot.features.assign(
+        label=1.0,
+        research_return=1.0,
+        excess_return_5=1.0,
+        forward_return_5=1.0,
+    )
+
+    class ChangedSnapshot:
+        canonical_sha256 = snapshot.canonical_sha256
+        signal_cutoff = snapshot.signal_cutoff
+        labels = snapshot.labels
+        features = changed_features
+
+    result = HistoricalEngineeringScreen().run(
+        ChangedSnapshot(), [HistoricalCandidate("valid", model_family="rule-baseline")]
+    )
+    assert result.trials[0].status in {"ENGINEERING_SCREENED", "ENGINEERING_BLOCKED"}
