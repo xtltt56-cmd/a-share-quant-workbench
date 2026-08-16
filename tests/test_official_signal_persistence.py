@@ -67,6 +67,28 @@ def test_official_signal_store_persists_and_loads_after_restart(tmp_path: Path) 
     assert not list(path.parent.glob("*.tmp"))
 
 
+def test_same_date_strategy_replaces_previous_candidate_set(tmp_path: Path) -> None:
+    path = tmp_path / "official-daily.json"
+    first = _signal()
+    replacement = OfficialModelSignal(
+        **{
+            **first.__dict__,
+            "symbol": "600001",
+            "name": "邯郸发展",
+            "normalized_score": 84.5,
+            "rank": 1,
+        }
+    )
+
+    store = OfficialSignalStore(path=path)
+    store.put_signals((first,))
+    store.put_signals((replacement,))
+
+    assert store.latest() == (replacement,)
+    persisted = OfficialSignalStore(path=path)
+    assert persisted.latest() == (replacement,)
+
+
 def test_official_signal_store_rejects_fixture_artifact_disguised_as_official(
     tmp_path: Path,
 ) -> None:

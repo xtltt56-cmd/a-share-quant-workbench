@@ -60,6 +60,17 @@ class OfficialSignalStore:
             for signal in incoming:
                 if not isinstance(signal, OfficialModelSignal):
                     raise TypeError("official signal store accepts only OfficialModelSignal")
+            replacement_groups = {
+                (signal.signal_date, signal.strategy_version) for signal in incoming
+            }
+            if replacement_groups:
+                self._signals = {
+                    key: signal
+                    for key, signal in self._signals.items()
+                    if (key[0], key[2]) not in replacement_groups
+                }
+
+            for signal in incoming:
                 key = (signal.signal_date, signal.symbol, signal.strategy_version)
                 self._signals[key] = signal
             if incoming and self.path is not None:

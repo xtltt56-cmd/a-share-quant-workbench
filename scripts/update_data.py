@@ -22,6 +22,12 @@ def main() -> int:
     parser.add_argument("--end-date", required=True, type=date.fromisoformat)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
+        "--minimum-history-rows",
+        type=int,
+        default=0,
+        help="对已有短历史也执行回填；日选生产建议至少 252 行",
+    )
+    parser.add_argument(
         "--provider-evidence",
         type=str,
         default=None,
@@ -61,7 +67,11 @@ def main() -> int:
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     store = MarketDataStore(root=settings.data_dir, database_path=settings.database_path)
     try:
-        summary = IncrementalUpdater(provider=provider, store=store).run(
+        summary = IncrementalUpdater(
+            provider=provider,
+            store=store,
+            minimum_history_rows=args.minimum_history_rows,
+        ).run(
             start_date=args.start_date,
             end_date=args.end_date,
             limit=args.limit,
