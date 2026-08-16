@@ -13,6 +13,12 @@ param(
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $pythonPath = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $runtimeDir = Join-Path $repoRoot '.runtime'
+$runtimeTempDir = Join-Path $runtimeDir 'tmp'
+$runtimeCacheDir = Join-Path $runtimeDir 'cache'
+$pipCacheDir = Join-Path $runtimeCacheDir 'pip'
+$joblibTempDir = Join-Path $runtimeCacheDir 'joblib'
+$xdgCacheDir = Join-Path $runtimeCacheDir 'xdg'
+$matplotlibConfigDir = Join-Path $runtimeCacheDir 'matplotlib'
 $pidPath = Join-Path $runtimeDir 'quant_workbench.pid'
 $launchMetadataPath = Join-Path $runtimeDir 'quant_workbench.launch.json'
 $launchHelpersPath = Join-Path $PSScriptRoot 'workbench_launch_helpers.ps1'
@@ -33,6 +39,48 @@ function Open-QuantWorkbenchPages {
     Start-Process $advisoryUrl
 }
 
+function Start-QuantWorkbenchProcess {
+    [CmdletBinding()]
+    param(
+        [string]$FilePath,
+        [object[]]$ArgumentList,
+        [string]$WorkingDirectory,
+        [string]$StandardOutputPath,
+        [string]$StandardErrorPath,
+        [System.Collections.IDictionary]$Environment
+    )
+
+    $previousEnvironment = @{}
+    foreach ($name in $Environment.Keys) {
+        $entry = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        $previousEnvironment[$name] = @{
+            Exists = $null -ne $entry
+            Value = if ($null -eq $entry) { $null } else { $entry.Value }
+        }
+    }
+    try {
+        foreach ($name in $Environment.Keys) {
+            Set-Item -LiteralPath "Env:$name" -Value $Environment[$name]
+        }
+        Start-Process `
+            -FilePath $FilePath `
+            -ArgumentList $ArgumentList `
+            -WorkingDirectory $WorkingDirectory `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $StandardOutputPath `
+            -RedirectStandardError $StandardErrorPath `
+            -PassThru
+    } finally {
+        foreach ($name in $Environment.Keys) {
+            if ($previousEnvironment[$name].Exists) {
+                Set-Item -LiteralPath "Env:$name" -Value $previousEnvironment[$name].Value
+            } else {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($AdvisoryLedger)) {
     $AdvisoryLedger = Join-Path $runtimeDir 'advisory\account-ledger.jsonl'
 }
@@ -49,7 +97,7 @@ $ResearchCheckpointPath = Join-Path $runtimeDir 'research\research-checkpoint.js
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python environment not found: $pythonPath"
 }
-New-Item -ItemType Directory -Force -Path $runtimeDir, (Split-Path $stdoutPath), $AccountImportDirectory, (Split-Path $ResearchCheckpointPath) | Out-Null
+New-Item -ItemType Directory -Force -Path $runtimeDir, $runtimeTempDir, $pipCacheDir, $joblibTempDir, $xdgCacheDir, $matplotlibConfigDir, (Split-Path $stdoutPath), $AccountImportDirectory, (Split-Path $ResearchCheckpointPath) | Out-Null
 
 if (Test-Path -LiteralPath $pidPath) {
     $oldPidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
@@ -106,7 +154,21 @@ if ($Offline) {
     }
     $arguments += '--offline'
 }
-$workbenchProcess = Start-Process -FilePath $pythonPath -ArgumentList $arguments -WorkingDirectory $repoRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+$workbenchEnvironment = [ordered]@{
+    TEMP = $runtimeTempDir
+    TMP = $runtimeTempDir
+    PIP_CACHE_DIR = $pipCacheDir
+    JOBLIB_TEMP_FOLDER = $joblibTempDir
+    XDG_CACHE_HOME = $xdgCacheDir
+    MPLCONFIGDIR = $matplotlibConfigDir
+}
+$workbenchProcess = Start-QuantWorkbenchProcess `
+    -FilePath $pythonPath `
+    -ArgumentList $arguments `
+    -WorkingDirectory $repoRoot `
+    -StandardOutputPath $stdoutPath `
+    -StandardErrorPath $stderrPath `
+    -Environment $workbenchEnvironment
 Set-Content -LiteralPath $pidPath -Value $workbenchProcess.Id -Encoding ascii
 
 $ready = $false

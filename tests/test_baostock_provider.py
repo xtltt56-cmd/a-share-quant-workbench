@@ -3,7 +3,11 @@ import types
 
 import pytest
 
-from a_share_quant.contracts.data import ProviderConfigurationError, ProviderRequestError
+from a_share_quant.contracts.data import (
+    CANONICAL_DAILY_COLUMNS,
+    ProviderConfigurationError,
+    ProviderRequestError,
+)
 from a_share_quant.data.providers.baostock import BaoStockDataProvider
 
 
@@ -87,6 +91,7 @@ def test_baostock_provider_logs_in_once_and_normalizes_universe_and_daily(
     assert fake.daily_calls[0]["frequency"] == "d"
     assert fake.daily_calls[0]["adjustflag"] == "3"
     assert daily.loc[0, "data_version"] == "baostock-unadjusted-v1"
+    assert tuple(daily.columns) == CANONICAL_DAILY_COLUMNS
 
 
 def test_baostock_provider_excludes_indexes_and_inactive_securities(

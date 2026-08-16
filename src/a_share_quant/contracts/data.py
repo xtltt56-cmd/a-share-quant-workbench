@@ -43,6 +43,21 @@ CANONICAL_INSTRUMENT_COLUMNS = (
     "data_version",
 )
 
+# Research history deliberately carries the execution-price columns above and
+# only a derived return label from the separately adjusted research series.
+# Adjusted OHLC values are never part of this contract.
+RESEARCH_HISTORY_COLUMNS = (
+    *CANONICAL_DAILY_COLUMNS[:12],
+    "trade_status",
+    "is_st",
+    "tradable",
+    "research_return",
+    "research_return_version",
+    "research_usable",
+    "unusable_reason",
+    *CANONICAL_DAILY_COLUMNS[12:],
+)
+
 
 class DataValidationError(ValueError):
     """Raised when an external or local frame violates a canonical schema."""

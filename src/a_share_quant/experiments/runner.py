@@ -165,10 +165,16 @@ def _relative_name(path: Path, root: Path) -> str:
 
 
 def _git_commit(repo_root: Path) -> str:
+    # Only an explicitly supplied repository root is provenance-bearing.  A
+    # temporary experiment directory nested inside a worktree must not inherit
+    # the parent repository's commit by Git's upward discovery.
+    root = Path(repo_root).resolve()
+    if not (root / ".git").exists():
+        return "unknown"
     try:
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
+            cwd=root,
             check=True,
             capture_output=True,
             text=True,

@@ -1,6 +1,43 @@
+import base64
+import json
+import os
+import shutil
+import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+MANAGED_ENVIRONMENT = {
+    "TEMP": ".runtime/tmp",
+    "TMP": ".runtime/tmp",
+    "PIP_CACHE_DIR": ".runtime/cache/pip",
+    "JOBLIB_TEMP_FOLDER": ".runtime/cache/joblib",
+    "XDG_CACHE_HOME": ".runtime/cache/xdg",
+    "MPLCONFIGDIR": ".runtime/cache/matplotlib",
+}
+
+
+@pytest.fixture
+def launcher_probe_dir() -> Iterator[Path]:
+    workspace = ROOT.resolve(strict=True)
+    assert workspace.drive.casefold() == "d:"
+    controlled_root = workspace / ".runtime" / "temp"
+    controlled_root.mkdir(parents=True, exist_ok=True)
+    controlled_root = controlled_root.resolve(strict=True)
+    assert controlled_root.is_relative_to(workspace)
+    probe_dir = controlled_root / f"pytest-launcher-scope-{uuid4().hex}"
+    probe_dir.mkdir()
+
+    try:
+        yield probe_dir
+    finally:
+        lexical_probe = Path(os.path.normpath(os.path.abspath(probe_dir)))
+        assert lexical_probe.parent == controlled_root
+        if lexical_probe.exists():
+            shutil.rmtree(lexical_probe)
 
 
 def test_launcher_scripts_use_local_dashboard_and_no_broker_path() -> None:
@@ -84,3 +121,323 @@ def test_launch_metadata_code_has_no_account_or_secret_fields() -> None:
         "account-ledger",
     ):
         assert forbidden not in helper
+
+
+def test_start_launcher_uses_only_process_scoped_project_runtime_environment() -> None:
+    launcher = (ROOT / "scripts" / "start_quant_workbench.ps1").read_text(
+        encoding="utf-8"
+    )
+    lower = launcher.lower()
+    launch_call_index = launcher.index("$workbenchProcess = Start-QuantWorkbenchProcess")
+
+    assert "$runtimeTempDir = Join-Path $runtimeDir 'tmp'" in launcher
+    assert "$runtimeCacheDir = Join-Path $runtimeDir 'cache'" in launcher
+    expected_directories = (
+        "$pipCacheDir = Join-Path $runtimeCacheDir 'pip'",
+        "$joblibTempDir = Join-Path $runtimeCacheDir 'joblib'",
+        "$xdgCacheDir = Join-Path $runtimeCacheDir 'xdg'",
+        "$matplotlibConfigDir = Join-Path $runtimeCacheDir 'matplotlib'",
+    )
+    for assignment in expected_directories:
+        assert assignment in launcher
+        assert launcher.index(assignment) < launch_call_index
+
+    assert "function Start-QuantWorkbenchProcess" in launcher
+    assert 'Set-Item -LiteralPath "Env:$name"' in launcher
+    assert 'Remove-Item -LiteralPath "Env:$name"' in launcher
+    assert "finally {" in launcher
+    assert "$env:" not in launcher.lower()
+
+    for forbidden in (
+        "setx ",
+        "setenvironmentvariable",
+        "registry::",
+        "$env:home",
+        "$env:codex_home",
+    ):
+        assert forbidden not in lower
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell process-scope test")
+@pytest.mark.parametrize(
+    ("mode", "expected_invoked", "expected_threw"),
+    [
+        ("reuse_or_early", False, False),
+        ("success", True, False),
+        ("failure", True, True),
+    ],
+)
+def test_launcher_managed_environment_is_scoped_to_start_process(
+    mode: str,
+    expected_invoked: bool,
+    expected_threw: bool,
+) -> None:
+    payload = _run_start_process_scope_probe(mode)
+
+    assert payload["Invoked"] is expected_invoked
+    assert payload["Threw"] is expected_threw
+    original_temp = str(Path(payload["RepoRoot"]) / ".runtime" / "original-temp")
+    original_tmp = str(Path(payload["RepoRoot"]) / ".runtime" / "original-tmp")
+    assert payload["After"] == {
+        "TEMP": original_temp,
+        "TMP": original_tmp,
+        "PIP_CACHE_DIR": None,
+        "JOBLIB_TEMP_FOLDER": None,
+        "XDG_CACHE_HOME": None,
+        "MPLCONFIGDIR": None,
+        "HOME": "preserved-home",
+        "CODEX_HOME": "preserved-codex-home",
+    }
+    if expected_invoked:
+        inherited_root = Path(payload["RepoRoot"])
+        for name, relative in MANAGED_ENVIRONMENT.items():
+            assert Path(payload["Observed"][name]) == inherited_root / relative
+        assert payload["Observed"]["HOME"] == "preserved-home"
+        assert payload["Observed"]["CODEX_HOME"] == "preserved-codex-home"
+    else:
+        assert payload["Observed"] is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell inheritance test")
+def test_launcher_real_child_process_inherits_managed_environment(
+    launcher_probe_dir: Path,
+) -> None:
+    payload = _run_real_child_inheritance_probe(launcher_probe_dir)
+
+    assert payload["ProcessType"] == "System.Diagnostics.Process"
+    assert payload["HasExited"] is True
+    inherited_root = Path(payload["RepoRoot"])
+    for name, relative in MANAGED_ENVIRONMENT.items():
+        assert Path(payload["Child"][name]) == inherited_root / relative
+        assert payload["After"][name] == f"original-{name}"
+    assert payload["Child"]["HOME"] == "preserved-home"
+    assert payload["Child"]["CODEX_HOME"] == "preserved-codex-home"
+    assert payload["After"]["HOME"] == "preserved-home"
+    assert payload["After"]["CODEX_HOME"] == "preserved-codex-home"
+    inherited_probe_dir = Path(payload["ProbeDir"])
+    assert inherited_probe_dir.drive.casefold() == "d:"
+    assert inherited_probe_dir.is_relative_to(inherited_root / ".runtime" / "temp")
+    stdout_path = Path(payload["StdoutPath"])
+    stderr_path = Path(payload["StderrPath"])
+    assert stdout_path.is_relative_to(inherited_probe_dir)
+    assert stderr_path.is_relative_to(inherited_probe_dir)
+    assert payload["StdoutExists"] is True
+    assert payload["StderrExists"] is True
+
+
+def _run_start_process_scope_probe(mode: str) -> dict[str, object]:
+    launcher_literal = str(ROOT / "scripts" / "start_quant_workbench.ps1").replace(
+        "'", "''"
+    )
+    mode_literal = mode.replace("'", "''")
+    script = r"""
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '__LAUNCHER__',
+    [ref]$tokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) { throw 'launcher parse failed' }
+$functionAst = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Start-QuantWorkbenchProcess'
+}, $true)
+if ($null -eq $functionAst) { throw 'scoped launcher function missing' }
+Invoke-Expression $functionAst.Extent.Text
+
+$repoRoot = (Resolve-Path '__ROOT__').Path
+$runtimeDir = Join-Path $repoRoot '.runtime'
+$managed = [ordered]@{
+    TEMP = Join-Path $runtimeDir 'tmp'
+    TMP = Join-Path $runtimeDir 'tmp'
+    PIP_CACHE_DIR = Join-Path $runtimeDir 'cache\pip'
+    JOBLIB_TEMP_FOLDER = Join-Path $runtimeDir 'cache\joblib'
+    XDG_CACHE_HOME = Join-Path $runtimeDir 'cache\xdg'
+    MPLCONFIGDIR = Join-Path $runtimeDir 'cache\matplotlib'
+}
+$names = @(
+    'TEMP', 'TMP', 'PIP_CACHE_DIR', 'JOBLIB_TEMP_FOLDER',
+    'XDG_CACHE_HOME', 'MPLCONFIGDIR', 'HOME', 'CODEX_HOME'
+)
+Set-Item -LiteralPath 'Env:TEMP' -Value (Join-Path $runtimeDir 'original-temp')
+Set-Item -LiteralPath 'Env:TMP' -Value (Join-Path $runtimeDir 'original-tmp')
+foreach ($name in @('PIP_CACHE_DIR', 'JOBLIB_TEMP_FOLDER', 'XDG_CACHE_HOME', 'MPLCONFIGDIR')) {
+    Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
+Set-Item -LiteralPath 'Env:HOME' -Value 'preserved-home'
+Set-Item -LiteralPath 'Env:CODEX_HOME' -Value 'preserved-codex-home'
+
+function Get-ProbeEnvironment {
+    $snapshot = [ordered]@{}
+    foreach ($name in $names) {
+        $entry = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        $snapshot[$name] = if ($null -eq $entry) { $null } else { $entry.Value }
+    }
+    return $snapshot
+}
+
+$script:Invoked = $false
+$script:Observed = $null
+$script:FailLaunch = '__MODE__' -eq 'failure'
+function Start-Process {
+    param(
+        [string]$FilePath,
+        [object[]]$ArgumentList,
+        [string]$WorkingDirectory,
+        [string]$WindowStyle,
+        [string]$RedirectStandardOutput,
+        [string]$RedirectStandardError,
+        [switch]$PassThru
+    )
+    $script:Invoked = $true
+    $script:Observed = Get-ProbeEnvironment
+    if ($script:FailLaunch) { throw 'simulated Start-Process failure' }
+    [pscustomobject]@{ Id = 12345 }
+}
+
+$threw = $false
+if ('__MODE__' -ne 'reuse_or_early') {
+    try {
+        $null = Start-QuantWorkbenchProcess `
+            -FilePath 'python.exe' `
+            -ArgumentList @('-V') `
+            -WorkingDirectory $repoRoot `
+            -StandardOutputPath (Join-Path $runtimeDir 'probe.out') `
+            -StandardErrorPath (Join-Path $runtimeDir 'probe.err') `
+            -Environment $managed
+    } catch {
+        $threw = $true
+    }
+}
+[ordered]@{
+    RepoRoot = $repoRoot
+    Invoked = $script:Invoked
+    Threw = $threw
+    Observed = $script:Observed
+    After = Get-ProbeEnvironment
+} | ConvertTo-Json -Depth 5 -Compress
+"""
+    script = script.replace("__LAUNCHER__", launcher_literal)
+    script = script.replace("__ROOT__", str(ROOT).replace("'", "''"))
+    script = script.replace("__MODE__", mode_literal)
+    process_temp = ROOT / ".runtime" / "temp" / f"pytest-launcher-process-{uuid4().hex}"
+    process_temp.mkdir(parents=True)
+    try:
+        return _run_powershell_probe(script, process_temp)
+    finally:
+        assert process_temp.parent == (ROOT / ".runtime" / "temp")
+        if process_temp.exists():
+            shutil.rmtree(process_temp)
+
+
+def _run_real_child_inheritance_probe(probe_dir: Path) -> dict[str, object]:
+    launcher_literal = str(ROOT / "scripts" / "start_quant_workbench.ps1").replace(
+        "'", "''"
+    )
+    probe_literal = str(probe_dir).replace("'", "''")
+    child_script = (
+        "[ordered]@{"
+        + ";".join(
+            f"{name}=$env:{name}"
+            for name in (*MANAGED_ENVIRONMENT, "HOME", "CODEX_HOME")
+        )
+        + "} | ConvertTo-Json -Compress"
+    )
+    encoded_child = base64.b64encode(child_script.encode("utf-16-le")).decode("ascii")
+    script = r"""
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '__LAUNCHER__',
+    [ref]$tokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) { throw 'launcher parse failed' }
+$functionAst = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Start-QuantWorkbenchProcess'
+}, $true)
+if ($null -eq $functionAst) { throw 'scoped launcher function missing' }
+Invoke-Expression $functionAst.Extent.Text
+
+$repoRoot = (Resolve-Path '__ROOT__').Path
+$probeDir = (Resolve-Path '__PROBE__').Path
+$runtimeDir = Join-Path $repoRoot '.runtime'
+$stdoutPath = Join-Path $probeDir 'child.stdout.json'
+$stderrPath = Join-Path $probeDir 'child.stderr.log'
+$managed = [ordered]@{
+    TEMP = Join-Path $runtimeDir 'tmp'
+    TMP = Join-Path $runtimeDir 'tmp'
+    PIP_CACHE_DIR = Join-Path $runtimeDir 'cache\pip'
+    JOBLIB_TEMP_FOLDER = Join-Path $runtimeDir 'cache\joblib'
+    XDG_CACHE_HOME = Join-Path $runtimeDir 'cache\xdg'
+    MPLCONFIGDIR = Join-Path $runtimeDir 'cache\matplotlib'
+}
+$names = @(
+    'TEMP', 'TMP', 'PIP_CACHE_DIR', 'JOBLIB_TEMP_FOLDER',
+    'XDG_CACHE_HOME', 'MPLCONFIGDIR', 'HOME', 'CODEX_HOME'
+)
+foreach ($name in $managed.Keys) {
+    Set-Item -LiteralPath "Env:$name" -Value "original-$name"
+}
+Set-Item -LiteralPath 'Env:HOME' -Value 'preserved-home'
+Set-Item -LiteralPath 'Env:CODEX_HOME' -Value 'preserved-codex-home'
+
+function Get-ProbeEnvironment {
+    $snapshot = [ordered]@{}
+    foreach ($name in $names) {
+        $entry = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        $snapshot[$name] = if ($null -eq $entry) { $null } else { $entry.Value }
+    }
+    return $snapshot
+}
+
+$process = Start-QuantWorkbenchProcess `
+    -FilePath (Get-Command 'powershell.exe').Source `
+    -ArgumentList @('-NoProfile', '-EncodedCommand', '__ENCODED__') `
+    -WorkingDirectory $repoRoot `
+    -StandardOutputPath $stdoutPath `
+    -StandardErrorPath $stderrPath `
+    -Environment $managed
+$process.WaitForExit()
+$process.Refresh()
+$child = Get-Content -LiteralPath $stdoutPath -Raw | ConvertFrom-Json
+[ordered]@{
+    RepoRoot = $repoRoot
+    ProbeDir = $probeDir
+    ProcessType = $process.GetType().FullName
+    HasExited = $process.HasExited
+    ExitCode = $process.ExitCode
+    Child = $child
+    After = Get-ProbeEnvironment
+    StdoutPath = $stdoutPath
+    StderrPath = $stderrPath
+    StdoutExists = Test-Path -LiteralPath $stdoutPath -PathType Leaf
+    StderrExists = Test-Path -LiteralPath $stderrPath -PathType Leaf
+} | ConvertTo-Json -Depth 5 -Compress
+"""
+    script = script.replace("__LAUNCHER__", launcher_literal)
+    script = script.replace("__ROOT__", str(ROOT).replace("'", "''"))
+    script = script.replace("__PROBE__", probe_literal)
+    script = script.replace("__ENCODED__", encoded_child)
+    return _run_powershell_probe(script, probe_dir / "process-temp")
+
+
+def _run_powershell_probe(script: str, process_temp: Path) -> dict[str, object]:
+    process_temp.mkdir(parents=True, exist_ok=True)
+    assert process_temp.resolve(strict=True).drive.casefold() == "d:"
+    assert process_temp.resolve(strict=True).is_relative_to(ROOT.resolve(strict=True))
+    base = dict(os.environ)
+    base["TEMP"] = str(process_temp)
+    base["TMP"] = str(process_temp)
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=base,
+    )
+    return json.loads(result.stdout.strip())

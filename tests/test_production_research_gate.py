@@ -9,7 +9,7 @@ from a_share_quant.research.production_gate import (
 def _evidence(**overrides) -> ResearchEvidence:
     values = {
         "candidate_id": "model-v2",
-        "data_mode": "historical",
+        "data_mode": "paper",
         "walk_forward_windows": 6,
         "oos_excess_returns": (0.02, 0.01, -0.01, 0.03, 0.01, 0.02),
         "rank_ic": (0.04, 0.02, 0.01, 0.03, 0.02, 0.01),
@@ -49,6 +49,14 @@ def test_production_research_gate_fails_closed_for_fixture_and_weak_windows() ->
     assert result.checks["historical_data"] is False
     assert result.checks["walk_forward"] is False
     assert result.reasons
+
+
+def test_production_research_gate_rejects_historical_engineering_evidence() -> None:
+    result = ProductionResearchGate().evaluate(_evidence(data_mode="historical"))
+
+    assert result.passed is False
+    assert result.checks["historical_data"] is False
+    assert "historical_data" in result.reasons
 
 
 def test_production_research_gate_rejects_missing_or_unstable_evidence() -> None:

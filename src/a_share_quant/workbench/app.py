@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from datetime import date
+import threading
+from collections.abc import Callable, Mapping
+from datetime import date, datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +28,99 @@ from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
 
+_RESEARCH_CONTEXT_KEYS = frozenset(
+    {
+        "session_completed",
+        "data_fingerprint",
+        "data_refreshed",
+        "outcome_cutoff",
+    }
+)
+
+
+class ResearchLifecycle:
+    """Own periodic research scheduling for exactly one workbench server.
+
+    The lifecycle owns no provider configuration or arbitrary worker inputs:
+    it receives a fixed, workbench-derived evidence snapshot and delegates
+    allowlist/resource enforcement to :class:`ResearchJobSupervisor`.  The
+    first tick is immediate; later ticks wait on an event so shutdown cannot
+    busy-loop or race a new child launch after it returns.
+    """
+
+    def __init__(
+        self,
+        supervisor: ResearchJobSupervisor,
+        context_supplier: Callable[[datetime], Mapping[str, object]],
+        *,
+        clock: Callable[[], datetime] | None = None,
+        interval_seconds: float = 30.0,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("research tick interval must be positive")
+        self._supervisor = supervisor
+        self._context_supplier = context_supplier
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._interval_seconds = float(interval_seconds)
+        self._stop_event = threading.Event()
+        self._tick_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> tuple[str, ...]:
+        """Run one tick now, then wait between subsequent ticks."""
+
+        if self._thread is not None:
+            return ()
+        started = self.tick()
+        if not self._stop_event.is_set():
+            self._thread = threading.Thread(
+                target=self._run,
+                name="a-share-research-lifecycle",
+                daemon=True,
+            )
+            self._thread.start()
+        return started
+
+    def tick(self) -> tuple[str, ...]:
+        """Safely collect/queue one internal lifecycle snapshot."""
+
+        if self._stop_event.is_set():
+            return ()
+        with self._tick_lock:
+            if self._stop_event.is_set():
+                return ()
+            try:
+                now = _utc_clock(self._clock())
+                context = self._context_supplier(now)
+                if not isinstance(context, Mapping) or set(context) - _RESEARCH_CONTEXT_KEYS:
+                    return ()
+                normalized = dict(context)
+                self._supervisor.register_default_jobs(now=now, **normalized)
+                # ``stop`` takes this lock after setting the event.  Checking
+                # again prevents a final tick from launching a child during
+                # server teardown.
+                if self._stop_event.is_set():
+                    return ()
+                return self._supervisor.start_due_jobs(now=now)
+            except (TypeError, ValueError, OSError):
+                # Evidence is unavailable or malformed.  The worker remains
+                # untouched; the next bounded tick may retry with fresh state.
+                return ()
+
+    def stop(self, *, timeout_seconds: float = 5.0) -> None:
+        """Prevent further ticks and wait for an in-flight tick to finish."""
+
+        self._stop_event.set()
+        with self._tick_lock:
+            pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, timeout_seconds))
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_seconds):
+            self.tick()
+
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -37,6 +132,7 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         advisory_service: AdvisoryWorkbenchService | None = None,
         supervisor: ResearchJobSupervisor | None = None,
         governance: EvolutionRegistry | None = None,
+        research_lifecycle: ResearchLifecycle | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
@@ -44,6 +140,7 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.advisory_service = advisory_service
         self.supervisor = supervisor
         self.governance = governance
+        self.research_lifecycle = research_lifecycle
         self._governance_previews: dict[str, tuple[str, str, str]] = {}
         super().__init__(server_address, WorkbenchRequestHandler)
 
@@ -128,6 +225,9 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return
+        lifecycle = self.server.research_lifecycle
+        if lifecycle is not None:
+            lifecycle.stop(timeout_seconds=5.0)
         result = supervisor.shutdown(timeout_seconds=5.0)
         self._write_json(
             {
@@ -427,6 +527,7 @@ def create_server(
     advisory_service: AdvisoryWorkbenchService | None = None,
     supervisor: ResearchJobSupervisor | None = None,
     governance: EvolutionRegistry | None = None,
+    research_lifecycle: ResearchLifecycle | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -438,6 +539,7 @@ def create_server(
         advisory_service,
         supervisor,
         governance,
+        research_lifecycle,
     )
 
 
@@ -452,6 +554,11 @@ def run_server(
     price_guidance_store: PriceGuidanceStore | None = None,
     supervisor: ResearchJobSupervisor | None = None,
     governance: EvolutionRegistry | None = None,
+    research_context_supplier: (
+        Callable[[datetime, WorkbenchService], Mapping[str, object]] | None
+    ) = None,
+    research_clock: Callable[[], datetime] | None = None,
+    research_tick_interval_seconds: float = 30.0,
 ) -> None:
     if official_signal_store is not None:
         official_store = official_signal_store
@@ -498,6 +605,15 @@ def run_server(
         set_quote_provider = getattr(advisory_service, "set_quote_provider", None)
         if set_quote_provider is not None:
             set_quote_provider(service.validated_quote)
+    research_lifecycle = None
+    if supervisor is not None:
+        supplier = research_context_supplier or _empty_research_context
+        research_lifecycle = ResearchLifecycle(
+            supervisor,
+            lambda tick_now: supplier(tick_now, service),
+            clock=research_clock,
+            interval_seconds=research_tick_interval_seconds,
+        )
     eod_coordinator = None
     if repo_root is not None and allow_network and official_store is not None:
         def refresh_eod(day: date) -> None:
@@ -517,14 +633,19 @@ def run_server(
         advisory_service=advisory_service,
         supervisor=supervisor,
         governance=governance,
+        research_lifecycle=research_lifecycle,
         port=port,
     )
     try:
+        if research_lifecycle is not None:
+            research_lifecycle.start()
         print(f"A股量化交易工作台：http://127.0.0.1:{server.server_address[1]}/")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if research_lifecycle is not None:
+            research_lifecycle.stop()
         server.shutdown()
         server.server_close()
         service.stop_background()
@@ -532,6 +653,25 @@ def run_server(
             eod_coordinator.stop()
         if supervisor is not None:
             supervisor.shutdown(timeout_seconds=5.0)
+
+
+def _empty_research_context(
+    _now: datetime, _service: WorkbenchService
+) -> Mapping[str, object]:
+    """Fail closed when a caller has not installed an internal evidence source."""
+
+    return {
+        "session_completed": False,
+        "data_fingerprint": None,
+        "data_refreshed": False,
+        "outcome_cutoff": None,
+    }
+
+
+def _utc_clock(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("research lifecycle clock must be timezone-aware")
+    return value.astimezone(timezone.utc)
 
 
 def refresh_eod_state(
