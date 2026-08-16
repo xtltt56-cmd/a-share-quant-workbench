@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from collections import namedtuple
 from datetime import date, datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import pytest
@@ -21,6 +25,25 @@ from a_share_quant.storage.research_data_store import (
 )
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
+
+
+@pytest.fixture
+def d_backfill_root() -> Path:
+    """Keep this regression's persisted data under the project D: runtime."""
+
+    workspace = Path(__file__).resolve().parents[1]
+    assert workspace.drive.casefold() == "d:"
+    parent = workspace / ".runtime" / "temp"
+    parent.mkdir(parents=True, exist_ok=True)
+    root = parent / f"task8-backfill-{uuid4().hex}"
+    root.mkdir()
+    try:
+        yield root
+    finally:
+        lexical = Path(os.path.normpath(os.path.abspath(root)))
+        assert lexical.parent == parent.resolve()
+        if lexical.exists():
+            shutil.rmtree(lexical)
 
 
 def _instrument_frame() -> pd.DataFrame:
@@ -140,6 +163,20 @@ def test_backfill_resumes_only_missing_symbols_and_keeps_delisted_symbols(tmp_pa
     assert second.rows_written == 0
     assert [call for call in provider.calls if call[0] == "history"] == history_calls_after_first
     assert "600001" in coordinator.coverage().symbols
+
+
+def test_backfill_can_bound_each_provider_date_request_for_large_history(tmp_path) -> None:
+    provider = RecordingHistoryProvider()
+    provider.list_research_instruments = lambda as_of=None: _instrument_frame().iloc[:1].copy()
+    coordinator = _coordinator(tmp_path, provider, max_request_days=2)
+
+    coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 5), limit=1)
+    first_calls = [call for call in provider.calls if call[0] == "history"]
+    coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 5), limit=1)
+    second_calls = [call for call in provider.calls if call[0] == "history"]
+
+    assert first_calls == [("history", "600001", date(2019, 1, 1), date(2019, 1, 2))]
+    assert second_calls[-1] == ("history", "600001", date(2019, 1, 3), date(2019, 1, 4))
 
 
 def test_backfill_stops_before_any_provider_call_when_d_drive_space_is_low(tmp_path) -> None:
@@ -274,6 +311,45 @@ def test_expanding_range_requests_only_missing_edges_and_merges_last_valid_artif
         date(2019, 1, 3),
         date(2019, 1, 4),
     ]
+
+
+def test_task8_forward_history_chunks_preserve_verified_coverage(
+    d_backfill_root: Path,
+) -> None:
+    """A later bounded chunk must merge instead of rejecting earlier rows."""
+
+    provider = RecordingHistoryProvider()
+    instruments = _instrument_frame().iloc[:1].copy()
+    provider.list_research_instruments = lambda as_of=None: instruments
+    coordinator = _coordinator(d_backfill_root, provider)
+
+    coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+    first_coverage = coordinator.coverage()
+    provider.calls.clear()
+
+    second = coordinator.run(start=date(2019, 1, 3), end=date(2019, 1, 4), limit=1)
+    second_coverage = coordinator.coverage()
+
+    assert second.failures == {}
+    assert second.rows_written == 2
+    assert second_coverage.session_count > first_coverage.session_count
+    assert [call[2:] for call in provider.calls if call[0] == "history"] == [
+        (date(2019, 1, 3), date(2019, 1, 4)),
+    ]
+    artifact = coordinator.store.active_artifact("research_returns", "600001")
+    assert coordinator.store.verify(artifact)
+    assert list(pd.read_parquet(artifact.path)["date"]) == [
+        date(2019, 1, 1),
+        date(2019, 1, 2),
+        date(2019, 1, 3),
+        date(2019, 1, 4),
+    ]
+
+    provider.calls.clear()
+    complete = coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 4), limit=1)
+
+    assert complete.rows_written == 0
+    assert [call for call in provider.calls if call[0] == "history"] == []
 
 
 def test_retries_only_bounded_transient_failures_and_applies_configured_delays(

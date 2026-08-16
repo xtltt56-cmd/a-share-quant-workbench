@@ -129,12 +129,18 @@ class ProspectivePrediction:
     as_of: date
     horizon: int
     score: float
-    probability: float
+    probability: float | None
     guidance_price_bands: Mapping[str, tuple[float, float]]
     evidence_mode: str = "PROSPECTIVE"
     maturity_date: date | None = None
     prediction_id: str = ""
     maturity_explicit: bool = dataclass_field(default=False, repr=False, compare=False)
+    source_input_digest: str = ""
+    session_calendar_digest: str = ""
+    cycle_key: str = ""
+    model_bundle_digest: str = ""
+    probability_calibrated: bool = True
+    source_artifact_path: str = ""
 
     def __post_init__(self) -> None:
         for field in (
@@ -166,10 +172,16 @@ class ProspectivePrediction:
             raise ValueError("horizon must be one of 5, 10, or 20")
         object.__setattr__(self, "horizon", horizon)
         object.__setattr__(self, "score", _finite(self.score, field="score"))
-        probability = _finite(self.probability, field="probability")
-        if not 0 <= probability <= 1:
-            raise ValueError("probability must be between zero and one")
-        object.__setattr__(self, "probability", probability)
+        calibrated = bool(self.probability_calibrated)
+        if self.probability is None:
+            if calibrated:
+                raise ValueError("probability is required when calibrated")
+        else:
+            probability = _finite(self.probability, field="probability")
+            if not 0 <= probability <= 1:
+                raise ValueError("probability must be between zero and one")
+            object.__setattr__(self, "probability", probability)
+        object.__setattr__(self, "probability_calibrated", calibrated)
         object.__setattr__(self, "guidance_price_bands", _freeze_bands(self.guidance_price_bands))
         evidence_mode = str(self.evidence_mode).strip().upper()
         if evidence_mode not in _ALLOWED_EVIDENCE_MODES:
@@ -190,6 +202,29 @@ class ProspectivePrediction:
             raise ValueError("prediction_at must precede maturity_date")
         object.__setattr__(self, "maturity_date", maturity)
         object.__setattr__(self, "maturity_explicit", maturity_was_explicit)
+        for field in (
+            "source_input_digest",
+            "session_calendar_digest",
+            "model_bundle_digest",
+        ):
+            value = str(getattr(self, field)).strip().lower()
+            if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
+                raise ValueError(f"{field} must be a sha256 digest")
+            object.__setattr__(self, field, value)
+        cycle_key = str(self.cycle_key).strip()
+        if len(cycle_key) > 128 or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in cycle_key
+        ):
+            raise ValueError("cycle_key is invalid")
+        object.__setattr__(self, "cycle_key", cycle_key)
+        source_path = str(self.source_artifact_path).strip().replace("\\", "/")
+        if source_path and (
+            not source_path.startswith(".runtime/research/")
+            or any(part in {"", ".", ".."} for part in source_path.split("/"))
+        ):
+            raise ValueError("source_artifact_path is invalid")
+        object.__setattr__(self, "source_artifact_path", source_path)
         provided_id = str(self.prediction_id).strip()
         object.__setattr__(self, "prediction_id", provided_id or self._computed_id())
 
@@ -210,6 +245,12 @@ class ProspectivePrediction:
             "evidence_mode": self.evidence_mode,
             "maturity_date": self.maturity_date,
             "maturity_explicit": self.maturity_explicit,
+            "source_input_digest": self.source_input_digest,
+            "session_calendar_digest": self.session_calendar_digest,
+            "cycle_key": self.cycle_key,
+            "model_bundle_digest": self.model_bundle_digest,
+            "probability_calibrated": self.probability_calibrated,
+            "source_artifact_path": self.source_artifact_path,
         }
 
     def _computed_id(self) -> str:
@@ -237,11 +278,21 @@ class ProspectivePrediction:
             "evidence_mode": self.evidence_mode,
             "maturity_date": self.maturity_date.isoformat(),
             "maturity_explicit": self.maturity_explicit,
+            "source_input_digest": self.source_input_digest,
+            "session_calendar_digest": self.session_calendar_digest,
+            "cycle_key": self.cycle_key,
+            "model_bundle_digest": self.model_bundle_digest,
+            "probability_calibrated": self.probability_calibrated,
+            "source_artifact_path": self.source_artifact_path,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ProspectivePrediction:
         payload = dict(value)
+        # Older records did not distinguish a calibrated probability from a
+        # score scaled into [0, 1].  Treat missing provenance as uncalibrated
+        # so historical rows cannot silently enter Brier/ECE metrics.
+        payload.setdefault("probability_calibrated", False)
         # Pre-migration records serialized a maturity date but not its
         # provenance.  Treat those as explicit conservatively so they require
         # a trusted session calendar before re-registration.
@@ -471,7 +522,15 @@ class ProspectiveCompetition:
                 candidate.config_hash,
                 candidate.training_snapshot_hash,
             )
-            if actual != expected or candidate.evidence_mode != "PROSPECTIVE":
+            bundle_matches = (
+                self.contest.model_bundle_digest is None
+                or candidate.model_bundle_digest == self.contest.model_bundle_digest
+            )
+            if (
+                actual != expected
+                or not bundle_matches
+                or candidate.evidence_mode != "PROSPECTIVE"
+            ):
                 raise ValueError("prediction does not match frozen contest")
             if candidate.prediction_at < self.contest.contest_started_at:
                 raise ValueError("prediction_at precedes contest start")
@@ -507,8 +566,17 @@ class ProspectiveCompetition:
             if item.realized_return is not None
         ]
         scores = [predictions[item.prediction_id].score for item in outcomes]
-        probabilities = [predictions[item.prediction_id].probability for item in outcomes]
         labels = [1.0 if value > 0 else 0.0 for value in returns]
+        calibrated = all(
+            predictions[item.prediction_id].probability_calibrated
+            and predictions[item.prediction_id].probability is not None
+            for item in outcomes
+        )
+        probabilities = (
+            [float(predictions[item.prediction_id].probability) for item in outcomes]
+            if calibrated
+            else []
+        )
         turnover = len(outcomes) / max(total, 1)
         net = sum(returns) / len(returns) - float(cost_bps) / 10000.0 * turnover
         running = peak = drawdown = 0.0
@@ -516,16 +584,28 @@ class ProspectiveCompetition:
             running += value - float(cost_bps) / 10000.0 * turnover / len(returns)
             peak = max(peak, running)
             drawdown = max(drawdown, peak - running)
-        brier = sum(
-            (probability - label) ** 2
-            for probability, label in zip(probabilities, labels)
-        ) / len(labels)
-        ece = _expected_calibration_error(probabilities, labels)
+        brier = (
+            sum(
+                (probability - label) ** 2
+                for probability, label in zip(probabilities, labels)
+            )
+            / len(labels)
+            if calibrated
+            else None
+        )
+        ece = _expected_calibration_error(probabilities, labels) if calibrated else None
         rank_ic = _rank_correlation(scores, returns)
         return ProspectiveMetrics(
             directional_hit_rate=sum(
-                (score >= 0.5) == bool(label)
-                for score, label in zip(probabilities, labels)
+                (
+                    (probability >= 0.5 if calibrated else score >= 50.0)
+                    == bool(label)
+                )
+                for score, probability, label in zip(
+                    scores,
+                    probabilities if calibrated else [None] * len(labels),
+                    labels,
+                )
             ) / len(labels),
             brier=brier, ece=ece, rank_ic=rank_ic, net_cost_return=net,
             max_drawdown=drawdown, turnover=turnover, coverage=coverage,
@@ -623,6 +703,7 @@ class ProspectiveContest:
         self._model_version: str | None = None
         self._config_hash: str | None = None
         self._training_snapshot_hash: str | None = None
+        self._model_bundle_digest: str | None = None
         self._primary_metric: str | None = None
         self._tie_break: tuple[str, ...] = ()
         self._future_sessions = 0
@@ -638,6 +719,7 @@ class ProspectiveContest:
         model_version: str,
         config_hash: str,
         training_snapshot_hash: str,
+        model_bundle_digest: str | None = None,
         primary_metric: str = "net_cost_return",
         tie_break: Iterable[str] = ("max_drawdown", "brier"),
         started_at: datetime | None = None,
@@ -647,6 +729,9 @@ class ProspectiveContest:
             "model_version": str(model_version).strip(),
             "config_hash": str(config_hash).strip(),
             "training_snapshot_hash": str(training_snapshot_hash).strip(),
+            "model_bundle_digest": (
+                str(model_bundle_digest).strip().lower() if model_bundle_digest else None
+            ),
             "primary_metric": str(primary_metric).strip(),
             "tie_break": tuple(str(item).strip() for item in tie_break),
         }
@@ -663,6 +748,11 @@ class ProspectiveContest:
             raise ValueError("contest registration fields are required")
         if not values["tie_break"] or any(not item for item in values["tie_break"]):
             raise ValueError("tie_break must be non-empty")
+        if values["model_bundle_digest"] is not None and (
+            len(values["model_bundle_digest"]) != 64
+            or any(c not in "0123456789abcdef" for c in values["model_bundle_digest"])
+        ):
+            raise ValueError("model_bundle_digest must be a sha256 digest")
         at = _utc(started_at or self.now, field="contest_started_at")
         if at > self.now:
             raise FutureTimestampError("contest start timestamp is in the future")
@@ -672,6 +762,7 @@ class ProspectiveContest:
                 self._model_version,
                 self._config_hash,
                 self._training_snapshot_hash,
+                self._model_bundle_digest,
                 self._primary_metric,
                 self._tie_break,
             )
@@ -680,6 +771,7 @@ class ProspectiveContest:
                 values["model_version"],
                 values["config_hash"],
                 values["training_snapshot_hash"],
+                values["model_bundle_digest"],
                 values["primary_metric"],
                 values["tie_break"],
             ):
@@ -691,6 +783,7 @@ class ProspectiveContest:
         self._model_version = values["model_version"]
         self._config_hash = values["config_hash"]
         self._training_snapshot_hash = values["training_snapshot_hash"]
+        self._model_bundle_digest = values["model_bundle_digest"]
         self._primary_metric = values["primary_metric"]
         self._tie_break = values["tie_break"]
         self._status = "PROSPECTIVE_COLLECTING"
@@ -878,6 +971,10 @@ class ProspectiveContest:
         return self._training_snapshot_hash
 
     @property
+    def model_bundle_digest(self) -> str | None:
+        return self._model_bundle_digest
+
+    @property
     def metrics(self) -> ProspectiveMetrics | None:
         return self._metrics
 
@@ -894,6 +991,7 @@ class ProspectiveContest:
             "model_version": self._model_version,
             "config_hash": self._config_hash,
             "training_snapshot_hash": self._training_snapshot_hash,
+            "model_bundle_digest": self._model_bundle_digest,
             "primary_metric": self._primary_metric,
             "tie_break": list(self._tie_break),
             "future_sessions": self._future_sessions,

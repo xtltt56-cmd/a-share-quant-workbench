@@ -331,6 +331,7 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
         "config_hash": "c" * 64,
         "training_snapshot_hash": "d" * 64,
         "official_signal_digest": "e" * 64,
+        "model_bundle_digest": "b" * 64,
     }
     terms = {
         "primary_metric": "net_cost_return",
@@ -359,6 +360,7 @@ def test_task8_contest_start_freezes_internal_provenance_and_rejects_version_fla
     assert frozen["config_hash"] == "c" * 64
     assert frozen["training_snapshot_hash"] == "d" * 64
     assert frozen["official_signal_digest"] == "e" * 64
+    assert frozen["model_bundle_digest"] == "b" * 64
     assert frozen["primary_metric"] == "net_cost_return"
     assert frozen["tie_break"] == terms["tie_break"]
     assert frozen["provisional_sessions"] == 20

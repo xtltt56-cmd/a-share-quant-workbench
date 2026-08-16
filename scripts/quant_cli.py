@@ -20,7 +20,11 @@ from a_share_quant.data.realtime.diagnostics import (
     collect_network_diagnostics,
     write_network_diagnostics_report,
 )
-from a_share_quant.research.daily_candidates import generate_from_data_root, load_name_map
+from a_share_quant.research.daily_candidates import (
+    generate_from_data_root,
+    load_name_map,
+    model_bundle_digest,
+)
 from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.research.prospective_competition import ProspectiveContest
 from a_share_quant.runtime.historical_backfill import HistoricalBackfillCoordinator
@@ -520,6 +524,7 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
         model_version=registration["model_version"],
         config_hash=registration["config_hash"],
         training_snapshot_hash=registration["training_snapshot_hash"],
+        model_bundle_digest=registration.get("model_bundle_digest"),
         primary_metric=terms["primary_metric"],
         tie_break=terms["tie_break"],
         started_at=now,
@@ -543,6 +548,8 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
         "status": "PROSPECTIVE_COLLECTING",
         "promotion": "NEVER",
     }
+    if registration.get("model_bundle_digest"):
+        body["model_bundle_digest"] = registration["model_bundle_digest"]
     encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     payload = {**body, "sha256": hashlib.sha256(encoded).hexdigest()}
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
@@ -603,7 +610,12 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
         "status",
         "promotion",
     }
-    if set(body) != required or body.get("format_version") != 3:
+    optional = {"model_bundle_digest"}
+    if (
+        not set(body).issubset(required | optional)
+        or not required.issubset(body)
+        or body.get("format_version") != 3
+    ):
         raise SystemExit("未来竞赛冻结文件字段无效")
     if (
         body.get("provisional_sessions") != 20
@@ -624,6 +636,9 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
             raise ValueError
         for key in ("config_hash", "training_snapshot_hash", "official_signal_digest"):
             _sha256_value(body[key], key)
+        model_bundle = body.get("model_bundle_digest")
+        if model_bundle is not None:
+            _sha256_value(model_bundle, "model_bundle_digest")
         model_id = _frozen_text(body["model_id"], "model_id")
         model_version = _frozen_text(body["model_version"], "model_version")
         primary_metric = _frozen_text(body["primary_metric"], "primary_metric")
@@ -637,6 +652,11 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
             config_hash=_sha256_value(body["config_hash"], "config_hash"),
             training_snapshot_hash=_sha256_value(
                 body["training_snapshot_hash"], "training_snapshot_hash"
+            ),
+            model_bundle_digest=(
+                _sha256_value(model_bundle, "model_bundle_digest")
+                if model_bundle is not None
+                else None
             ),
             primary_metric=primary_metric,
             tie_break=tuple(_frozen_text(item, "tie_break") for item in tie_break),
@@ -699,9 +719,13 @@ def _derived_model_registration(
         }
     except (TypeError, ValueError) as exc:
         raise SystemExit("尚无已核验模型登记，不能开始未来竞赛") from exc
-    config_path = policy.authorize(repo_root / "config" / "research_maturity.yaml")
+    config_path = policy.authorize(repo_root / "config" / "strategy.yaml")
     policy.revalidate(config_path)
     registration["config_hash"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    bundle_digest = model_bundle_digest(repo_root)
+    if any(signal.model_bundle_digest != bundle_digest for signal in signals):
+        raise SystemExit("官方日选与当前模型包摘要不一致，不能开始未来竞赛")
+    registration["model_bundle_digest"] = bundle_digest
     snapshot_hash = _verified_research_manifest_digest(policy)
     if snapshot_hash is None:
         raise SystemExit("模型登记训练快照未通过D盘研究数据校验")

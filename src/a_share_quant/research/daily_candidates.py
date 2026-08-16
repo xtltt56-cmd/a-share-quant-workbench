@@ -7,6 +7,8 @@ cross-section before any row can be exposed as an official daily candidate.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -31,6 +33,26 @@ _DISALLOWED_SOURCES = frozenset({"fixture", "replay", "synthetic", "test", "test
 _REQUIRED_COLUMNS = frozenset(
     {"symbol", "date", "open", "high", "low", "close", "volume", "amount", "source"}
 )
+
+
+def model_bundle_digest(repo_root: str | Path | None = None) -> str:
+    """Hash the exact strategy and candidate implementation used for ranking."""
+
+    root = (
+        Path(repo_root).resolve()
+        if repo_root is not None
+        else Path(__file__).resolve().parents[3]
+    )
+    strategy_path = root / "config" / "strategy.yaml"
+    code_path = Path(__file__).resolve()
+    payload = {
+        "strategy_sha256": hashlib.sha256(strategy_path.read_bytes()).hexdigest(),
+        "candidate_code_sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
+        "model_version": DEFAULT_MODEL_VERSION,
+        "feature_version": DEFAULT_FEATURE_VERSION,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class DailyDataStaleError(ValueError):
@@ -134,6 +156,7 @@ def generate_official_signals(
     if generated_at.tzinfo is None or generated_at.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     names = {normalize_symbol(key): str(value).strip() for key, value in (name_map or {}).items()}
+    bundle_digest = model_bundle_digest()
     result: list[OfficialModelSignal] = []
     for rank, row in enumerate(candidates.itertuples(index=False), start=1):
         symbol = normalize_symbol(str(row.symbol))
@@ -159,6 +182,7 @@ def generate_official_signals(
                 reference_price=float(row.close),
                 average_amount=float(row.amount20),
                 invalidation_price=round(float(row.close) * 0.93, 4),
+                model_bundle_digest=bundle_digest,
             )
         )
     return tuple(result)
@@ -313,5 +337,6 @@ __all__ = [
     "generate_from_data_root",
     "generate_official_signals",
     "load_name_map",
+    "model_bundle_digest",
     "validate_daily_data_freshness",
 ]

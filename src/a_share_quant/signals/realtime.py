@@ -68,6 +68,7 @@ class OfficialModelSignal:
     reference_price: float | None = None
     average_amount: float | None = None
     invalidation_price: float | None = None
+    model_bundle_digest: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -118,6 +119,12 @@ class OfficialModelSignal:
             if not isfinite(number) or number <= 0:
                 raise ValueError(f"{numeric_field} must be positive and finite")
             object.__setattr__(self, numeric_field, number)
+        bundle = str(self.model_bundle_digest).strip().lower()
+        if bundle and (
+            len(bundle) != 64 or any(character not in "0123456789abcdef" for character in bundle)
+        ):
+            raise ValueError("model_bundle_digest must be a sha256 digest")
+        object.__setattr__(self, "model_bundle_digest", bundle)
 
 
 @dataclass(frozen=True)

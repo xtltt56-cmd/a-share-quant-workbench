@@ -474,3 +474,18 @@ def test_pre_migration_record_without_provenance_is_conservative() -> None:
     legacy.pop("maturity_explicit")
     restored = ProspectivePrediction.from_dict(legacy)
     assert restored.maturity_explicit is True
+
+
+def test_pre_migration_score_is_not_treated_as_calibrated_probability() -> None:
+    prediction = ProspectivePrediction(
+        model_id="m", model_version="v1", config_hash="c", training_snapshot_hash="t",
+        symbol="600001", name="示例", prediction_at=datetime(2026, 8, 19, 8, tzinfo=UTC),
+        as_of=date(2026, 8, 19), horizon=5, score=82.0, probability=0.82,
+        guidance_price_bands=_bands(),
+    )
+    legacy = prediction.to_dict()
+    legacy.pop("probability_calibrated")
+
+    restored = ProspectivePrediction.from_dict(legacy)
+
+    assert restored.probability_calibrated is False

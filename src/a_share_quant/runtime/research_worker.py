@@ -13,9 +13,10 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
 
@@ -258,7 +259,7 @@ def _verified_job_context(
 
 
 def _run_history(
-    _root: Path, policy: ProjectStoragePolicy, _context: dict[str, Any]
+    root: Path, policy: ProjectStoragePolicy, _context: dict[str, Any]
 ) -> dict[str, Any]:
     """Perform one bounded incremental historical collection batch."""
 
@@ -268,21 +269,84 @@ def _run_history(
 
     provider = BaoStockDataProvider()
     try:
-        coordinator = HistoricalBackfillCoordinator(ResearchDataStore(policy), provider)
-        end = datetime.now(timezone.utc).date()
-        # Never bootstrap an exchange-wide multi-year download from a workbench
-        # opening.  The coordinator itself has a bounded 100-symbol default.
-        result = coordinator.run(start=end - timedelta(days=14), end=end, limit=100)
+        coordinator = HistoricalBackfillCoordinator(
+            ResearchDataStore(policy), provider, max_request_days=366
+        )
+        start = _configured_history_start(root, policy)
+        end = _current_time().astimezone(ZoneInfo("Asia/Shanghai")).date()
+        # The coordinator itself limits each lifecycle batch to 100 symbols;
+        # coverage advances from the configured maturity start over repeated
+        # workbench sessions instead of silently using a two-week window.
+        result = coordinator.run(start=start, end=end, limit=100)
         failures = getattr(result, "failures", {})
         if failures:
             if int(getattr(result, "rows_written", 0)) > 0:
                 raise _Partial("HISTORY_PARTIAL")
             raise _Failed("HISTORY_ALL_FAILED")
-        return {"kind": "history", "result": result.to_dict()}
+        result_payload = result.to_dict()
+        if int(getattr(result, "rows_written", 0)) > 0 or int(
+            getattr(result, "symbols_updated", 0)
+        ) > 0:
+            coordinator_store = getattr(coordinator, "store", None)
+            manifest_digest = _verified_file_digest(
+                policy, getattr(coordinator_store, "manifest_path", None)
+            )
+            checkpoint_digest = _verified_file_digest(
+                policy, getattr(coordinator, "checkpoint_path", None)
+            )
+            if manifest_digest is None or checkpoint_digest is None:
+                raise _Failed("HISTORY_EVIDENCE_NOT_READY")
+            result_payload.update(
+                {
+                    "history_manifest_digest": manifest_digest,
+                    "history_checkpoint_digest": checkpoint_digest,
+                }
+            )
+        return {"kind": "history", "result": result_payload}
     finally:
         close = getattr(provider, "close", None)
         if callable(close):
             close()
+
+
+def _verified_file_digest(
+    policy: ProjectStoragePolicy, path: Any
+) -> str | None:
+    """Return a bounded digest for a durable project-owned evidence file."""
+
+    if not isinstance(path, (str, os.PathLike, Path)):
+        return None
+    try:
+        candidate = policy.authorize(Path(path))
+        policy.revalidate(candidate)
+        raw = candidate.read_bytes()
+        if not raw or len(raw) > _MAX_INTEGRITY_ARTIFACT_BYTES:
+            return None
+        policy.revalidate(candidate)
+        if candidate.stat().st_size != len(raw):
+            return None
+        return hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _configured_history_start(root: Path, policy: ProjectStoragePolicy) -> date:
+    """Read the fail-closed historical maturity start from the local config."""
+
+    import yaml
+
+    config_path = policy.authorize(root / "config" / "research_maturity.yaml")
+    try:
+        policy.revalidate(config_path)
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw_history = payload.get("history") if isinstance(payload, dict) else None
+        raw_start = raw_history.get("start_date") if isinstance(raw_history, dict) else None
+        start = date.fromisoformat(str(raw_start))
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise _Blocked("HISTORY_CONFIG_INVALID") from exc
+    if start > _current_time().astimezone(ZoneInfo("Asia/Shanghai")).date():
+        raise _Blocked("HISTORY_CONFIG_INVALID")
+    return start
 
 
 def _run_screen(
@@ -323,12 +387,31 @@ def _run_predict(
 
     contest = _contest_from_payload(context.get("contest"))
     signals = context.get("signals")
-    if not isinstance(signals, tuple) or not signals:
+    session_calendar = context.get("session_calendar")
+    session_calendar_digest = context.get("session_calendar_digest")
+    model_bundle_digest = context.get("model_bundle_digest")
+    if model_bundle_digest is None and contest.model_bundle_digest is not None:
+        model_bundle_digest = contest.model_bundle_digest
+    if (
+        not isinstance(signals, tuple)
+        or not signals
+        or not isinstance(session_calendar, tuple)
+        or not session_calendar
+        or not _is_sha256(session_calendar_digest)
+        or (
+            contest.model_bundle_digest is not None
+            and not _is_sha256(model_bundle_digest)
+        )
+    ):
         raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
     now = _current_time()
+    cycle_key = str(context.get("cycle_key") or _worker_instance_id("predict") or "").strip()
     try:
         competition = ProspectiveCompetition(
-            store=ProspectiveLedgerStore(policy=policy), contest=contest, now=now
+            store=ProspectiveLedgerStore(policy=policy),
+            contest=contest,
+            now=now,
+            session_calendar=session_calendar,
         )
         appended = tuple(
             competition.append_prediction(
@@ -339,15 +422,37 @@ def _run_predict(
                     training_snapshot_hash=contest.training_snapshot_hash,
                     symbol=signal.symbol,
                     name=signal.name,
-                    prediction_at=now,
+                    # The source generation time is immutable across a replay;
+                    # using the process clock here would make an otherwise
+                    # identical cycle conflict with its ledger id.
+                    prediction_at=signal.generated_at,
                     as_of=signal.data_cutoff,
                     horizon=5,
                     score=float(signal.normalized_score),
                     # The daily rule emits a rank score, not a calibrated
-                    # probability.  This deterministic scale conversion is
-                    # recorded as uncalibrated and never presented as a
-                    # probability estimate to a user.
-                    probability=float(signal.normalized_score) / 100.0,
+                    # probability.  Keep probability absent so Brier/ECE
+                    # cannot be mistaken for calibration evidence.
+                    probability=None,
+                    probability_calibrated=False,
+                    prediction_id=(
+                        _stable_prediction_id(
+                            contest,
+                            cycle_key,
+                            signal,
+                            str(context["daily_signal_digest"]),
+                            str(session_calendar_digest),
+                        )
+                        if cycle_key
+                        else ""
+                    ),
+                    source_input_digest=str(context["daily_signal_digest"]),
+                    session_calendar_digest=str(session_calendar_digest),
+                    cycle_key=cycle_key,
+                    model_bundle_digest=str(model_bundle_digest or ""),
+                    source_artifact_path=str(context.get("source_artifact_path") or ""),
+                    maturity_date=_calendar_maturity_date(
+                        session_calendar, signal.data_cutoff, horizon=5
+                    ),
                     guidance_price_bands={
                         "reference": (float(signal.reference_price), float(signal.reference_price)),
                         "invalidation": (
@@ -365,6 +470,8 @@ def _run_predict(
         "kind": "predict",
         "predictions": [item.to_dict() for item in appended],
         "input_integrity_digest": context.get("daily_signal_digest"),
+        "session_calendar_digest": session_calendar_digest,
+        "cycle_key": cycle_key or None,
         "probability_semantics": "NORMALIZED_SCORE_NOT_CALIBRATED",
     }
 
@@ -540,15 +647,16 @@ def _derive_predict_context(
 ) -> dict[str, Any] | None:
     """Use current verified daily model output; never accept a prediction file."""
 
-    signals, digest = _verified_official_signals(policy)
+    signals, digest, source_artifact_path = _verified_official_signals(policy)
     frozen = _contest_from_payload(contest)
     now = _current_time()
+    local_signal_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
     selected = tuple(
         signal
         for signal in signals
         if signal.strategy_version == frozen.model_id
         and signal.model_version == frozen.model_version
-        and signal.signal_date == now.date()
+        and signal.signal_date == local_signal_date
         and signal.data_cutoff == signal.signal_date
         and signal.generated_at <= now
         and signal.reference_price is not None
@@ -556,11 +664,103 @@ def _derive_predict_context(
     )
     if not selected:
         raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
+    frozen_signal_digest = str(contest.get("official_signal_digest", ""))
+    if digest != frozen_signal_digest:
+        raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
+    if frozen.model_bundle_digest is not None and any(
+        signal.model_bundle_digest != frozen.model_bundle_digest for signal in selected
+    ):
+        raise _Blocked("MODEL_BUNDLE_MISMATCH")
+    session_calendar, session_calendar_digest = _verified_session_calendar(
+        policy, selected[0].data_cutoff
+    )
     return {
         "contest": contest,
         "signals": selected,
         "daily_signal_digest": digest,
+        "source_artifact_path": source_artifact_path,
+        "session_calendar": session_calendar,
+        "session_calendar_digest": session_calendar_digest,
+        "model_bundle_digest": frozen.model_bundle_digest,
     }
+
+
+def _verified_session_calendar(
+    policy: ProjectStoragePolicy, as_of: date, *, horizon: int = 20
+) -> tuple[tuple[date, ...], str]:
+    """Build and archive a bounded, holiday-aware A-share session calendar."""
+
+    from a_share_quant.market.trading_calendar import AShareTradingCalendar
+
+    if horizon < 5 or horizon > 256:
+        raise ValueError("calendar horizon is outside the bounded range")
+    try:
+        calendar = AShareTradingCalendar()
+        sessions: list[date] = []
+        current = as_of
+        for _ in range(horizon):
+            current = calendar.next_session(current)
+            sessions.append(current)
+    except (TypeError, ValueError) as exc:
+        raise _Blocked("TRADING_CALENDAR_NOT_READY") from exc
+    body = {
+        "format_version": 1,
+        "source": "A_SHARE_EXCHANGE_CALENDAR_2026_V1",
+        "as_of": as_of.isoformat(),
+        "sessions": [item.isoformat() for item in sessions],
+    }
+    encoded = _canonical_json(body)
+    digest = hashlib.sha256(encoded).hexdigest()
+    destination = policy.authorize(f".runtime/research/calendars/{digest}.json")
+    try:
+        if destination.exists():
+            policy.revalidate(destination)
+            if destination.read_bytes() != encoded:
+                raise ValueError("session calendar artifact changed")
+        else:
+            _atomic_write(policy, destination, encoded)
+            policy.revalidate(destination)
+    except (OSError, ValueError) as exc:
+        raise _Blocked("TRADING_CALENDAR_NOT_READY") from exc
+    return tuple(sessions), digest
+
+
+def _calendar_maturity_date(
+    session_calendar: tuple[date, ...], as_of: date, *, horizon: int
+) -> date:
+    future = sorted({item for item in session_calendar if isinstance(item, date) and item > as_of})
+    if len(future) < horizon:
+        raise ValueError("session calendar is insufficient for horizon")
+    return future[horizon - 1]
+
+
+def _stable_prediction_id(
+    contest: Any,
+    cycle_key: str,
+    signal: Any,
+    source_input_digest: str,
+    session_calendar_digest: str,
+) -> str:
+    """Derive an idempotent identity independent of process timestamps."""
+
+    payload = {
+        "cycle_key": cycle_key,
+        "model_id": contest.model_id,
+        "model_version": contest.model_version,
+        "config_hash": contest.config_hash,
+        "training_snapshot_hash": contest.training_snapshot_hash,
+        "symbol": signal.symbol,
+        "signal_date": signal.signal_date,
+        "data_cutoff": signal.data_cutoff,
+        "horizon": 5,
+        "score": signal.normalized_score,
+        "reference_price": signal.reference_price,
+        "invalidation_price": signal.invalidation_price,
+        "source_input_digest": source_input_digest,
+        "session_calendar_digest": session_calendar_digest,
+        "model_bundle_digest": getattr(contest, "model_bundle_digest", None),
+    }
+    return f"prediction-{hashlib.sha256(_canonical_json(payload)).hexdigest()[:32]}"
 
 
 def _derive_settle_context(
@@ -657,7 +857,9 @@ def _derived_outcome(policy: ProjectStoragePolicy, prediction: Any, now: datetim
         raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
 
 
-def _verified_official_signals(policy: ProjectStoragePolicy) -> tuple[tuple[Any, ...], str]:
+def _verified_official_signals(
+    policy: ProjectStoragePolicy,
+) -> tuple[tuple[Any, ...], str, str]:
     """Load a fixed, integrity-checked daily artifact without creating it."""
 
     from a_share_quant.storage.official_signal_store import OfficialSignalStore
@@ -673,7 +875,16 @@ def _verified_official_signals(policy: ProjectStoragePolicy) -> tuple[tuple[Any,
         policy.revalidate(path)
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest or not signals:
             raise ValueError
-        return signals, digest
+        archive_relpath = f".runtime/research/signal-archive/{digest}.json"
+        archive = policy.authorize(archive_relpath)
+        if archive.exists():
+            policy.revalidate(archive)
+            if archive.read_bytes() != raw:
+                raise ValueError
+        else:
+            _atomic_write(policy, archive, raw)
+            policy.revalidate(archive)
+        return signals, digest, archive_relpath
     except (OSError, TypeError, ValueError):
         raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY") from None
 
@@ -752,7 +963,8 @@ def _contest_from_payload(payload: Any):
             "promotion",
         }
     )
-    if set(payload) != required:
+    optional = frozenset({"model_bundle_digest"})
+    if not required.issubset(payload) or not set(payload).issubset(required | optional):
         raise ValueError("frozen contest fields are invalid")
     required_values = (
         "model_id",
@@ -784,6 +996,9 @@ def _contest_from_payload(payload: Any):
     started = datetime.fromisoformat(str(payload["contest_started_at"]))
     now = max(datetime.now(timezone.utc), started.astimezone(timezone.utc))
     contest = ProspectiveContest(now=now)
+    bundle_digest = payload.get("model_bundle_digest")
+    if bundle_digest is not None:
+        bundle_digest = _sha256_text(bundle_digest, "model_bundle_digest")
     contest.start(
         model_id=str(payload["model_id"]),
         model_version=str(payload["model_version"]),
@@ -791,6 +1006,7 @@ def _contest_from_payload(payload: Any):
         training_snapshot_hash=_sha256_text(
             payload["training_snapshot_hash"], "training_snapshot_hash"
         ),
+        model_bundle_digest=bundle_digest,
         primary_metric=str(payload["primary_metric"]),
         tie_break=tuple(str(item) for item in payload["tie_break"]),
         started_at=started,
@@ -803,6 +1019,12 @@ def _sha256_text(value: Any, name: str) -> str:
     if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
         raise ValueError(f"{name} must be sha256")
     return text
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value.lower()
+    )
 
 
 def _artifact_digest(value: Any) -> str:

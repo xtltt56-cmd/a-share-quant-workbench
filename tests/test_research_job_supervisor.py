@@ -322,14 +322,48 @@ def test_task8_successful_child_is_not_relaunched_and_result_is_checkpointed(
     launcher.children[0].running = False
 
     assert supervisor.start_due_jobs(now=now + timedelta(minutes=1)) == ()
+    assert supervisor.checkpoint_path.exists()
     assert len(launcher.children) == 1
     assert supervisor.shutdown().checkpoint_saved is True
     checkpoint = json.loads((d_research_root / "research-checkpoint.json").read_text())
     assert checkpoint["jobs"][0]["completed"] is True
     assert checkpoint["jobs"][0]["process_exit_code"] == 0
+    evidence = {
+        "format_version": 1,
+        "job": "screen",
+        "job_id": "screen",
+        "result": {"legacy": "persisted"},
+    }
     assert checkpoint["jobs"][0]["artifact_digest"] == hashlib.sha256(
-        json.dumps({"legacy": "persisted"}, sort_keys=True).encode("utf-8")
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def test_task8_restore_rejects_tampered_completed_evidence(
+    d_research_root: Path,
+) -> None:
+    """A completed checkpoint cannot silently survive evidence tampering."""
+
+    launcher = FakeLauncher()
+    policy = ProjectStoragePolicy(d_research_root)
+    supervisor = ResearchJobSupervisor(
+        d_research_root, launcher=launcher, storage_policy=policy
+    )
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    supervisor.register_job("screen", ("research", "screen"), due_at=now)
+    assert supervisor.start_due_jobs(now=now) == ("screen",)
+    _write_instance_success(supervisor, "screen", {"stable": "evidence"})
+    launcher.children[0].running = False
+    assert supervisor.start_due_jobs(now=now + timedelta(minutes=1)) == ()
+    evidence = d_research_root / "evidence" / "screen.json"
+    evidence.write_text('{"stable":"tampered"}', encoding="utf-8")
+
+    restored = ResearchJobSupervisor(
+        d_research_root, launcher=FakeLauncher(), storage_policy=policy
+    )
+
+    assert restored._jobs["screen"].completed is False
+    assert restored._jobs["screen"].failure_reason == "EVIDENCE_INTEGRITY_FAILURE"
 
 
 def _write_instance_success(
@@ -339,7 +373,16 @@ def _write_instance_success(
 
     artifact = supervisor.root / "evidence" / f"{job_id}.json"
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(body, sort_keys=True).encode("utf-8")
+    encoded = json.dumps(
+        {
+            "format_version": 1,
+            "job": job_id.split("-", maxsplit=1)[0],
+            "job_id": job_id,
+            "result": body,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     artifact.write_bytes(encoded)
     status = {
         "format_version": 3,

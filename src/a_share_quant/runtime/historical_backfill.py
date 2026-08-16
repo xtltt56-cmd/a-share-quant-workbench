@@ -9,7 +9,7 @@ import shutil
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -107,9 +107,12 @@ class HistoricalBackfillCoordinator:
         delay_seconds: float = 0.25,
         disk_usage: Callable[[str | os.PathLike[str]], Any] | None = None,
         directory_fsync: Callable[[Path], None] | None = None,
+        max_request_days: int | None = None,
     ) -> None:
-        if retry_count < 0 or delay_seconds < 0:
-            raise ValueError("retry_count and delay_seconds must be non-negative")
+        if retry_count < 0 or delay_seconds < 0 or (
+            max_request_days is not None and int(max_request_days) < 1
+        ):
+            raise ValueError("retry, delay and request bounds must be non-negative")
         self.store = store
         self.provider = provider
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -118,6 +121,9 @@ class HistoricalBackfillCoordinator:
         self.delay_seconds = float(delay_seconds)
         self._disk_usage = disk_usage or getattr(store, "_disk_usage", shutil.disk_usage)
         self._directory_fsync = directory_fsync or _fsync_directory
+        self.max_request_days = (
+            int(max_request_days) if max_request_days is not None else None
+        )
         self.data_root = store.root_directory
         self.checkpoint_path = store.policy.authorize(
             ".runtime/research/historical-backfill-checkpoint.json"
@@ -149,9 +155,26 @@ class HistoricalBackfillCoordinator:
         instruments = self._validate_instruments(instruments)
         self._persist_instrument_history(instruments, end_day)
 
+        previous_target = checkpoint.get("target")
+        previous_start = (
+            _optional_checkpoint_date(previous_target.get("start_date"))
+            if isinstance(previous_target, Mapping)
+            else None
+        )
+        previous_end = (
+            _optional_checkpoint_date(previous_target.get("end_date"))
+            if isinstance(previous_target, Mapping)
+            else None
+        )
         checkpoint["target"] = {
-            "start_date": start_day.isoformat(),
-            "end_date": end_day.isoformat(),
+            "start_date": min(
+                (item for item in (previous_start, start_day) if item is not None),
+                default=start_day,
+            ).isoformat(),
+            "end_date": max(
+                (item for item in (previous_end, end_day) if item is not None),
+                default=end_day,
+            ).isoformat(),
         }
         checkpoint.setdefault("symbols", {})
         checkpoint.setdefault("failures", {})
@@ -167,21 +190,27 @@ class HistoricalBackfillCoordinator:
                 checkpoint, symbol, record, start_day, end_day
             )
             missing = self._missing_ranges(record, start_day, end_day)
+            if self.max_request_days is not None:
+                # One bounded edge per symbol per lifecycle keeps network and
+                # temporary Parquet growth predictable; the next cycle resumes
+                # from the checkpointed edge.
+                missing = self._bound_missing_ranges(missing)[:1]
             if not missing:
                 continue
             if attempted >= int(limit):
                 break
             attempted += 1
             try:
-                pieces = [
-                    self._request(
+                pieces = []
+                for missing_start, missing_end in missing:
+                    piece = self._request(
                         self.provider.get_research_history,
                         symbol,
                         missing_start,
                         missing_end,
                     )
-                    for missing_start, missing_end in missing
-                ]
+                    self._validate_history(piece, symbol, missing_start, missing_end)
+                    pieces.append(piece)
             except ProviderRequestError as exc:
                 reason = (
                     "TRANSIENT_PROVIDER_FAILURE"
@@ -201,7 +230,8 @@ class HistoricalBackfillCoordinator:
                 continue
             try:
                 frame = self._merge_with_previous(symbol, record, pieces)
-                self._validate_history(frame, symbol, start_day, end_day)
+                frame_start, frame_end = _frame_bounds(frame)
+                self._validate_history(frame, symbol, frame_start, frame_end)
             except ProviderRequestError:
                 failures[symbol] = "PERMANENT_PROVIDER_FAILURE"
                 checkpoint["failures"][symbol] = "PERMANENT_PROVIDER_FAILURE"
@@ -214,10 +244,10 @@ class HistoricalBackfillCoordinator:
                 ResearchDataset.RESEARCH_RETURNS,
                 symbol,
                 frame,
-                _artifact_version(frame, start_day, end_day),
+                _artifact_version(frame, frame_start, frame_end),
             )
             checkpoint["symbols"][symbol] = self._symbol_record(
-                frame, artifact, start_day, end_day
+                frame, artifact, frame_start, frame_end
             )
             checkpoint["failures"].pop(symbol, None)
             self._write_checkpoint(checkpoint)
@@ -368,12 +398,13 @@ class HistoricalBackfillCoordinator:
             raise CheckpointIntegrityError(f"历史回填活跃产物校验失败: {symbol}")
         frame = pd.read_parquet(active.path)
         try:
-            self._validate_history(frame, symbol, start, end)
+            frame_start, frame_end = _frame_bounds(frame)
+            self._validate_history(frame, symbol, frame_start, frame_end)
         except ProviderRequestError as exc:
             raise CheckpointIntegrityError(
                 f"历史回填活跃产物不符合目标: {symbol}"
             ) from exc
-        expected_version = _artifact_version(frame, start, end)
+        expected_version = _artifact_version(frame, frame_start, frame_end)
         if active.data_version != expected_version:
             raise CheckpointIntegrityError(
                 f"历史回填活跃产物目标或版本不匹配: {symbol}"
@@ -439,7 +470,6 @@ class HistoricalBackfillCoordinator:
         dates = pd.to_datetime(frame["date"], errors="raise").dt.date
         if dates.min() < start or dates.max() > end or dates.duplicated().any():
             raise ProviderRequestError("research history date range is invalid")
-
     @staticmethod
     def _symbol_record(frame, artifact, start: date, end: date) -> dict[str, Any]:
         dates = pd.to_datetime(frame["date"], errors="raise").dt.date
@@ -458,8 +488,8 @@ class HistoricalBackfillCoordinator:
             }
         )
         return {
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
+            "start_date": dates.min().isoformat(),
+            "end_date": dates.max().isoformat(),
             "rows": len(frame),
             "sessions": int(dates.nunique()),
             "earliest_date": dates.min().isoformat(),
@@ -487,6 +517,23 @@ class HistoricalBackfillCoordinator:
         if end > previous_end:
             missing.append((previous_end.fromordinal(previous_end.toordinal() + 1), end))
         return missing
+
+    def _bound_missing_ranges(
+        self, ranges: list[tuple[date, date]]
+    ) -> list[tuple[date, date]]:
+        """Split provider requests so one lifecycle never downloads years at once."""
+
+        if self.max_request_days is None:
+            return ranges
+        bounded: list[tuple[date, date]] = []
+        span = timedelta(days=self.max_request_days - 1)
+        for start, end in ranges:
+            cursor = start
+            while cursor <= end:
+                chunk_end = min(end, cursor + span)
+                bounded.append((cursor, chunk_end))
+                cursor = chunk_end + timedelta(days=1)
+        return bounded
 
     def _load_checkpoint(self) -> dict[str, Any]:
         self.store.policy.revalidate(self.checkpoint_path)
@@ -544,6 +591,15 @@ class HistoricalBackfillCoordinator:
         finally:
             self.store.policy.revalidate(temporary)
             temporary.unlink(missing_ok=True)
+
+
+def _frame_bounds(frame: pd.DataFrame) -> tuple[date, date]:
+    """Return the actual verified bounds, not the caller's requested window."""
+
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "date" not in frame:
+        raise ProviderRequestError("research history has no date bounds")
+    dates = pd.to_datetime(frame["date"], errors="raise").dt.date
+    return dates.min(), dates.max()
 
 
 _TRANSPORT_FAILURES = (TimeoutError, ConnectionError, OSError)

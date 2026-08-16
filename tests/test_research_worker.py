@@ -12,7 +12,9 @@ import pandas as pd
 import pytest
 
 from a_share_quant.research.prospective_competition import (
+    OutcomeObservation,
     ProspectiveCompetition,
+    ProspectiveContest,
     ProspectivePrediction,
 )
 from a_share_quant.runtime import research_worker
@@ -185,6 +187,9 @@ def test_task8_history_partial_batch_is_not_reported_as_success(
 
     job_id = "history-0123456789abcdefabcd"
     policy = ProjectStoragePolicy(d_worker_root)
+    config_path = d_worker_root / "config" / "research_maturity.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("history:\n  start_date: '2019-01-01'\n", encoding="utf-8")
     monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_WORKBENCH", "1")
     monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_JOB_ID", job_id)
     monkeypatch.setattr(research_worker, "_verified_job_context", lambda *_args: {})
@@ -237,6 +242,9 @@ def test_task8_history_all_failed_batch_is_reported_as_failed(
 
     job_id = "history-abcdef0123456789abcd"
     policy = ProjectStoragePolicy(d_worker_root)
+    config_path = d_worker_root / "config" / "research_maturity.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("history:\n  start_date: '2019-01-01'\n", encoding="utf-8")
     monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_WORKBENCH", "1")
     monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_JOB_ID", job_id)
     monkeypatch.setattr(research_worker, "_verified_job_context", lambda *_args: {})
@@ -258,12 +266,126 @@ def test_task8_history_all_failed_batch_is_reported_as_failed(
     assert payload["reason_code"] == "HISTORY_ALL_FAILED"
 
 
+def test_task8_history_worker_uses_configured_start_and_bounded_batch(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """History lifecycle must advance from the configured maturity start date."""
+
+    config_path = d_worker_root / "config" / "research_maturity.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "history:\n  start_date: '2019-01-01'\n", encoding="utf-8"
+    )
+    calls: list[dict[str, object]] = []
+
+    class Provider:
+        def close(self):
+            return None
+
+    class Result:
+        failures: dict[str, str] = {}
+        rows_written = 0
+
+        @staticmethod
+        def to_dict():
+            return {"failures": {}, "rows_written": 0}
+
+    class Coordinator:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return Result()
+
+    policy = ProjectStoragePolicy(d_worker_root)
+    monkeypatch.setattr(research_worker, "_current_time", lambda: datetime(
+        2026, 8, 14, 8, tzinfo=timezone.utc
+    ))
+    monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_WORKBENCH", "1")
+    monkeypatch.setattr(
+        "a_share_quant.data.providers.baostock.BaoStockDataProvider", Provider
+    )
+    monkeypatch.setattr(
+        "a_share_quant.runtime.historical_backfill.HistoricalBackfillCoordinator",
+        Coordinator,
+    )
+
+    result = research_worker._run_history(d_worker_root, policy, {})
+
+    assert result["kind"] == "history"
+    assert calls == [
+        {
+            "start": date(2019, 1, 1),
+            "end": date(2026, 8, 14),
+            "limit": 100,
+        }
+    ]
+
+
+def test_task8_history_success_binds_manifest_and_checkpoint_digests(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """History success must carry durable manifest/checkpoint evidence."""
+
+    config_path = d_worker_root / "config" / "research_maturity.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("history:\n  start_date: '2019-01-01'\n", encoding="utf-8")
+
+    class Provider:
+        def close(self):
+            return None
+
+    class Result:
+        failures: dict[str, str] = {}
+        rows_written = 1
+
+        @staticmethod
+        def to_dict():
+            return {"failures": {}, "rows_written": 1}
+
+    class Coordinator:
+        def __init__(self, store, *_args, **_kwargs):
+            self.store = store
+            self.checkpoint_path = store.policy.authorize(
+                ".runtime/research/historical-backfill-checkpoint.json"
+            )
+
+        def run(self, **_kwargs):
+            self.store.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            self.store.manifest_path.write_bytes(b"manifest-evidence")
+            self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_path.write_bytes(b"checkpoint-evidence")
+            return Result()
+
+    policy = ProjectStoragePolicy(d_worker_root)
+    monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_WORKBENCH", "1")
+    monkeypatch.setattr(
+        "a_share_quant.data.providers.baostock.BaoStockDataProvider", Provider
+    )
+    monkeypatch.setattr(
+        "a_share_quant.runtime.historical_backfill.HistoricalBackfillCoordinator",
+        Coordinator,
+    )
+
+    result = research_worker._run_history(d_worker_root, policy, {})
+
+    assert result["result"]["history_manifest_digest"] == hashlib.sha256(
+        b"manifest-evidence"
+    ).hexdigest()
+    assert result["result"]["history_checkpoint_digest"] == hashlib.sha256(
+        b"checkpoint-evidence"
+    ).hexdigest()
+
+
 def test_task8_predict_derives_future_record_from_frozen_contest_and_daily_signal(
     d_worker_root: Path, monkeypatch
 ) -> None:
     """No pre-written prediction request can substitute for a verified signal."""
 
-    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    # UTC afternoon is already the next local calendar boundary for some
+    # callers; selection must use Asia/Shanghai rather than ``now.date()``.
+    now = datetime(2026, 8, 14, 15, tzinfo=timezone.utc)
     policy = ProjectStoragePolicy(d_worker_root)
     signal_path = d_worker_root / ".runtime" / "signals" / "official-daily.json"
     OfficialSignalStore(signal_path).put_signals(
@@ -322,6 +444,254 @@ def test_task8_predict_derives_future_record_from_frozen_contest_and_daily_signa
     assert len(predictions) == 1
     assert predictions[0].model_id == "official-rule-v1"
     assert predictions[0].as_of == date(2026, 8, 14)
+    archive = d_worker_root / predictions[0].source_artifact_path
+    assert archive.exists()
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == signal_digest
+    contest["official_signal_digest"] = "a" * 64
+    contest.pop("sha256", None)
+    with pytest.raises(research_worker._Blocked, match="OFFICIAL_SIGNAL_DIGEST_MISMATCH"):
+        research_worker._derive_predict_context(policy, contest)
+
+
+def test_task8_predict_uses_verified_exchange_calendar_for_maturity(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """A-share maturity must count verified sessions, not weekdays."""
+
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    calendar = (
+        date(2026, 8, 17),
+        date(2026, 8, 18),
+        date(2026, 8, 20),
+        date(2026, 8, 21),
+        date(2026, 8, 24),
+    )
+    signal = OfficialModelSignal(
+        signal_date=date(2026, 8, 14),
+        symbol="600001",
+        name="测试股票",
+        normalized_score=82.0,
+        strategy_version="official-rule-v1",
+        model_version="daily-rule-v1",
+        feature_version="daily-features-v1",
+        data_mode="historical",
+        source="verified-free-source",
+        data_cutoff=date(2026, 8, 14),
+        generated_at=now - timedelta(minutes=1),
+        rank=1,
+        reference_price=10.0,
+        invalidation_price=9.0,
+    )
+    contest = {
+        "format_version": 3,
+        "contest_started_at": (now - timedelta(minutes=2)).isoformat(),
+        "model_id": "official-rule-v1",
+        "model_version": "daily-rule-v1",
+        "config_hash": "c" * 64,
+        "training_snapshot_hash": "d" * 64,
+        "official_signal_digest": "e" * 64,
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+        "evidence_mode": "PROSPECTIVE_ONLY",
+        "status": "PROSPECTIVE_COLLECTING",
+        "promotion": "NEVER",
+    }
+    captured: dict[str, object] = {}
+
+    class FakeCompetition:
+        def __init__(self, *, session_calendar=None, **_kwargs):
+            captured["calendar"] = session_calendar
+
+        def append_prediction(self, prediction):
+            captured["prediction"] = prediction
+            return prediction
+
+    monkeypatch.setattr(
+        "a_share_quant.research.prospective_competition.ProspectiveCompetition",
+        FakeCompetition,
+    )
+    policy = ProjectStoragePolicy(d_worker_root)
+
+    result = research_worker._run_predict(
+        d_worker_root,
+        policy,
+        {
+            "contest": contest,
+            "signals": (signal,),
+            "daily_signal_digest": "f" * 64,
+            "session_calendar": calendar,
+            "session_calendar_digest": "a" * 64,
+        },
+    )
+
+    assert result["kind"] == "predict"
+    assert captured["calendar"] == calendar
+    assert captured["prediction"].maturity_date == date(2026, 8, 24)
+
+
+def test_task8_predict_replay_is_idempotent_for_one_cycle(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """A crash/replay cannot append a second prediction for one cycle."""
+
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    signal = OfficialModelSignal(
+        signal_date=date(2026, 8, 14),
+        symbol="600001",
+        name="测试股票",
+        normalized_score=82.0,
+        strategy_version="official-rule-v1",
+        model_version="daily-rule-v1",
+        feature_version="daily-features-v1",
+        data_mode="historical",
+        source="verified-free-source",
+        data_cutoff=date(2026, 8, 14),
+        generated_at=now - timedelta(minutes=1),
+        rank=1,
+        reference_price=10.0,
+        invalidation_price=9.0,
+    )
+    contest = {
+        "format_version": 3,
+        "contest_started_at": (now - timedelta(minutes=2)).isoformat(),
+        "model_id": "official-rule-v1",
+        "model_version": "daily-rule-v1",
+        "config_hash": "c" * 64,
+        "training_snapshot_hash": "d" * 64,
+        "official_signal_digest": "e" * 64,
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+        "evidence_mode": "PROSPECTIVE_ONLY",
+        "status": "PROSPECTIVE_COLLECTING",
+        "promotion": "NEVER",
+    }
+    calendar = tuple(
+        date(2026, 8, day) for day in (17, 18, 20, 21, 24, 25, 26, 27, 28, 31)
+    )
+    context = {
+        "contest": contest,
+        "signals": (signal,),
+        "daily_signal_digest": "f" * 64,
+        "source_artifact_path": ".runtime/research/signal-archive/" + "f" * 64 + ".json",
+        "session_calendar": calendar,
+        "session_calendar_digest": "a" * 64,
+    }
+    policy = ProjectStoragePolicy(d_worker_root)
+    monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_JOB_ID", "predict-cycle-0123456789abcdefabcd")
+    monkeypatch.setattr(research_worker, "_current_time", lambda: now)
+    first = research_worker._run_predict(d_worker_root, policy, context)
+    monkeypatch.setattr(research_worker, "_current_time", lambda: now + timedelta(minutes=1))
+    second = research_worker._run_predict(d_worker_root, policy, context)
+
+    predictions = ProspectiveLedgerStore(policy=policy).predictions()
+    assert len(predictions) == 1
+    assert first["predictions"][0]["prediction_id"] == second["predictions"][0]["prediction_id"]
+    assert predictions[0].source_input_digest == "f" * 64
+    assert predictions[0].source_artifact_path.endswith("/" + "f" * 64 + ".json")
+
+
+def test_task8_uncalibrated_rank_score_is_excluded_from_calibration_metrics(
+    d_worker_root: Path,
+) -> None:
+    """A ranking score must not be reported as calibrated probability quality."""
+
+    policy = ProjectStoragePolicy(d_worker_root)
+    ledger = ProspectiveLedgerStore(policy=policy)
+    competition = ProspectiveCompetition(
+        store=ledger, now=datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    )
+    prediction = competition.append_prediction(
+        ProspectivePrediction(
+            model_id="rule-ranking",
+            model_version="v1",
+            config_hash="c" * 64,
+            training_snapshot_hash="d" * 64,
+            symbol="600001",
+            name="测试股票",
+            prediction_at=datetime(2026, 8, 14, 8, tzinfo=timezone.utc),
+            as_of=date(2026, 8, 14),
+            horizon=5,
+            score=82.0,
+            probability=None,
+            probability_calibrated=False,
+            guidance_price_bands={"reference": (10.0, 10.0)},
+        )
+    )
+    competition.now = datetime(2026, 8, 30, 8, tzinfo=timezone.utc)
+    competition.settle_due(
+        OutcomeObservation(
+            prediction_id=prediction.id,
+            symbol=prediction.symbol,
+            maturity_date=prediction.maturity_date,
+            outcome_at=datetime(2026, 8, 30, 8, tzinfo=timezone.utc),
+            realized_price=11.0,
+            realized_return=0.1,
+            data_version="returns-v1",
+            data_sha256="e" * 64,
+            status="OK",
+            fresh=True,
+            complete=True,
+            session_aligned=True,
+            corporate_action_ok=True,
+        )
+    )
+
+    metrics = competition.compute_metrics()
+
+    assert metrics.brier is None
+    assert metrics.ece is None
+    assert metrics.net_cost_return is not None
+
+
+def test_task8_frozen_model_bundle_digest_rejects_changed_candidate(
+    d_worker_root: Path,
+) -> None:
+    policy = ProjectStoragePolicy(d_worker_root)
+    contest = ProspectiveContest(now=datetime(2026, 8, 14, 8, tzinfo=timezone.utc))
+    contest.start(
+        model_id="rule-ranking",
+        model_version="v1",
+        config_hash="c" * 64,
+        training_snapshot_hash="d" * 64,
+        model_bundle_digest="a" * 64,
+        started_at=datetime(2026, 8, 14, 7, tzinfo=timezone.utc),
+    )
+    competition = ProspectiveCompetition(
+        store=ProspectiveLedgerStore(policy=policy),
+        contest=contest,
+        now=datetime(2026, 8, 14, 8, tzinfo=timezone.utc),
+        session_calendar=tuple(
+            date(2026, 8, day) for day in (17, 18, 19, 20, 21, 24)
+        ),
+    )
+    with pytest.raises(ValueError, match="frozen contest"):
+        competition.append_prediction(
+            ProspectivePrediction(
+                model_id="rule-ranking",
+                model_version="v1",
+                config_hash="c" * 64,
+                training_snapshot_hash="d" * 64,
+                symbol="600001",
+                name="测试股票",
+                prediction_at=datetime(2026, 8, 14, 8, tzinfo=timezone.utc),
+                as_of=date(2026, 8, 14),
+                horizon=5,
+                score=82.0,
+                probability=None,
+                probability_calibrated=False,
+                model_bundle_digest="b" * 64,
+                maturity_date=date(2026, 8, 21),
+                guidance_price_bands={"reference": (10.0, 10.0)},
+            )
+        )
 
 
 def test_task8_worker_rejects_contest_fields_outside_frozen_contract() -> None:

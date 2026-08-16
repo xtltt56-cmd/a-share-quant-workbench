@@ -408,6 +408,7 @@ class ResearchJobSupervisor:
         )
 
     def _collect_finished_children(self) -> None:
+        changed = False
         for job_id, child in tuple(self._children.items()):
             if self._child_running(child):
                 continue
@@ -435,11 +436,16 @@ class ResearchJobSupervisor:
                 failure_reason=None if success else reason,
             )
             self._terminal_job_ids.add(job_id)
+            changed = True
             # Terminal children have already exited.  Releasing the process
             # wrapper makes bounded lifecycle retention effective while the
             # immutable job record remains in the checkpoint.
             self._children.pop(job_id, None)
         self._prune_terminal_history()
+        if changed:
+            # A completed child may already have appended durable evidence;
+            # checkpoint immediately so a later crash cannot replay the cycle.
+            self._write_checkpoint()
 
     def _read_child_status(self, job: ResearchJob) -> dict[str, Any]:
         path = self.status_path_for(job.job_id)
@@ -470,7 +476,18 @@ class ResearchJobSupervisor:
         try:
             artifact = self._revalidate(self.root / expected_relpath)
             raw = artifact.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("format_version") != 1
+                or payload.get("job_id") != job.job_id
+                or payload.get("job") != job.command[1]
+                or not isinstance(payload.get("result"), dict)
+            ):
+                return False
         except (OSError, ValueError):
+            return False
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
             return False
         actual = hashlib.sha256(raw).hexdigest()
         return actual == digest.removeprefix("sha256:")
@@ -598,6 +615,20 @@ class ResearchJobSupervisor:
                 )
             except (TypeError, ValueError):
                 return
+            if job.completed:
+                status = self._read_child_status(job)
+                digest = _safe_status_digest(status.get("artifact_digest"))
+                if (
+                    digest is None
+                    or digest != job.artifact_digest
+                    or not self._status_has_verified_artifact(job, status, digest)
+                ):
+                    job = replace(
+                        job,
+                        completed=False,
+                        failure_reason="EVIDENCE_INTEGRITY_FAILURE",
+                    )
+                    self._terminal_job_ids.add(job_id)
             restored[job_id] = job
             if job.completed or job.process_exit_code is not None:
                 self._terminal_job_ids.add(job_id)

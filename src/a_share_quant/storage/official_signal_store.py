@@ -41,6 +41,7 @@ class OfficialSignalStore:
             "reference_price",
             "average_amount",
             "invalidation_price",
+            "model_bundle_digest",
         }
     )
 
@@ -203,7 +204,12 @@ class OfficialSignalStore:
 
     @classmethod
     def _decode_signal(cls, payload: Any) -> OfficialModelSignal:
-        if not isinstance(payload, dict) or set(payload) != cls._SIGNAL_FIELDS:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid official signal row")
+        payload = dict(payload)
+        if set(payload) == cls._SIGNAL_FIELDS - {"model_bundle_digest"}:
+            payload["model_bundle_digest"] = ""
+        if set(payload) != cls._SIGNAL_FIELDS:
             raise ValueError("invalid official signal row")
         reasons = payload["reasons"]
         if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
@@ -227,6 +233,7 @@ class OfficialSignalStore:
             reference_price=payload["reference_price"],
             average_amount=payload["average_amount"],
             invalidation_price=payload["invalidation_price"],
+            model_bundle_digest=payload["model_bundle_digest"],
         )
 
     @staticmethod
@@ -249,6 +256,7 @@ class OfficialSignalStore:
             "reference_price": signal.reference_price,
             "average_amount": signal.average_amount,
             "invalidation_price": signal.invalidation_price,
+            "model_bundle_digest": signal.model_bundle_digest,
         }
 
 
