@@ -28,6 +28,7 @@ data/**/*.db
 data/**/*.json
 data/**/*.jsonl
 data/**/*.tmp
+data/research/research.lock
 data/qlib_provider/
 models/
 /experiments/
