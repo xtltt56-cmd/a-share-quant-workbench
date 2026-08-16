@@ -266,8 +266,18 @@ class HistoricalBackfillCoordinator:
             raise CheckpointIntegrityError("历史回填检查点 symbols 无效")
 
         symbols = tuple(sorted(str(symbol) for symbol in records))
+        active_artifacts = self.store.active_artifacts(ResearchDataset.RESEARCH_RETURNS)
         for symbol, record in records.items():
-            self._verified_artifact(str(symbol), record)
+            artifact = active_artifacts.get(str(symbol))
+            if (
+                artifact is None
+                or artifact.sha256 != record.get("artifact_sha256")
+                or artifact.data_version != record.get("artifact_data_version")
+                or artifact.size_bytes != record.get("size_bytes")
+            ):
+                raise CheckpointIntegrityError(
+                    f"历史回填检查点引用的产物校验失败: {symbol}"
+                )
         row_count = sum(_nonnegative_int(record, "rows") for record in records.values())
         session_count = max(
             (_nonnegative_int(record, "sessions") for record in records.values()),

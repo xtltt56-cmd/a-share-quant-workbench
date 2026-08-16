@@ -250,6 +250,26 @@ class ResearchDataStore:
                 raise KeyError(f"no active research artifact for {dataset_value}/{key}")
             return self._artifact_from_record(matches[-1])
 
+    def active_artifacts(
+        self, dataset: str | ResearchDataset
+    ) -> dict[str, ResearchArtifact]:
+        """Load all active artifacts for a dataset in one verified manifest pass.
+
+        Callers that need coverage across many logical keys must not call
+        :meth:`active_artifact` repeatedly: each single-key lookup reparses the
+        manifest and validates every blob.  This bulk form keeps the same
+        fail-closed validation while avoiding quadratic I/O as the research
+        universe grows.
+        """
+
+        dataset_value = self._validate_dataset(dataset)
+        with self._locked():
+            active: dict[str, ResearchArtifact] = {}
+            for record in self._load_records():
+                if record["dataset"] == dataset_value:
+                    active[record["key"]] = self._artifact_from_record(record)
+            return active
+
     def verify(self, artifact: ResearchArtifact) -> bool:
         try:
             dataset_value = self._validate_dataset(artifact.dataset)

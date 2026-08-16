@@ -352,6 +352,29 @@ def test_task8_forward_history_chunks_preserve_verified_coverage(
     assert [call for call in provider.calls if call[0] == "history"] == []
 
 
+def test_coverage_validates_manifest_once_for_many_symbols(
+    d_backfill_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = RecordingHistoryProvider()
+    coordinator = _coordinator(d_backfill_root, provider)
+    coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=3)
+
+    calls = 0
+    original = coordinator.store._load_records
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.store, "_load_records", counted)
+
+    coverage = coordinator.coverage()
+
+    assert coverage.symbol_count == 3
+    assert calls == 1
+
+
 def test_retries_only_bounded_transient_failures_and_applies_configured_delays(
     tmp_path,
 ) -> None:
