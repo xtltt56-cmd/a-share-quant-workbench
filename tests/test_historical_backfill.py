@@ -375,6 +375,32 @@ def test_coverage_validates_manifest_once_for_many_symbols(
     assert calls == 1
 
 
+def test_empty_leading_calendar_gap_does_not_block_forward_resume(
+    d_backfill_root: Path,
+) -> None:
+    class HolidayProvider(RecordingHistoryProvider):
+        def get_research_history(self, symbol, start_date, end_date):
+            frame = super().get_research_history(symbol, start_date, end_date)
+            return frame.loc[frame["date"] != date(2019, 1, 1)].reset_index(drop=True)
+
+    provider = HolidayProvider()
+    provider.list_research_instruments = lambda as_of=None: _instrument_frame().iloc[:1].copy()
+    coordinator = _coordinator(d_backfill_root, provider, max_request_days=2)
+
+    first = coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 2), limit=1)
+    provider.calls.clear()
+    second = coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 4), limit=1)
+    provider.calls.clear()
+    third = coordinator.run(start=date(2019, 1, 1), end=date(2019, 1, 4), limit=1)
+
+    assert first.rows_written == 1
+    assert second.failures == {}
+    assert third.rows_written == 2
+    assert [call[2:] for call in provider.calls if call[0] == "history"] == [
+        (date(2019, 1, 3), date(2019, 1, 4)),
+    ]
+
+
 def test_retries_only_bounded_transient_failures_and_applies_configured_delays(
     tmp_path,
 ) -> None:

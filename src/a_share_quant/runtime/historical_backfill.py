@@ -224,6 +224,29 @@ class HistoricalBackfillCoordinator:
 
             new_rows = sum(len(piece) for piece in pieces)
             if new_rows == 0:
+                previous_start = (
+                    _optional_checkpoint_date(record.get("start_date"))
+                    if record is not None
+                    else None
+                )
+                if (
+                    record is not None
+                    and previous_start is not None
+                    and missing[0][0] == start_day
+                    and missing[0][1] < previous_start
+                ):
+                    # A provider may legitimately return no rows for a
+                    # calendar-only prefix (holiday, weekend, or pre-listing
+                    # period).  Advance the checkpoint to the first verified
+                    # session so a bounded forward batch is not starved by
+                    # the same empty prefix on every lifecycle tick.
+                    updated = dict(record)
+                    updated["start_date"] = previous_start.isoformat()
+                    updated["leading_gap_skipped"] = True
+                    checkpoint["symbols"][symbol] = updated
+                    checkpoint["failures"].pop(symbol, None)
+                    self._write_checkpoint(checkpoint)
+                    continue
                 failures[symbol] = "NO_HISTORY"
                 checkpoint["failures"][symbol] = "NO_HISTORY"
                 self._write_checkpoint(checkpoint)
@@ -246,9 +269,10 @@ class HistoricalBackfillCoordinator:
                 frame,
                 _artifact_version(frame, frame_start, frame_end),
             )
-            checkpoint["symbols"][symbol] = self._symbol_record(
-                frame, artifact, frame_start, frame_end
-            )
+            updated_record = self._symbol_record(frame, artifact, frame_start, frame_end)
+            if record is not None and record.get("leading_gap_skipped") is True:
+                updated_record["leading_gap_skipped"] = True
+            checkpoint["symbols"][symbol] = updated_record
             checkpoint["failures"].pop(symbol, None)
             self._write_checkpoint(checkpoint)
             symbols_updated += 1
@@ -475,7 +499,9 @@ class HistoricalBackfillCoordinator:
         }
         if not required.issubset(frame.columns):
             raise ProviderRequestError("research history is missing required fields")
-        if frame.empty or set(frame["symbol"].astype(str)) != {symbol}:
+        if frame.empty:
+            return
+        if set(frame["symbol"].astype(str)) != {symbol}:
             raise ProviderRequestError("research history symbol mismatch")
         dates = pd.to_datetime(frame["date"], errors="raise").dt.date
         if dates.min() < start or dates.max() > end or dates.duplicated().any():
@@ -522,7 +548,7 @@ class HistoricalBackfillCoordinator:
         if previous_start is None or previous_end is None:
             raise CheckpointIntegrityError("历史回填检查点日期无效")
         missing: list[tuple[date, date]] = []
-        if start < previous_start:
+        if start < previous_start and record.get("leading_gap_skipped") is not True:
             missing.append((start, previous_start.fromordinal(previous_start.toordinal() - 1)))
         if end > previous_end:
             missing.append((previous_end.fromordinal(previous_end.toordinal() + 1), end))
