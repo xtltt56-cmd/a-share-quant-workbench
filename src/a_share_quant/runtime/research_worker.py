@@ -627,6 +627,11 @@ def _derived_screen_frames(frame: Any, symbol: str) -> tuple[Any, Any]:
     feature_columns = [
         "symbol",
         "date",
+        # Keep the unadjusted execution price alongside lagged features so
+        # historical screening can apply the same conservative cost model as
+        # the execution path.  It is not used as a same-day feature because
+        # the scorer still receives only explicitly selected columns.
+        "close",
         "feature_momentum_5",
         "feature_momentum_20",
         "feature_volatility_20",

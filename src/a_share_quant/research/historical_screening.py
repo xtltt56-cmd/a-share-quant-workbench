@@ -680,7 +680,15 @@ def _merge_features_labels(
     candidate: HistoricalCandidate,
 ) -> pd.DataFrame:
     feature_columns = _feature_columns(features, candidate)
-    left = features[["symbol", "_session_date", *feature_columns]].copy()
+    # Execution cost estimation needs an unadjusted price even when a
+    # candidate explicitly selects only one score column.  Keep ``close`` in
+    # the merged evaluation frame as audit data; _scores still uses only the
+    # candidate's declared feature columns, so this cannot silently change a
+    # model's input schema.
+    merged_columns = list(feature_columns)
+    if "close" in features.columns and "close" not in merged_columns:
+        merged_columns.append("close")
+    left = features[["symbol", "_session_date", *merged_columns]].copy()
     if labels.empty:
         return pd.DataFrame()
     right = labels[

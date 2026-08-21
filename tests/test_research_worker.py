@@ -54,6 +54,38 @@ def test_worker_parser_allows_only_fixed_internal_jobs() -> None:
         research_worker.parse_args(["history", "--output", "C:\\outside.json"])
 
 
+def test_derived_screen_features_retain_unadjusted_close_for_cost_screening() -> None:
+    from datetime import date, timedelta
+
+    from a_share_quant.research.historical_screening import (
+        HistoricalCandidate,
+        HistoricalEngineeringScreen,
+    )
+
+    periods = 1_800
+    frame = pd.DataFrame(
+        {
+            "date": [date(2019, 1, 1) + timedelta(days=index) for index in range(periods)],
+            "close": [10.0 + index * 0.001 for index in range(periods)],
+            "research_usable": [True] * periods,
+        }
+    )
+    features, labels = research_worker._derived_screen_frames(frame, "000001")
+
+    assert "close" in features.columns
+    snapshot = type("Snapshot", (), {})()
+    snapshot.features = features
+    snapshot.labels = labels
+    snapshot.signal_cutoff = features["date"].max()
+    snapshot.canonical_sha256 = "a" * 64
+    result = HistoricalEngineeringScreen().run(
+        snapshot,
+        [HistoricalCandidate("derived", score_column="feature_momentum_5")],
+    )
+
+    assert "cost_data_unavailable" not in result.trials[0].leakage_flags
+
+
 def test_worker_status_is_project_local_and_screen_is_non_promotional(tmp_path) -> None:
     exit_code = research_worker.run_job("screen", tmp_path)
 
