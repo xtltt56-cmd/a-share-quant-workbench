@@ -6,6 +6,7 @@ import pytest
 from a_share_quant.research.daily_candidates import (
     DailyDataStaleError,
     generate_official_signals,
+    latest_complete_signal_date,
     validate_daily_data_freshness,
 )
 
@@ -110,3 +111,28 @@ def test_daily_candidates_filter_point_in_time_universe_before_common_date() -> 
     assert {"000001", "000002", lagging_symbol}.isdisjoint(
         signal.symbol for signal in signals
     )
+
+
+def test_latest_complete_signal_date_uses_previous_day_before_close() -> None:
+    assert latest_complete_signal_date(
+        pd.Timestamp("2026-08-21 10:00", tz="Asia/Shanghai").to_pydatetime()
+    ) == date(2026, 8, 20)
+    assert latest_complete_signal_date(
+        pd.Timestamp("2026-08-21 15:01", tz="Asia/Shanghai").to_pydatetime()
+    ) == date(2026, 8, 21)
+
+
+def test_daily_candidates_ignore_stale_but_long_history_symbol_for_common_date() -> None:
+    bars = _bars()
+    stale_symbol = "000001"
+    bars = bars.loc[
+        ~(
+            (bars["symbol"] == stale_symbol)
+            & (bars["date"] > date(2026, 1, 5))
+        )
+    ]
+
+    signals = generate_official_signals(bars, top_k=10)
+
+    assert all(signal.signal_date == date(2026, 1, 14) for signal in signals)
+    assert stale_symbol not in {signal.symbol for signal in signals}

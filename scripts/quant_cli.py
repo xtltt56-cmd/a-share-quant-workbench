@@ -22,6 +22,7 @@ from a_share_quant.data.realtime.diagnostics import (
 )
 from a_share_quant.research.daily_candidates import (
     generate_from_data_root,
+    latest_complete_signal_date,
     load_name_map,
     model_bundle_digest,
 )
@@ -509,7 +510,9 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
         policy.revalidate(destination)
         existing = _read_local_json(destination)
         _verify_frozen_contest(existing)
-        return existing
+        if not _rollover_needed(repo_root, policy, existing):
+            return existing
+        _archive_frozen_contest(policy, destination, existing)
     registration = _derived_model_registration(repo_root, policy)
     terms = _require_fixed_contest_terms(_contest_terms(repo_root))
     now = datetime.now(timezone.utc)
@@ -574,6 +577,79 @@ def _freeze_contest(repo_root: Path) -> dict[str, object]:
         return existing
     except OSError as exc:
         raise SystemExit("未来竞赛冻结文件无法安全创建") from exc
+
+
+def _rollover_needed(
+    repo_root: Path,
+    policy: ProjectStoragePolicy,
+    existing: dict[str, object],
+) -> bool:
+    """Detect a new model bundle before any prediction is recorded.
+
+    An immutable contest remains the active baseline while it has predictions.
+    If code/data provenance changed before the first prediction, archive that
+    empty baseline and create a fresh contest for the current verified model.
+    Daily signal digest changes alone are intentionally not a rollover: they
+    are handled as forward sessions by the research worker.
+    """
+
+    try:
+        current_bundle = _current_signal_model_bundle(policy)
+        previous_bundle = str(existing.get("model_bundle_digest", "")).strip()
+        if not current_bundle or current_bundle == previous_bundle:
+            return False
+        from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
+
+        ledger = ProspectiveLedgerStore(policy=policy)
+        model_id = str(existing.get("model_id", ""))
+        model_version = str(existing.get("model_version", ""))
+        config_hash = str(existing.get("config_hash", ""))
+        snapshot_hash = str(existing.get("training_snapshot_hash", ""))
+        return not any(
+            prediction.model_id == model_id
+            and prediction.model_version == model_version
+            and prediction.config_hash == config_hash
+            and prediction.training_snapshot_hash == snapshot_hash
+            for prediction in ledger.predictions()
+        )
+    except Exception:
+        # A missing/invalid current signal must never mutate an immutable
+        # contest; the normal registration path will report the real blocker.
+        return False
+
+
+def _current_signal_model_bundle(policy: ProjectStoragePolicy) -> str | None:
+    try:
+        signals, _ = _verified_official_signal_artifact(policy)
+        bundles = {str(signal.model_bundle_digest).strip() for signal in signals}
+        if len(bundles) != 1:
+            return None
+        bundle = next(iter(bundles))
+        return bundle if len(bundle) == 64 else None
+    except (SystemExit, TypeError, ValueError):
+        return None
+
+
+def _archive_frozen_contest(
+    policy: ProjectStoragePolicy,
+    destination: Path,
+    existing: dict[str, object],
+) -> None:
+    """Move an empty superseded contest to a recoverable D-drive archive."""
+
+    raw = destination.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    archive_dir = policy.authorize(".runtime/research/contests")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive = archive_dir / f"prospective-contest-{digest}.json"
+    policy.revalidate(archive_dir)
+    policy.revalidate(destination)
+    if archive.exists():
+        policy.revalidate(archive)
+        if archive.read_bytes() != raw:
+            archive = archive_dir / f"prospective-contest-{digest}-{os.getpid()}.json"
+    policy.revalidate(archive)
+    destination.replace(archive)
 
 
 def _read_local_json(path: Path) -> dict[str, object]:
@@ -824,7 +900,7 @@ def _fresh_daily_signal_available(policy: ProjectStoragePolicy, now: datetime) -
 
     try:
         signals, _ = _verified_official_signal_artifact(policy)
-        session_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        session_date = latest_complete_signal_date(now)
         return bool(
             signals
             and all(

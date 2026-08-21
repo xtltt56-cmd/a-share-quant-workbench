@@ -13,6 +13,8 @@ from a_share_quant.data.pipeline import IncrementalUpdater, UpdateSummary
 from a_share_quant.data.providers.baostock import BaoStockDataProvider
 from a_share_quant.storage.market_store import MarketDataStore
 
+DEFAULT_INDEX_SYMBOLS = ("000300",)
+
 
 @dataclass(frozen=True)
 class DailyRefreshSummary:
@@ -32,6 +34,7 @@ def refresh_daily_data_if_due(
     provider: Any | None = None,
     lookback_days: int = 370,
     minimum_history_rows: int = 252,
+    index_symbols: tuple[str, ...] = DEFAULT_INDEX_SYMBOLS,
 ) -> DailyRefreshSummary:
     """Incrementally update BaoStock bars only when the lake is behind.
 
@@ -97,6 +100,23 @@ def refresh_daily_data_if_due(
                 ).run(start_date=target - timedelta(days=lookback_days), end_date=target)
             finally:
                 active_provider.list_instruments = original_list
+            _refresh_existing_indices(
+                store=store,
+                provider=active_provider,
+                symbols=tuple(
+                    sorted(
+                        (
+                            set(existing_symbols)
+                            - set(instruments["symbol"].astype(str))
+                        )
+                        & set(index_symbols)
+                    )
+                ),
+                start_date=target - timedelta(days=lookback_days),
+                end_date=target,
+                minimum_history_rows=minimum_history_rows,
+                summary=summary,
+            )
             return DailyRefreshSummary(
                 skipped=False,
                 rows_written=summary.rows_written,
@@ -163,3 +183,73 @@ def _latest_complete_weekday(now: datetime | None = None) -> date:
 
 
 __all__ = ["DailyRefreshSummary", "refresh_daily_data_if_due"]
+
+
+def _refresh_existing_indices(
+    *,
+    store: MarketDataStore,
+    provider: Any,
+    symbols: tuple[str, ...],
+    start_date: date,
+    end_date: date,
+    minimum_history_rows: int,
+    summary: UpdateSummary,
+) -> None:
+    """Refresh index files omitted from the ordinary stock instrument list.
+
+    BaoStock's ``query_stock_basic`` intentionally excludes indices, while the
+    official daily ranking uses CSI 300 (000300) as a benchmark.  Keep this
+    narrow and opt-in by only touching an index file that already exists and a
+    provider that exposes ``get_index_daily_bars``; no universe expansion or
+    fabricated fallback is allowed.
+    """
+
+    fetch_index = getattr(provider, "get_index_daily_bars", None)
+    if not callable(fetch_index):
+        return
+    for symbol in symbols:
+        summary.symbols_seen += 1
+        latest, row_count, stored_version = store.daily_profile(symbol)
+        required_version = getattr(provider, "daily_data_version", None)
+        replace_history = bool(
+            required_version
+            and stored_version is not None
+            and stored_version != required_version
+        )
+        needs_backfill = row_count < minimum_history_rows
+        requested_start = (
+            _stored_earliest_date(store, symbol) or start_date
+            if replace_history
+            else start_date
+            if needs_backfill or latest is None
+            else latest + timedelta(days=1)
+        )
+        if requested_start > end_date:
+            summary.symbols_skipped += 1
+            continue
+        try:
+            bars = fetch_index(symbol, requested_start, end_date)
+            if replace_history:
+                store.replace_daily_bars(bars)
+            else:
+                store.write_daily_bars(bars)
+            summary.symbols_updated += 1
+            summary.rows_written += len(bars)
+        except Exception as exc:  # one index endpoint must not stop stock refresh
+            summary.symbols_failed += 1
+            summary.errors.append(f"{symbol}: {type(exc).__name__}")
+
+
+def _stored_earliest_date(store: MarketDataStore, symbol: str) -> date | None:
+    """Return the earliest local date before replacing a versioned history."""
+
+    try:
+        import pandas as pd
+
+        frame = pd.read_parquet(store.daily_dir / f"{symbol}.parquet", columns=["date"])
+        if frame.empty:
+            return None
+        values = pd.to_datetime(frame["date"], errors="coerce").dropna()
+        return values.min().date() if not values.empty else None
+    except (OSError, ValueError, KeyError, ImportError):
+        return None

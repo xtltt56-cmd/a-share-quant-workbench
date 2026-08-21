@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from a_share_quant.research.daily_candidates import latest_complete_signal_date
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
 
 _JOBS = ("history", "screen", "predict", "settle")
@@ -655,7 +656,7 @@ def _derive_predict_context(
     signals, digest, source_artifact_path = _verified_official_signals(policy)
     frozen = _contest_from_payload(contest)
     now = _current_time()
-    local_signal_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    local_signal_date = latest_complete_signal_date(now)
     selected = tuple(
         signal
         for signal in signals
@@ -671,7 +672,7 @@ def _derive_predict_context(
         raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
     frozen_signal_digest = str(contest.get("official_signal_digest", ""))
     if digest != frozen_signal_digest:
-        raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
+        _require_forward_signal_rollover(policy, contest, selected)
     if frozen.model_bundle_digest is not None and any(
         signal.model_bundle_digest != frozen.model_bundle_digest for signal in selected
     ):
@@ -688,6 +689,58 @@ def _derive_predict_context(
         "session_calendar_digest": session_calendar_digest,
         "model_bundle_digest": frozen.model_bundle_digest,
     }
+
+
+def _require_forward_signal_rollover(
+    policy: ProjectStoragePolicy,
+    contest: dict[str, Any],
+    signals: tuple[Any, ...],
+) -> None:
+    """Allow a later daily artifact without weakening same-cycle binding.
+
+    ``official_signal_digest`` freezes the first contest input, while a
+    prospective contest must also collect later daily sessions.  A digest
+    change is therefore accepted only for a strictly later signal date than
+    an already recorded prediction.  On the first rollover (before any
+    prediction exists), the new date must differ from the contest's local
+    start date; a same-day rewrite remains blocked.
+    """
+
+    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
+
+    current_dates = {
+        signal.signal_date
+        for signal in signals
+        if isinstance(getattr(signal, "signal_date", None), date)
+    }
+    if len(current_dates) != 1:
+        raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
+    current_date = next(iter(current_dates))
+    ledger = ProspectiveLedgerStore(policy=policy)
+    prior_dates = {
+        prediction.as_of
+        for prediction in ledger.predictions()
+        if (
+            prediction.model_id == str(contest.get("model_id", ""))
+            and prediction.model_version == str(contest.get("model_version", ""))
+            and prediction.config_hash == str(contest.get("config_hash", ""))
+            and prediction.training_snapshot_hash
+            == str(contest.get("training_snapshot_hash", ""))
+        )
+    }
+    if prior_dates:
+        if current_date <= max(prior_dates):
+            raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
+        return
+    try:
+        started = datetime.fromisoformat(str(contest["contest_started_at"]))
+        if started.tzinfo is None or started.utcoffset() is None:
+            raise ValueError
+        start_local_date = started.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    except (KeyError, TypeError, ValueError):
+        raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH") from None
+    if current_date == start_local_date:
+        raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
 
 
 def _verified_session_calendar(

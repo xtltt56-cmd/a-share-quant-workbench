@@ -39,6 +39,23 @@ class FakeProvider:
             ]
         )
 
+    def get_index_daily_bars(self, symbol, start_date, end_date):
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "date": end_date,
+                    "open": 4000,
+                    "high": 4010,
+                    "low": 3990,
+                    "close": 4005,
+                    "volume": 100,
+                    "amount": 1000,
+                    "source": "baostock",
+                }
+            ]
+        )
+
     def close(self):
         return None
 
@@ -132,3 +149,50 @@ def test_daily_refresh_repairs_corrupt_current_file(tmp_path) -> None:
     assert provider.list_calls == 1
     assert pd.read_parquet(daily_dir / "000001.parquet").iloc[-1]["close"] == 10.5
     assert tuple(daily_dir.glob("000001.parquet.corrupt-*"))
+
+
+def test_daily_refresh_updates_existing_benchmark_index(tmp_path) -> None:
+    provider = FakeProvider()
+    from a_share_quant.storage.market_store import MarketDataStore
+
+    store = MarketDataStore(tmp_path)
+    seed = pd.DataFrame(
+        [
+            {
+                "symbol": "000001",
+                "date": date(2026, 8, 10),
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 10.2,
+                "volume": 100,
+                "amount": 1000,
+                "source": "baostock",
+            },
+            {
+                "symbol": "000300",
+                "date": date(2026, 8, 10),
+                "open": 4000,
+                "high": 4010,
+                "low": 3990,
+                "close": 4000,
+                "volume": 100,
+                "amount": 1000,
+                "source": "baostock",
+            },
+        ]
+    )
+    store.write_daily_bars(seed)
+
+    summary = refresh_daily_data_if_due(
+        tmp_path,
+        end_date=date(2026, 8, 12),
+        provider=provider,
+        minimum_history_rows=1,
+    )
+
+    assert summary.symbols_failed == 0
+    assert summary.symbols_updated == 2
+    index = pd.read_parquet(tmp_path / "lake" / "daily_bars" / "000300.parquet")
+    assert index["date"].max() == date(2026, 8, 12)
+    assert float(index.loc[index["date"].eq(date(2026, 8, 12)), "close"].iloc[0]) == 4005

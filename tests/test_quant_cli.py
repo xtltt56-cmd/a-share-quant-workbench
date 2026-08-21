@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 from datetime import datetime, timezone
@@ -430,6 +431,57 @@ def test_task8_contest_first_writer_uses_exclusive_create_and_fixed_terms(
     assert first["official_signal_digest"] == "e" * 64
     assert first["primary_metric"] == "net_cost_return"
     assert first["tie_break"] == terms["tie_break"]
+
+
+def test_task8_empty_contest_rolls_over_to_new_model_bundle(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    from scripts import quant_cli
+
+    terms = {
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+    }
+    monkeypatch.setattr(quant_cli, "_contest_terms", lambda _root: terms)
+    monkeypatch.setattr(
+        quant_cli,
+        "_derived_model_registration",
+        lambda _root, _policy: {
+            "model_id": "rule-ranking",
+            "model_version": "v1",
+            "config_hash": "c" * 64,
+            "training_snapshot_hash": "d" * 64,
+            "official_signal_digest": "e" * 64,
+            "model_bundle_digest": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(quant_cli, "_current_signal_model_bundle", lambda _policy: "b" * 64)
+    first = quant_cli._freeze_contest(d_cli_root)
+
+    monkeypatch.setattr(
+        quant_cli,
+        "_derived_model_registration",
+        lambda _root, _policy: {
+            "model_id": "rule-ranking",
+            "model_version": "v2",
+            "config_hash": "c" * 64,
+            "training_snapshot_hash": "d" * 64,
+            "official_signal_digest": "f" * 64,
+            "model_bundle_digest": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(quant_cli, "_current_signal_model_bundle", lambda _policy: "a" * 64)
+    second = quant_cli._freeze_contest(d_cli_root)
+
+    assert first["model_version"] == "v1"
+    assert second["model_version"] == "v2"
+    archives = tuple((d_cli_root / ".runtime" / "research" / "contests").glob("*.json"))
+    assert len(archives) == 1
+    assert json.loads(archives[0].read_text(encoding="utf-8"))["model_version"] == "v1"
 
 
 def test_task8_contest_start_rejects_nonfixed_metric_or_tie_break(

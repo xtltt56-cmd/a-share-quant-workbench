@@ -107,12 +107,30 @@ def generate_official_signals(
         ).tradable_universe(eligibility_date)
         allowed = set(tradable["symbol"].astype(str)) | {benchmark_symbol}
         frame = frame.loc[frame["symbol"].isin(allowed)].copy()
+    # A failed provider request may leave a stale file beside otherwise current
+    # files.  Do not let that one symbol pin the entire cross-section to an old
+    # date; select the latest date with enough long-history symbols instead.
+    history_counts = frame.groupby("symbol", sort=True).size()
+    history_ready = set(history_counts.loc[history_counts.ge(min_history)].index)
+    frame = frame.loc[frame["symbol"].isin(history_ready)].copy()
     latest_by_symbol = frame.groupby("symbol", sort=True)["date"].max()
-    common_as_of = min(latest_by_symbol.tolist())
+    if benchmark_symbol not in latest_by_symbol:
+        raise ValueError("benchmark does not have enough common historical bars")
     if requested_as_of is not None:
-        if requested_as_of > common_as_of:
+        benchmark_latest = latest_by_symbol[benchmark_symbol]
+        if requested_as_of > benchmark_latest:
             raise ValueError("requested as_of is later than available common history")
         common_as_of = requested_as_of
+    else:
+        common_as_of = _latest_cross_section_date(
+            latest_by_symbol,
+            benchmark_symbol=benchmark_symbol,
+            min_cross_section=min_cross_section,
+        )
+        if common_as_of is None:
+            raise ValueError(
+                "eligible cross-section has fewer than the required long-history symbols"
+            )
     if require_fresh:
         validate_daily_data_freshness(
             common_as_of,
@@ -228,15 +246,30 @@ def validate_daily_data_freshness(
         raise ValueError("now must be timezone-aware")
     if max_business_day_lag < 0:
         raise ValueError("max_business_day_lag must be non-negative")
+    candidate = latest_complete_signal_date(now)
+    lag = _business_day_distance(available_cutoff, candidate)
+    if lag > max_business_day_lag:
+        raise DailyDataStaleError(available_cutoff, candidate)
+
+
+def latest_complete_signal_date(now: datetime) -> date:
+    """Return the latest weekday whose close can legally feed a signal.
+
+    Before the 15:00 close, today's bar is incomplete and the latest valid
+    signal is the previous weekday.  After the close, today's bar may be used.
+    This intentionally does not infer exchange holidays; freshness validation
+    still applies its bounded weekday lag separately.
+    """
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
     local = now.astimezone(ZoneInfo("Asia/Shanghai"))
     candidate = local.date()
     if local.timetz().replace(tzinfo=None) < time(15, 0):
         candidate -= timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate -= timedelta(days=1)
-    lag = _business_day_distance(available_cutoff, candidate)
-    if lag > max_business_day_lag:
-        raise DailyDataStaleError(available_cutoff, candidate)
+    return candidate
 
 
 def _business_day_distance(available: date, expected: date) -> int:
@@ -316,6 +349,25 @@ def _parse_date(value: date | str) -> date:
     return parsed.date()
 
 
+def _latest_cross_section_date(
+    latest_by_symbol: pd.Series,
+    *,
+    benchmark_symbol: str,
+    min_cross_section: int,
+) -> date | None:
+    """Find the newest date with a benchmark and enough current symbols."""
+
+    required_symbols = min_cross_section + 1  # stocks plus the benchmark
+    for candidate in sorted(latest_by_symbol.unique(), reverse=True):
+        available = int(latest_by_symbol.ge(candidate).sum())
+        if (
+            latest_by_symbol.get(benchmark_symbol, date.min) >= candidate
+            and available >= required_symbols
+        ):
+            return candidate
+    return None
+
+
 def _validate_parameters(
     top_k: int,
     min_history: int,
@@ -336,6 +388,7 @@ __all__ = [
     "DailyDataStaleError",
     "generate_from_data_root",
     "generate_official_signals",
+    "latest_complete_signal_date",
     "load_name_map",
     "model_bundle_digest",
     "validate_daily_data_freshness",
