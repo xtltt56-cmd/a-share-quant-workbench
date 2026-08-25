@@ -20,6 +20,25 @@ jobs:
           cache: pip
       - name: Create project virtual environment
         run: python -m venv .venv
+      - name: Verify Windows PowerShell launch helpers
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path
+          $helper = Join-Path $root 'scripts\workbench_launch_helpers.ps1'
+          $fingerprint = Join-Path $root 'scripts\workbench_code_fingerprint.py'
+          $legacy = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+          Write-Host "Legacy host: $legacy"
+          Write-Host "Helper: $helper"
+          Write-Host "Helper exists: $(Test-Path -LiteralPath $helper -PathType Leaf)"
+          Write-Host "Fingerprint script exists: $(Test-Path -LiteralPath $fingerprint -PathType Leaf)"
+          Get-Item -LiteralPath $helper, $fingerprint | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+          $command = ". '$helper'; Get-Command Get-QuantLaunchDecision -ErrorAction Stop | Select-Object -ExpandProperty CommandType; Get-QuantLaunchDecision -Metadata `$null -ActualPid 42 -RequestedMode 'network' -RequestedGitRevision 'abc' -RequestedCodeFingerprint 'sha256:one'"
+          $decision = & $legacy -NoProfile -ExecutionPolicy Bypass -Command $command
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows PowerShell launch helper probe failed: $decision"
+          }
+          Write-Host "Decision: $decision"
       - name: Install locked runtime and test dependencies
         run: >-
           .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free]" lightgbm scikit-learn
