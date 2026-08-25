@@ -20,14 +20,14 @@ function Get-QuantCodeFingerprint {
     $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
     $fingerprintScript = Join-Path $RepoRoot 'scripts\workbench_code_fingerprint.py'
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-        throw "项目 Python 环境不存在：$python"
+        throw "Project Python environment not found: $python"
     }
     if (-not (Test-Path -LiteralPath $fingerprintScript -PathType Leaf)) {
-        throw "源码指纹脚本不存在：$fingerprintScript"
+        throw "Code fingerprint script not found: $fingerprintScript"
     }
     $fingerprint = (& $python -X utf8 $fingerprintScript $RepoRoot)
     if ($LASTEXITCODE -ne 0 -or $fingerprint -notmatch '^sha256:[0-9a-f]{64}$') {
-        throw "无法计算有效的源码指纹：$fingerprint"
+        throw "Unable to compute a valid source fingerprint: $fingerprint"
     }
     return $fingerprint
 }
