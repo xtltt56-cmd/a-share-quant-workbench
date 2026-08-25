@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+HELPERS = ROOT / "scripts" / "workbench_launch_helpers.ps1"
+
+
+def _legacy_powershell() -> str:
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    candidate = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(candidate) if candidate.is_file() else "powershell.exe"
 
 
 def _shell(executable: str, expression: str) -> str:
+    helper_path = str(HELPERS).replace("'", "''")
     completed = subprocess.run(
         [
             executable,
@@ -15,7 +24,7 @@ def _shell(executable: str, expression: str) -> str:
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            f". '.\\scripts\\workbench_launch_helpers.ps1'; {expression}",
+            f". '{helper_path}'; {expression}",
         ],
         cwd=ROOT,
         check=True,
@@ -27,7 +36,7 @@ def _shell(executable: str, expression: str) -> str:
 
 
 def _powershell(expression: str) -> str:
-    return _shell("powershell.exe", expression)
+    return _shell(_legacy_powershell(), expression)
 
 
 def _decision(**overrides: object) -> str:
