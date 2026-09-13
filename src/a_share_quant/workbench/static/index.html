@@ -1,49 +1,93 @@
 <!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>A股量化交易工作台</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23325fe5'/%3E%3Cpath d='M7 23V15M15 23V9M23 23V5' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/assets/workbench.css">
-<script src="/assets/echarts.min.js" defer></script><script src="/assets/workbench.js" defer></script>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>A股量化交易工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23282e39'/%3E%3Cpath d='M8 23V15M16 23V9M24 23V5' stroke='%238da8ff' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/workbench.css">
+  <script src="/assets/echarts.min.js" defer></script>
+  <script src="/assets/workbench.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#main">跳到内容</a>
 <aside class="sidebar">
-  <a class="brand" href="/#overview"><span class="brand-mark">量</span><span>量化工作台<small>A-SHARE · RESEARCH</small></span></a>
-  <button id="collapse-nav" class="collapse-nav" aria-label="折叠或展开导航" aria-expanded="true">☰ <span>工作空间</span></button>
+  <a class="brand" href="/#overview" aria-label="量化工作台首页">
+    <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="nav-text">量化工作台<small>A股研究</small></span>
+  </a>
   <nav aria-label="主导航">
-    <a href="#overview" data-page="overview"><span>◈</span>投资总览</a>
-    <a href="#daily" data-page="daily"><span>▤</span>日选研究</a>
-    <a href="#monitor" data-page="monitor"><span>⌁</span>盘中监控</a>
-    <a href="#holdings" data-page="holdings"><span>▦</span>我的持仓</a>
-    <a href="#models" data-page="models"><span>◇</span>模型观察</a>
-    <a href="#system" data-page="system"><span>⚙</span>数据与系统</a>
+    <a href="#overview" data-page="overview"><span data-icon="overview"></span><span class="nav-text">投资总览</span></a>
+    <a href="#daily" data-page="daily"><span data-icon="daily"></span><span class="nav-text">日选研究</span></a>
+    <a href="#monitor" data-page="monitor"><span data-icon="monitor"></span><span class="nav-text">盘中监控</span></a>
+    <a href="#holdings" data-page="holdings"><span data-icon="holdings"></span><span class="nav-text">我的持仓</span></a>
+    <a href="#models" data-page="models"><span data-icon="models"></span><span class="nav-text">模型观察</span></a>
+    <a href="#system" data-page="system"><span data-icon="system"></span><span class="nav-text">数据与系统</span></a>
   </nav>
-  <div class="sidebar-bottom"><div class="local-label"><i></i>本地工作空间</div><p>研究辅助 · 人工执行<br>数据存储于本机</p><a href="/classic">打开经典工作台 ↗</a></div>
+  <div class="sidebar-bottom"><span class="local-label"><i></i><span class="nav-text">本地工作空间</span></span><a href="/classic"><span class="nav-text">经典工作台</span> ↗</a></div>
+  <button id="collapse-nav" class="collapse-nav" aria-label="折叠或展开导航" aria-expanded="true"><span data-icon="collapse"></span><span class="nav-text">收起导航</span></button>
 </aside>
 <div class="workspace">
-<header class="topbar"><div><span class="breadcrumb">工作空间</span><span class="divider">/</span><span id="breadcrumb">投资总览</span></div><div class="tools"><span id="connection" class="badge">正在连接</span><button id="density" class="icon-button" title="切换紧凑模式" aria-label="切换紧凑模式">≡</button><button id="theme" class="icon-button" title="切换深浅主题" aria-label="切换深浅主题">◐</button></div></header>
-<main>
-<div class="page-heading"><div><div class="eyebrow">A-SHARE QUANT WORKBENCH</div><h1 id="page-title">投资总览</h1><p id="page-subtitle">从全局到个股，让每一次观察都有依据。</p></div><button class="primary" id="refresh">↻ 刷新后台数据</button></div>
-<div id="alert" role="status" aria-live="polite"></div>
-<section data-view="overview">
-  <div class="hero"><div><div class="eyebrow">今日工作台</div><h2>看清市场，审慎决策。</h2><p>将日线候选、价格计划与持仓放在同一视野。</p><a class="hero-link" href="#daily">查看本期日选 <span>↗</span></a></div><div class="hero-meta"><span>日线数据截止</span><strong id="cutoff">—</strong><span id="daily-notice">正在读取本地数据</span></div></div>
-  <div id="overview-stats" class="stats"></div>
-  <div class="overview-grid"><article class="panel"><div class="panel-heading"><div><h2>本期日选</h2><p>本系统策略生成 · 排名分数并非上涨概率</p></div><a href="#daily">全部候选 →</a></div><div id="top-candidates"></div></article><article class="panel"><div class="panel-heading"><div><h2>需要关注</h2><p>数据与账户的待处理事项</p></div><span class="eyebrow">TO DO</span></div><div id="attention"></div><div class="quiet-note">所有成交均由你在券商客户端完成。本平台仅提供研究与人工记录。</div></article></div>
-</section>
-<section data-view="daily" hidden><div class="toolbar"><label class="search">⌕ <input id="daily-search" placeholder="搜索股票名称或代码" aria-label="搜索日选"></label><select id="daily-sort" aria-label="日选排序"><option value="rank">按候选分数</option><option value="symbol">按股票代码</option></select><label><input type="checkbox" id="daily-plan">仅看已有价格区间</label></div><article class="panel"><div class="panel-heading"><div><h2>官方日线候选</h2><p id="daily-description">固定权重横截面排序 · 点击股票查看依据</p></div><span class="badge" id="daily-count"></span></div><div id="daily-table" class="table-scroll"></div></article></section>
-<section data-view="monitor" hidden><div class="toolbar"><label class="search">⌕ <input id="monitor-search" placeholder="搜索股票名称或代码" aria-label="搜索监控"></label><select id="monitor-filter" aria-label="监控范围"><option value="all">全部监控</option><option value="daily">日选候选</option><option value="holdings">我的持仓</option><option value="watch">我的自选</option></select><span class="muted">每 15 秒读取后台状态</span></div><article class="panel"><div class="panel-heading"><div><h2>盘中监控</h2><p>行情时间与数据质量决定指导是否可用</p></div><span id="session" class="badge"></span></div><div id="monitor-table" class="table-scroll"></div></article></section>
-<section data-view="holdings" hidden>
-<div id="account-stats" class="stats"></div><p class="muted">本地人工投顾 · 仅限人工执行，系统不会提交委托。</p><article class="panel" id="allocation-panel" hidden><h2>持仓成本分布</h2><p class="muted">按数量 × 平均成本计算，不是实时市值仓位</p><div id="allocation"></div></article>
-<article class="panel"><div class="panel-heading"><div><h2>本机账本持仓</h2><p>人工登记口径，与券商导入快照独立展示</p></div><a href="#entry">登记成交 ↓</a></div><div id="holding-table" class="table-scroll"></div><div id="holding-plans"></div></article>
-<article class="panel"><div class="panel-heading"><div><h2>券商持仓快照</h2><p id="imported-date">尚未导入</p></div></div><div id="imported-table" class="table-scroll"></div></article>
-<div class="two-columns"><article class="panel" id="entry"><div class="panel-heading"><div><h2>登记已完成的买入</h2><p>请先在券商端完成交易，再登记实际成交</p></div></div><form id="buy-form"><div class="form-grid"><label>证券代码<input id="code" required pattern="[0-9]{6}" maxlength="6" placeholder="例如 600519"></label><label>证券名称<input id="name" required placeholder="自动匹配或手动填写"></label><label>成交数量（股）<input id="quantity" type="number" min="1" step="1" required placeholder="100"></label><label>成交价格（元）<input id="price" type="number" min="0.001" step="any" required placeholder="实际成交价"></label></div><button class="primary" type="submit">预览人工成交</button></form><div id="buy-preview" aria-live="polite"></div><button id="buy-confirm" hidden>确认记录人工成交</button></article>
-<article class="panel"><div class="panel-heading"><div><h2>券商导出文件导入</h2><p>① 扫描文件　② 预览核对　③ 确认导入</p></div></div><p class="muted">只读取固定收件箱，不会登录或控制券商客户端。将官方导出文件放入项目的 .runtime/advisory/import-inbox 收件箱。</p><button id="scan">扫描导出文件</button><select id="import-file" aria-label="选择导出文件"><option value="">请选择文件</option></select><button id="import-preview-button">生成预览</button><div id="import-preview"></div><button id="import-confirm" hidden>确认导入</button><p id="import-message" role="status"></p></article></div>
-<article class="panel"><h2>今日指引</h2><div id="guidance"></div></article>
-</section>
-<section data-view="models" hidden><article class="panel"><div class="panel-heading"><div><h2>模型观察与对证</h2><p>先记录预测，再等待未来实际数据验证</p></div><span class="badge">人工批准晋级</span></div><div id="models"></div><div class="timeline"><div><b>01</b><strong>形成预测</strong><p>保存当时可见的数据和模型版本</p></div><div><b>02</b><strong>等待结果</strong><p>预测周期结束前保持待成熟状态</p></div><div><b>03</b><strong>公平比较</strong><p>相同周期与样本范围进行对证</p></div><div><b>04</b><strong>审核晋级</strong><p>满足门槛后人工批准，可审计回滚</p></div></div><div class="quiet-note">尚未有后端提供的可比较成绩时，不展示命中率或收益曲线。日选排名不等于经过校准的收益预测。</div></article></section>
-<section data-view="system" hidden><article class="panel"><div class="panel-heading"><div><h2>数据源与运行状态</h2><p>查看实际数据截止时间与连接情况</p></div></div><div id="system-stats" class="stats"></div><div id="system-details"></div></article><article class="panel"><h2>使用与退出</h2><p class="muted">桌面快捷方式继续可用。安全退出会停止工作台及受其管理的研究任务。</p><button id="safe-exit">安全退出系统</button><p id="exit-message" role="status"></p></article></section>
-<footer>仅供纸面监控与人工研究　<span>行情、计划与实际成交请按时间和口径核对</span></footer>
-</main></div>
-<dialog id="stock-dialog"><div class="drawer-heading"><div><span class="eyebrow">SECURITY OVERVIEW</span><h2 id="stock-title"></h2></div><button id="close-stock" aria-label="关闭股票详情">✕</button></div><div id="stock-summary"></div><div class="chart-heading"><h3>历史日 K 线</h3><select id="chart-range" aria-label="K线范围"><option value="60">最近 60 条</option><option value="120" selected>最近 120 条</option><option value="252">最近 252 条</option><option value="600">最近 600 条</option></select></div><div id="chart-note" class="muted"></div><div id="stock-chart" role="img" aria-label="股票日K线与成交量图"></div><div id="price-plan"></div><div id="stock-reasons"></div></dialog>
-<noscript>请启用浏览器 JavaScript，或打开经典工作台。</noscript>
-</body></html>
+  <header class="topbar"><span id="breadcrumb">投资总览</span><div class="tools"><span id="connection" class="connection" role="status">正在连接</span><span id="top-cutoff" class="top-cutoff" title="日线数据截止">—</span><button id="density" class="icon-button" title="切换紧凑模式" aria-label="切换紧凑模式" aria-pressed="false"><span data-icon="density"></span></button><button id="theme" class="icon-button" title="切换深浅主题" aria-label="切换深浅主题" aria-pressed="false"><span data-icon="theme"></span></button></div></header>
+  <main id="main" tabindex="-1">
+    <div class="page-heading"><div><h1 id="page-title">投资总览</h1><p id="page-subtitle">先看数据状态，再看候选与价格。</p></div><button class="primary" id="refresh"><span data-icon="refresh"></span>刷新数据</button></div>
+    <div id="alert" role="status" aria-live="polite"></div>
+
+    <section data-view="overview" aria-label="投资总览">
+      <div id="overview-stats" class="stats"></div>
+      <div class="overview-grid">
+        <article class="panel"><div class="panel-heading"><h2>本期日选</h2><a href="#daily">查看全部 →</a></div><div id="top-candidates" class="table-scroll"></div></article>
+        <div class="side-stack"><article class="panel attention-panel"><div class="panel-heading"><h2>待处理</h2><span id="attention-count" class="muted"></span></div><div id="attention"></div></article><article class="panel risk-panel"><div class="panel-heading"><h2>风险提示</h2></div><div id="risk-summary"></div></article></div>
+      </div>
+      <div class="two-columns summary-row"><article class="panel"><div class="panel-heading"><h2>数据时效</h2><a href="#system">查看状态 →</a></div><div id="overview-freshness"></div></article><article class="panel"><div class="panel-heading"><h2>模型记录</h2><a href="#models">查看对证 →</a></div><div id="overview-model"></div></article></div>
+    </section>
+
+    <section data-view="daily" hidden>
+      <div class="toolbar"><label class="search"><span data-icon="search"></span><input id="daily-search" placeholder="搜索股票名称或代码" aria-label="搜索日选" type="search"></label><select id="daily-sort" aria-label="日选排序"><option value="rank">按候选分数</option><option value="symbol">按股票代码</option></select><label class="check-label"><input type="checkbox" id="daily-plan">已有价格区间</label></div>
+      <article class="panel"><div class="panel-heading"><div><h2>官方日线候选</h2><p id="daily-description"></p></div><span id="daily-count" class="badge"></span></div><div id="daily-table" class="table-scroll"></div></article>
+      <details class="help"><summary>如何阅读日选</summary><p>分数用于候选排序，并非上涨概率。参考区间须结合信号日期、行情质量和适用日期核对。</p></details>
+    </section>
+
+    <section data-view="monitor" hidden>
+      <div class="toolbar"><label class="search"><span data-icon="search"></span><input id="monitor-search" placeholder="搜索股票名称或代码" aria-label="搜索监控" type="search"></label><select id="monitor-filter" aria-label="监控范围"><option value="all">全部监控</option><option value="daily">日选候选</option><option value="holdings">我的持仓</option><option value="watch">我的自选</option></select><span class="toolbar-note">15 秒同步</span></div>
+      <article class="panel"><div class="panel-heading"><h2>行情与价格计划</h2><span id="session" class="badge"></span></div><div id="monitor-table" class="table-scroll"></div></article>
+      <details class="help"><summary>监控状态说明</summary><p>“就绪”仅表示监控状态。指导是否可用仍取决于行情时间和数据质量。</p></details>
+    </section>
+
+    <section data-view="holdings" hidden>
+      <span class="sr-only">本地人工投顾</span>
+      <div id="account-stats" class="stats"></div>
+      <article class="panel"><div class="panel-heading"><div><h2>本机账本持仓</h2><p>依据已登记成交</p></div><a href="#entry">登记成交 →</a></div><div id="holding-table" class="table-scroll"></div><div id="holding-plans"></div></article>
+      <article class="panel" id="allocation-panel" hidden><div class="panel-heading"><h2>持仓成本分布</h2><span class="muted">数量 × 平均成本</span></div><div id="allocation"></div></article>
+      <article class="panel"><div class="panel-heading"><div><h2>券商持仓快照</h2><p id="imported-date">尚未导入</p></div><a href="#import-section">导入文件 →</a></div><div id="imported-table" class="table-scroll"></div></article>
+      <div class="two-columns">
+        <article class="panel" id="entry"><div class="panel-heading"><div><h2>登记买入</h2><p>填写已完成的实际成交</p></div></div><form id="buy-form"><div class="form-grid"><label>证券代码<input id="code" required pattern="[0-9]{6}" maxlength="6" placeholder="例如 600519" inputmode="numeric"></label><label>证券名称<input id="name" required placeholder="自动匹配或手动填写"></label><label>数量（股）<input id="quantity" type="number" min="1" step="1" required placeholder="100"></label><label>成交价格（元）<input id="price" type="number" min="0.001" step="any" required placeholder="实际成交价"></label></div><button class="primary" type="submit">预览成交</button></form><div id="buy-preview" aria-live="polite"></div><button id="buy-confirm" hidden>确认记录人工成交</button></article>
+        <article class="panel" id="import-section"><div class="panel-heading"><h2>券商导出文件导入</h2><span class="muted">扫描 · 预览 · 导入</span></div><details class="help import-help"><summary>文件放在哪里</summary><p>放入项目的 <code>.runtime/advisory/import-inbox</code> 后扫描。只读取固定收件箱，不会登录或控制券商客户端。</p></details><button id="scan"><span data-icon="folder"></span>扫描导出文件</button><select id="import-file" aria-label="选择导出文件"><option value="">请选择文件</option></select><button id="import-preview-button">生成预览</button><div id="import-preview"></div><button id="import-confirm" hidden>确认导入</button><p id="import-message" role="status"></p></article>
+      </div>
+      <article class="panel"><div class="panel-heading"><h2>持仓指引</h2></div><div id="guidance"></div></article>
+      <details class="help"><summary>账本与券商快照</summary><p>本机账本根据人工登记计算；券商文件是特定时间的独立快照。系统不会提交委托。</p></details>
+    </section>
+
+    <section data-view="models" hidden>
+      <article class="panel"><div class="panel-heading"><h2>模型与对证</h2><span class="badge">人工批准晋级</span></div><div id="models"></div></article>
+      <details class="help"><summary>预测如何对证</summary><ol><li>记录预测和当时可见数据。</li><li>等待预测周期结束。</li><li>在相同周期和样本上比较。</li><li>审核后决定是否晋级。</li></ol></details>
+    </section>
+
+    <section data-view="system" hidden>
+      <div id="system-stats" class="stats"></div><article class="panel"><div class="panel-heading"><h2>数据与连接</h2></div><div id="system-details"></div></article>
+      <article class="panel exit-panel"><div><h2>安全退出</h2><p class="muted">停止工作台和受其管理的研究任务</p></div><button id="safe-exit">退出系统</button><p id="exit-message" role="status"></p></article>
+    </section>
+    <footer><span>研究辅助 · 人工执行</span><span>本地工作空间</span></footer>
+  </main>
+</div>
+
+<dialog id="stock-dialog" aria-labelledby="stock-title">
+  <div class="drawer-heading"><h2 id="stock-title"></h2><button id="close-stock" class="icon-button" aria-label="关闭股票详情"><span data-icon="close"></span></button></div>
+  <div id="stock-summary"></div><section id="price-plan" class="price-plan"></section>
+  <div class="chart-heading"><h3>历史日 K 线</h3><select id="chart-range" aria-label="K线范围"><option value="60">最近 60 条</option><option value="120" selected>最近 120 条</option><option value="252">最近 252 条</option><option value="600">最近 600 条</option></select></div>
+  <div id="stock-chart" role="img" aria-label="股票日K线与成交量图"></div><div id="chart-note" class="muted"></div><div id="stock-reasons"></div>
+</dialog>
+<noscript>请启用 JavaScript，或<a href="/classic">打开经典工作台</a>。</noscript>
+</body>
+</html>

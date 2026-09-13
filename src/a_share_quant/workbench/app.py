@@ -199,6 +199,13 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._write_advisory_response(lambda service: service.list_account_imports())
         elif path == "/api/models/governance":
             self._write_governance_state()
+        elif path == "/api/models/progress":
+            from a_share_quant.workbench.research_summary import research_summary
+
+            try:
+                self._write_json(research_summary())
+            except (OSError, ValueError, RuntimeError):
+                self._write_json({"status": "UNAVAILABLE", "notice_zh": "预测账本读取或完整性校验失败"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
         elif path == "/api/refresh":
             self._write_json(
                 {"error": "use POST with the local refresh request header"},
