@@ -796,6 +796,8 @@ def test_fake_ownership_marker_never_authorizes_deletion(research_temp: Path) ->
         ),
         encoding="utf-8",
     )
+    future_timestamp = time.time() + 1
+    os.utime(fake, (future_timestamp, future_timestamp))
 
     report = store.cleanup_rebuildable_temporary_files(grace_seconds=0)
     assert foreign.exists()

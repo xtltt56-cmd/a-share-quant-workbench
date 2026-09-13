@@ -340,7 +340,12 @@ class ResearchDataStore:
                     if not marker.is_file():
                         continue
                     self.policy.revalidate(marker)
-                    if marker.stat().st_mtime > cutoff:
+                    # A zero grace period means "inspect now".  Do not let a
+                    # small filesystem/clock skew turn that explicit request
+                    # into an implicit delay.  Positive grace periods still
+                    # protect newly created markers, including future-dated
+                    # timestamps.
+                    if grace > 0 and marker.stat().st_mtime > cutoff:
                         continue
                     ownership = self._read_owned_marker(marker)
                     if ownership["state"] != "sealed":
