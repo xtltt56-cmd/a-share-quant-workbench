@@ -14,7 +14,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.research.evolution import EvolutionRegistry
@@ -27,6 +27,13 @@ from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
+
+_UI_ROOT = Path(__file__).with_name("static")
+_UI_ASSETS = {
+    "/assets/workbench.css": ("workbench.css", "text/css; charset=utf-8"),
+    "/assets/workbench.js": ("workbench.js", "text/javascript; charset=utf-8"),
+    "/assets/echarts.min.js": ("echarts.min.js", "text/javascript; charset=utf-8"),
+}
 
 _RESEARCH_CONTEXT_KEYS = frozenset(
     {
@@ -151,9 +158,33 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
         if path == "/":
-            self._write_html(_DASHBOARD_HTML)
+            self._write_html((_UI_ROOT / "index.html").read_text(encoding="utf-8"))
         elif path == "/advisory":
+            self._write_html((_UI_ROOT / "index.html").read_text(encoding="utf-8"))
+        elif path == "/classic":
+            self._write_html(_DASHBOARD_HTML)
+        elif path == "/classic/advisory":
             self._write_html(_ADVISORY_DASHBOARD_HTML)
+        elif path in _UI_ASSETS:
+            body = (_UI_ROOT / _UI_ASSETS[path][0]).read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", _UI_ASSETS[path][1])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/api/stocks/history":
+            from a_share_quant.workbench.stock_history import load_history
+
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                result = load_history(query.get("symbol", [""])[0], query.get("limit", ["120"])[0])
+                self._write_json(result)
+            except ValueError:
+                self._write_json({"error": "证券代码或范围无效"}, status=HTTPStatus.BAD_REQUEST)
+            except (OSError, KeyError):
+                self._write_json({"error": "本地日线暂不可用"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
         elif path == "/api/health":
             self._write_json(self.server.service.health())
         elif path == "/api/state":
@@ -178,6 +209,17 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
+        if path == "/api/system/quit":
+            if self.headers.get("X-Quant-Workbench-Request") != "safe-exit":
+                self._discard_request_body()
+                self._write_json({"error": "local safe-exit request header required"},
+                                 status=HTTPStatus.FORBIDDEN)
+                return
+            self._discard_request_body()
+            self._write_json({"notice_zh": "正在安全退出工作台及研究任务"})
+            # run_server's finally block owns lifecycle, worker and provider cleanup.
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         if path == "/api/system/safe-exit":
             self._safe_exit()
             return

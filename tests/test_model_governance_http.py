@@ -59,13 +59,13 @@ def _post(port: int, path: str, payload: dict[str, object]) -> tuple[int, dict[s
         return error.code, json.loads(error.read().decode("utf-8"))
 
 
-def test_governance_page_is_chinese() -> None:
+def test_classic_governance_page_is_chinese() -> None:
     registry, _ = _registry()
     server = create_server(service=FakeService(), governance=registry, port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        url = f"http://127.0.0.1:{server.server_address[1]}/advisory"
+        url = f"http://127.0.0.1:{server.server_address[1]}/classic/advisory"
         with urlopen(url, timeout=3) as response:
             html = response.read().decode("utf-8")
         for text in ("模型治理", "当前冠军", "挑战者", "影子运行", "等待人工批准", "回滚"):

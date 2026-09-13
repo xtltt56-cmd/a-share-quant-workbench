@@ -119,6 +119,53 @@ def test_akshare_realtime_provider_detects_optional_index_and_minute_endpoints(
     assert bars[0].is_final is True
 
 
+def test_akshare_index_snapshot_falls_back_to_sina_when_eastmoney_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def stock_zh_index_spot_em() -> pd.DataFrame:
+        calls.append("eastmoney")
+        raise ConnectionError("proxy rejected endpoint")
+
+    def stock_zh_index_spot_sina() -> pd.DataFrame:
+        calls.append("sina")
+        return pd.DataFrame(
+            [
+                {
+                    "代码": "sh000300",
+                    "名称": "沪深300",
+                    "最新价": 4000,
+                    "涨跌额": -10,
+                    "涨跌幅": -0.25,
+                    "昨收": 4010,
+                    "今开": 3990,
+                    "最高": 4020,
+                    "最低": 3980,
+                    "成交量": 1000,
+                    "成交额": 4_000_000,
+                }
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zh_index_spot_em=stock_zh_index_spot_em,
+            stock_zh_index_spot_sina=stock_zh_index_spot_sina,
+        ),
+    )
+
+    provider = AKShareRealTimeProvider(retry_count=3, delay_seconds=0)
+    quotes = provider.get_index_snapshot(["000300"])
+
+    assert calls == ["eastmoney", "sina"]
+    assert [quote.symbol for quote in quotes] == ["000300"]
+    assert quotes[0].name == "沪深300"
+    assert quotes[0].last == pytest.approx(4000)
+
+
 def test_akshare_full_market_endpoint_is_not_retried_inside_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

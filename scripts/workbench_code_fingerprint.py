@@ -11,7 +11,7 @@ def code_fingerprint(repo_root: Path) -> str:
         path
         for source_root in (root / "src", root / "scripts")
         for path in source_root.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".py", ".ps1"}
+        if path.is_file() and path.suffix.lower() in {".py", ".ps1", ".html", ".css", ".js"}
     )
     records = [
         f"{path.relative_to(root).as_posix()}:{_file_digest(path)}"

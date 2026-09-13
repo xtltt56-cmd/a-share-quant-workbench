@@ -81,7 +81,7 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
             state = json.loads(response.read().decode("utf-8"))
             assert response.headers["Cache-Control"] == "no-store"
         assert state["session"] == "OPEN"
-        with urlopen(f"http://127.0.0.1:{port}/", timeout=3) as response:
+        with urlopen(f"http://127.0.0.1:{port}/classic", timeout=3) as response:
             html = response.read().decode("utf-8")
             assert response.headers["Cache-Control"] == "no-store"
         assert '<html lang="zh-CN">' in html
