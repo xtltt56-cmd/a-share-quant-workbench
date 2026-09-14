@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         account_snapshot_path = _operator_path(repo_root, args.account_snapshot_path)
         price_guidance_path = _inside(repo_root, args.price_guidance_path)
         research_checkpoint_path = _inside(repo_root, args.research_checkpoint)
-        storage_policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+        storage_policy = ProjectStoragePolicy(repo_root)
         network_enabled = bool(args.network and not args.offline)
         research_supervisor = ResearchJobSupervisor(
             research_checkpoint_path.parent,
@@ -433,7 +433,7 @@ def _project_root() -> Path:
 def _research_status(repo_root: Path) -> dict[str, object]:
     """Read local research state without constructing or calling a provider."""
 
-    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    policy = ProjectStoragePolicy(repo_root)
     checkpoint_path = policy.authorize(".runtime/research/research-checkpoint.json")
     supervisor = ResearchJobSupervisor(
         checkpoint_path.parent,
@@ -463,7 +463,7 @@ def _research_status(repo_root: Path) -> dict[str, object]:
 def _research_screen_status(repo_root: Path) -> dict[str, object]:
     """Read the latest screen artifact; never create a worker from the CLI."""
 
-    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    policy = ProjectStoragePolicy(repo_root)
     directory = policy.authorize(".runtime/research/status")
     if not directory.exists():
         return {
@@ -504,7 +504,7 @@ def _research_screen_status(repo_root: Path) -> dict[str, object]:
 def _freeze_contest(repo_root: Path) -> dict[str, object]:
     """Freeze verified model provenance for future-only observation."""
 
-    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    policy = ProjectStoragePolicy(repo_root)
     destination = policy.authorize(".runtime/research/prospective-contest.json")
     if destination.exists():
         policy.revalidate(destination)
@@ -745,7 +745,7 @@ def _verify_frozen_contest(payload: dict[str, object]) -> None:
 def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, object]:
     """Derive lifecycle facts from fixed local research artifacts only."""
 
-    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    policy = ProjectStoragePolicy(repo_root)
     fingerprint = _verified_research_manifest_digest(policy)
     session_completed = _completed_trading_session(now)
     data_refreshed = _fresh_daily_signal_available(policy, now)
@@ -978,7 +978,7 @@ def _create_history_coordinator(
 ) -> HistoricalBackfillCoordinator:
     """Build the fixed-path history runtime without initiating network access."""
 
-    policy = ProjectStoragePolicy(repo_root, required_drive="D:")
+    policy = ProjectStoragePolicy(repo_root)
     maturity = _yaml_mapping(repo_root / "config" / "research_maturity.yaml")
     storage = maturity.get("storage", {})
     if not isinstance(storage, dict):

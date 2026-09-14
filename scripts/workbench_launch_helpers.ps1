@@ -1,5 +1,19 @@
 Set-StrictMode -Version Latest
 
+function Get-QuantPythonPath {
+    param([Parameter(Mandatory = $true)][string]$RepoRoot)
+
+    $developmentPython = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $developmentPython -PathType Leaf) {
+        return $developmentPython
+    }
+    $releasePython = Join-Path $RepoRoot 'runtime\python.exe'
+    if (Test-Path -LiteralPath $releasePython -PathType Leaf) {
+        return $releasePython
+    }
+    throw 'Project Python runtime not found. Run the release installer first.'
+}
+
 function Get-QuantGitRevision {
     param([Parameter(Mandatory = $true)][string]$RepoRoot)
 
@@ -17,11 +31,8 @@ function Get-QuantGitRevision {
 function Get-QuantCodeFingerprint {
     param([Parameter(Mandatory = $true)][string]$RepoRoot)
 
-    $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+    $python = Get-QuantPythonPath -RepoRoot $RepoRoot
     $fingerprintScript = Join-Path $RepoRoot 'scripts\workbench_code_fingerprint.py'
-    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-        throw "Project Python environment not found: $python"
-    }
     if (-not (Test-Path -LiteralPath $fingerprintScript -PathType Leaf)) {
         throw "Code fingerprint script not found: $fingerprintScript"
     }

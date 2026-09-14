@@ -56,7 +56,9 @@ class ProspectiveLedgerStore:
         path: str | os.PathLike[str] | None = None,
         *,
         policy: ProjectStoragePolicy | None = None,
+        recover_incomplete_tail: bool = True,
     ) -> None:
+        self._recover_incomplete_tail = recover_incomplete_tail
         if policy is not None:
             raw_path = path or ".runtime/research/prospective/predictions.jsonl"
             self.policy = policy
@@ -254,7 +256,11 @@ class ProspectiveLedgerStore:
                 OverflowError,
                 AttributeError,
             ) as exc:
-                if index == len(raw_lines) - 1 and not raw_line.endswith((b"\n", b"\r")):
+                if (
+                    self._recover_incomplete_tail
+                    and index == len(raw_lines) - 1
+                    and not raw_line.endswith((b"\n", b"\r"))
+                ):
                     try:
                         with self.path.open("r+b") as handle:
                             handle.truncate(sum(len(item) for item in raw_lines[:index]))

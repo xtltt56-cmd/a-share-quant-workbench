@@ -5,6 +5,7 @@ import pytest
 
 from a_share_quant.research.daily_candidates import (
     DailyDataStaleError,
+    generate_from_data_root,
     generate_official_signals,
     latest_complete_signal_date,
     validate_daily_data_freshness,
@@ -136,3 +137,35 @@ def test_daily_candidates_ignore_stale_but_long_history_symbol_for_common_date()
 
     assert all(signal.signal_date == date(2026, 1, 14) for signal in signals)
     assert stale_symbol not in {signal.symbol for signal in signals}
+
+
+def test_generate_from_data_root_uses_latest_instrument_snapshot_visible_at_cutoff(
+    tmp_path,
+) -> None:
+    bars = _bars()
+    bars_root = tmp_path / "lake" / "daily_bars"
+    instruments_root = tmp_path / "lake" / "instruments"
+    bars_root.mkdir(parents=True)
+    instruments_root.mkdir(parents=True)
+    bars.to_parquet(bars_root / "bars.parquet", index=False)
+
+    symbols = [f"{index:06d}" for index in range(1, 32)]
+    common = {
+        "symbol": symbols,
+        "name": [f"股票{index}" for index in range(1, 32)],
+        "listed_date": [date(2000, 1, 1)] * 31,
+        "is_st": [False] * 31,
+        "is_delisting_risk": [False] * 31,
+        "is_suspended": [False] * 31,
+    }
+    pd.DataFrame({**common, "as_of": [date(2026, 1, 14)] * 31}).to_parquet(
+        instruments_root / "as_of=2026-01-14.parquet", index=False
+    )
+    pd.DataFrame({**common, "as_of": [date(2026, 1, 15)] * 31}).to_parquet(
+        instruments_root / "as_of=2026-01-15.parquet", index=False
+    )
+
+    signals = generate_from_data_root(tmp_path, top_k=5)
+
+    assert len(signals) == 5
+    assert all(signal.signal_date == date(2026, 1, 14) for signal in signals)

@@ -1,4 +1,8 @@
-# A-Share Quant Framework-first
+# A股量化交易工作台
+
+[下载 Windows 最新版](https://github.com/xtltt56-cmd/a-share-quant-workbench/releases/latest) · [简体中文安装说明](README_RELEASE_ZH.md) · [新版审查记录](https://github.com/xtltt56-cmd/a-share-quant-workbench/pull/1)
+
+面向 A 股的本地量化研究、纸面监控和人工决策辅助系统。平台明确展示数据来源、新鲜度和模型前瞻验证状态；不会自动向券商提交真实委托，也不承诺投资收益。
 
 ## Stage 2 progress (2026-08-08)
 
@@ -270,16 +274,16 @@ V1 固定目标：A 股日频数据 → 数据清洗与本地存储 → 股票�
 
 第一阶段实测：AKShare 股票池快照写入 5,539 行；日线通过主端点失败后的 Tencent fallback 写入 `000001` 的 4 行（2026-08-04 至 2026-08-07），DuckDB manifest 为 `valid`；重复运行同一区间为 `updated=0, skipped=1`。本地数据不提交 Git。
 
-## 运行环境
+## 开发环境
 
 - Windows 10/11
 - Python 3.12（项目声明 `>=3.10`；当前开发和 CI 标准为 3.12）
 - Git
 
-## 安装
+## 源码开发安装
 
 ```powershell
-Set-Location 'D:\量化交易'
+Set-Location '<你的项目目录>'
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
@@ -298,6 +302,12 @@ Copy-Item .env.example .env
 ```
 
 `.env` 只保存本机配置和可选 Token，绝不提交 Git。AKShare/BaoStock 默认不需要 Token；Tushare/RQData 必须显式启用。密钥不会写入源码、测试夹具、日志、模型 artifact 或报告。
+
+普通 Windows 用户不需要执行上述开发命令。请从 [GitHub Releases 最新版本](https://github.com/xtltt56-cmd/a-share-quant-workbench/releases/latest) 下载在线版或便携版，并按照 [Windows 安装说明](README_RELEASE_ZH.md) 操作。每个 `v*` 版本标签都会触发干净 Windows 环境中的完整测试和打包；只有通过后才会更新 `releases/latest`。
+
+## 许可证与投资风险
+
+项目代码按 [Apache License 2.0](LICENSE) 发布，第三方组件声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本软件仅用于研究、纸面监控和人工决策辅助，不代替持牌投资顾问。公开免费数据源可能延迟、中断或改变接口；数据过期或质量校验失败时，系统会停止产生新的有效指导。任何真实交易决定与结果均由用户自行承担。
 
 ## 第一阶段命令
 

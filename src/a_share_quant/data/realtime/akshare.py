@@ -317,15 +317,42 @@ class AKShareRealTimeProvider:
         return tuple(quotes)
 
     def get_index_snapshot(self, symbols: list[str] | tuple[str, ...]) -> tuple:
-        if getattr(self._client(), "stock_zh_index_spot_em", None) is None:
-            raise ProviderRequestError("AKShare index snapshot endpoint unavailable")
-        received = datetime.now(timezone.utc)
-        raw = self._call("stock_zh_index_spot_em")
-        quotes = normalize_realtime_quotes(
-            raw, source=self.name, received_at=received, market="INDEX"
-        )
         requested = {normalize_symbol(symbol) for symbol in symbols}
-        return tuple(quote for quote in quotes if quote.symbol in requested)
+        endpoints = tuple(
+            endpoint
+            for endpoint in (
+                "stock_zh_index_spot_em",
+                "stock_zh_index_spot_sina",
+            )
+            if getattr(self._client(), endpoint, None) is not None
+        )
+        if not endpoints:
+            raise ProviderRequestError("AKShare index snapshot endpoint unavailable")
+
+        request_succeeded = False
+        last_error: ProviderRequestError | None = None
+        for endpoint in endpoints:
+            received = datetime.now(timezone.utc)
+            try:
+                raw = self._call(
+                    endpoint,
+                    retry_count=0,
+                    retry_on_timeout=False,
+                )
+            except ProviderRequestError as exc:
+                last_error = exc
+                continue
+            request_succeeded = True
+            quotes = normalize_realtime_quotes(
+                raw, source=self.name, received_at=received, market="INDEX"
+            )
+            selected = tuple(quote for quote in quotes if quote.symbol in requested)
+            if selected or not requested:
+                return selected
+
+        if request_succeeded:
+            return ()
+        raise ProviderRequestError("AKShare index snapshot requests failed") from last_error
 
     def get_minute_bars(
         self,

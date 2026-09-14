@@ -11,7 +11,6 @@ param(
 )
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$pythonPath = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $runtimeDir = Join-Path $repoRoot '.runtime'
 $runtimeTempDir = Join-Path $runtimeDir 'tmp'
 $runtimeCacheDir = Join-Path $runtimeDir 'cache'
@@ -26,6 +25,7 @@ $stdoutPath = Join-Path $repoRoot 'logs\quant_workbench.stdout.log'
 $stderrPath = Join-Path $repoRoot 'logs\quant_workbench.stderr.log'
 
 . $launchHelpersPath
+$pythonPath = Get-QuantPythonPath -RepoRoot $repoRoot
 $requestedMode = if ($Offline) { 'offline' } else { 'network' }
 $requestedGitRevision = Get-QuantGitRevision -RepoRoot $repoRoot
 $requestedCodeFingerprint = Get-QuantCodeFingerprint -RepoRoot $repoRoot
@@ -161,6 +161,7 @@ $workbenchEnvironment = [ordered]@{
     JOBLIB_TEMP_FOLDER = $joblibTempDir
     XDG_CACHE_HOME = $xdgCacheDir
     MPLCONFIGDIR = $matplotlibConfigDir
+    PYTHONPATH = Join-Path $repoRoot 'src'
 }
 $workbenchProcess = Start-QuantWorkbenchProcess `
     -FilePath $pythonPath `

@@ -58,3 +58,5 @@ mlruns/
 *.swp
 Thumbs.db
 desktop.ini
+.playwright-cli/
+output/playwright/

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,23 @@ def test_identity_requires_this_repository_workbench() -> None:
     )
 
 
+def test_python_resolution_prefers_development_and_supports_release_runtime(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    development = root / ".venv" / "Scripts" / "python.exe"
+    release = root / "runtime" / "python.exe"
+    development.parent.mkdir(parents=True)
+    release.parent.mkdir(parents=True)
+    development.write_bytes(b"development")
+    release.write_bytes(b"release")
+    escaped = str(root).replace("'", "''")
+
+    assert _powershell(f"Get-QuantPythonPath -RepoRoot '{escaped}'") == str(development)
+    development.unlink()
+    assert _powershell(f"Get-QuantPythonPath -RepoRoot '{escaped}'") == str(release)
+
+
 def test_fingerprint_is_stable_and_metadata_round_trips(tmp_path: Path) -> None:
     root = str(ROOT).replace("'", "''")
     first = _powershell(f"Get-QuantCodeFingerprint -RepoRoot '{root}'")
@@ -141,3 +159,37 @@ def test_fingerprint_is_identical_across_supported_powershell_hosts() -> None:
     modern = _shell("pwsh.exe", expression)
 
     assert legacy == modern
+
+
+def test_fingerprint_changes_when_frontend_asset_changes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    static_dir = repo / "src" / "package" / "static"
+    static_dir.mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    stylesheet = static_dir / "workbench.css"
+    stylesheet.write_text(":root { color: #111; }\n", encoding="utf-8")
+
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "workbench_code_fingerprint.py"),
+        str(repo),
+    ]
+    first = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+    stylesheet.write_text(":root { color: #222; }\n", encoding="utf-8")
+    second = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+
+    assert first.startswith("sha256:")
+    assert second.startswith("sha256:")
+    assert first != second

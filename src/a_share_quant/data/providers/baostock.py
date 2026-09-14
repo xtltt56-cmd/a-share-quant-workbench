@@ -30,7 +30,9 @@ class BaoStockDataProvider:
     """
 
     name = "baostock"
-    _daily_fields = "date,code,open,high,low,close,volume,amount,pctChg"
+    _daily_fields = (
+        "date,code,open,high,low,close,volume,amount,pctChg,tradestatus"
+    )
     _research_fields = (
         "date,code,open,high,low,close,volume,amount,tradestatus,isST"
     )
@@ -425,6 +427,13 @@ class BaoStockDataProvider:
             raise ProviderRequestError(
                 "BaoStock request failed: query_history_k_data_plus"
             ) from exc
+        trade_status_column = _find_column(
+            raw, ("tradestatus", "tradeStatus", "trade_status")
+        )
+        if trade_status_column is not None:
+            raw = raw.loc[
+                raw[trade_status_column].astype(str).str.strip().eq("1")
+            ].copy()
         return normalize_daily_bars(
             raw,
             symbol=normalized,

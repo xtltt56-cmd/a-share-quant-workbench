@@ -221,13 +221,49 @@ def generate_from_data_root(
     frames = [pd.read_parquet(path) for path in paths]
     frame = pd.concat(frames, ignore_index=True)
     instrument_paths = sorted((root / "lake" / "instruments").glob("*.parquet"))
-    instruments = pd.read_parquet(instrument_paths[-1]) if instrument_paths else None
+    instruments = None
+    if instrument_paths:
+        bar_dates = pd.to_datetime(frame["date"], errors="raise")
+        instruments = _latest_visible_instrument_snapshot(
+            instrument_paths,
+            cutoff=bar_dates.max().date(),
+        )
     return generate_official_signals(
         frame,
         benchmark=benchmark,
         instruments=instruments,
         **kwargs,
     )
+
+
+def _latest_visible_instrument_snapshot(
+    paths: list[Path],
+    *,
+    cutoff: date,
+) -> pd.DataFrame:
+    """Load the newest complete snapshot that was visible by ``cutoff``."""
+
+    candidates: list[tuple[pd.Timestamp, str, pd.DataFrame]] = []
+    for path in paths:
+        snapshot = pd.read_parquet(path)
+        as_of_column = next(
+            (name for name in ("as_of", "snapshot_date") if name in snapshot.columns),
+            None,
+        )
+        if snapshot.empty or as_of_column is None:
+            continue
+        as_of = pd.to_datetime(snapshot[as_of_column], errors="coerce")
+        visible = as_of.notna() & as_of.dt.date.le(cutoff)
+        if not visible.any():
+            continue
+        visible_snapshot = snapshot.loc[visible].copy()
+        candidates.append((as_of.loc[visible].max(), str(path), visible_snapshot))
+
+    if not candidates:
+        raise ValueError(
+            f"no instrument snapshot is visible at daily-bar cutoff {cutoff.isoformat()}"
+        )
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def validate_daily_data_freshness(

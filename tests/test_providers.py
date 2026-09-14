@@ -106,6 +106,80 @@ def test_akshare_provider_falls_back_to_tencent_daily_endpoint(
     assert calls[1][1]["symbol"] == "sz000001"
 
 
+def test_akshare_tencent_fallback_converts_000_series_lots_to_shares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stock_zh_a_hist(**kwargs: str) -> pd.DataFrame:
+        raise ConnectionError("eastmoney endpoint unavailable")
+
+    def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "date": "2026-09-11",
+                    "open": 11.82,
+                    "close": 11.74,
+                    "high": 11.86,
+                    "low": 11.71,
+                    "volume": 832_461,
+                    "amount": 979_990_600,
+                }
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zh_a_hist=stock_zh_a_hist,
+            stock_zh_a_hist_tx=stock_zh_a_hist_tx,
+        ),
+    )
+
+    result = AKShareDataProvider(adjust="", retry_count=0, delay_seconds=0).get_daily_bars(
+        "000001", start_date="2026-09-11", end_date="2026-09-11"
+    )
+
+    assert result.loc[0, "volume"] == pytest.approx(83_246_100)
+
+
+def test_akshare_tencent_fallback_does_not_multiply_normalized_volume_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stock_zh_a_hist(**kwargs: str) -> pd.DataFrame:
+        raise ConnectionError("eastmoney endpoint unavailable")
+
+    def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "date": "2026-09-11",
+                    "open": 11.82,
+                    "close": 11.74,
+                    "high": 11.86,
+                    "low": 11.71,
+                    "volume": 83_246_100,
+                    "amount": 979_990_600,
+                }
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zh_a_hist=stock_zh_a_hist,
+            stock_zh_a_hist_tx=stock_zh_a_hist_tx,
+        ),
+    )
+
+    result = AKShareDataProvider(adjust="", retry_count=0, delay_seconds=0).get_daily_bars(
+        "000001", start_date="2026-09-11", end_date="2026-09-11"
+    )
+
+    assert result.loc[0, "volume"] == pytest.approx(83_246_100)
+
+
 def test_akshare_provider_normalizes_index_daily_bars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

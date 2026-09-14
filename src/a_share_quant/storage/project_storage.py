@@ -45,7 +45,7 @@ class ProjectStoragePolicy:
     def __init__(
         self,
         repo_root: str | os.PathLike[str],
-        required_drive: str | None = "D:",
+        required_drive: str | None = None,
     ) -> None:
         try:
             resolved_root = Path(repo_root).resolve(strict=True)
@@ -57,7 +57,7 @@ class ProjectStoragePolicy:
             resolved_root.drive.casefold() != required_drive.casefold()
         ):
             drive_label = required_drive.rstrip(":")
-            raise StorageBoundaryError(f"生产项目目录必须位于{drive_label}盘")
+            raise StorageBoundaryError(f"项目目录必须位于{drive_label}盘")
         self.repo_root = resolved_root
 
     def authorize(self, value: str | os.PathLike[str]) -> Path:

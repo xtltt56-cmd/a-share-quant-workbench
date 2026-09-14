@@ -59,8 +59,32 @@ def _fake_baostock(*, daily_error: bool = False) -> types.SimpleNamespace:
         if daily_error:
             return _FakeResult([], [], error_code="10001001")
         return _FakeResult(
-            ["date", "code", "open", "high", "low", "close", "volume", "amount", "pctChg"],
-            [["2026-08-08", "sh.600000", "10", "10.8", "9.9", "10.5", "100", "1000", "1.2"]],
+            [
+                "date",
+                "code",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "pctChg",
+                "tradestatus",
+            ],
+            [
+                [
+                    "2026-08-08",
+                    "sh.600000",
+                    "10",
+                    "10.8",
+                    "9.9",
+                    "10.5",
+                    "100",
+                    "1000",
+                    "1.2",
+                    "1",
+                ]
+            ],
         )
 
     module.login = login
@@ -148,6 +172,65 @@ def test_baostock_provider_maps_csi300_to_sh_index_code(
 
     assert daily.loc[0, "symbol"] == "000300"
     assert fake.daily_calls[0]["code"] == "sh.000300"
+
+
+def test_baostock_provider_excludes_suspended_daily_rows_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_baostock()
+
+    def query_history_k_data_plus(**kwargs: str) -> _FakeResult:
+        fake.daily_calls.append(kwargs)
+        return _FakeResult(
+            [
+                "date",
+                "code",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "pctChg",
+                "tradestatus",
+            ],
+            [
+                [
+                    "2026-08-07",
+                    "sh.600000",
+                    "10",
+                    "10",
+                    "10",
+                    "10",
+                    "",
+                    "",
+                    "",
+                    "0",
+                ],
+                [
+                    "2026-08-08",
+                    "sh.600000",
+                    "10",
+                    "10.8",
+                    "9.9",
+                    "10.5",
+                    "100",
+                    "1000",
+                    "1.2",
+                    "1",
+                ],
+            ],
+        )
+
+    fake.query_history_k_data_plus = query_history_k_data_plus
+    monkeypatch.setitem(sys.modules, "baostock", fake)
+
+    daily = BaoStockDataProvider().get_daily_bars(
+        "600000", "2026-08-07", "2026-08-08"
+    )
+
+    assert daily["date"].astype(str).tolist() == ["2026-08-08"]
+    assert "tradestatus" in fake.daily_calls[0]["fields"]
 
 
 def test_baostock_provider_requires_optional_dependency(monkeypatch: pytest.MonkeyPatch) -> None:

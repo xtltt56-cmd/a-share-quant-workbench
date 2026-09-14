@@ -104,6 +104,7 @@ class AKShareDataProvider:
                     adjust=self.adjust,
                     timeout=self.timeout_seconds,
                 )
+                raw = _normalize_tencent_stock_volume(raw, symbol=primary_symbol)
             except ProviderRequestError as fallback_error:
                 raise ProviderRequestError(
                     "AKShare daily history unavailable from primary and fallback endpoints"
@@ -136,6 +137,36 @@ class AKShareDataProvider:
                 end_date=_format_akshare_date(end_date),
             )
         return normalize_daily_bars(raw, symbol=primary_symbol, source=self.name)
+
+
+def _normalize_tencent_stock_volume(raw: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Correct Tencent fallback rows that expose Shenzhen 000 volume in lots.
+
+    AKShare 1.18.83 treats every ``sz000`` identifier as if it were an index and
+    skips its normal lot-to-share conversion.  Ordinary 000-series A shares are
+    therefore 100 times too small while Shanghai rows are already expressed in
+    shares.  The amount/volume/close ratio keeps this adapter compatible if an
+    upstream release fixes the conversion: already-normalized rows are left
+    unchanged instead of being multiplied twice.
+    """
+
+    if not symbol.startswith("000") or raw.empty:
+        return raw
+    required = {"close", "volume", "amount"}
+    if not required.issubset(raw.columns):
+        return raw
+    close = pd.to_numeric(raw["close"], errors="coerce")
+    volume = pd.to_numeric(raw["volume"], errors="coerce")
+    amount = pd.to_numeric(raw["amount"], errors="coerce")
+    valid = close.gt(0) & volume.gt(0) & amount.gt(0)
+    if not valid.any():
+        return raw
+    notional_per_reported_share = (amount[valid] / (volume[valid] * close[valid])).median()
+    if pd.isna(notional_per_reported_share) or notional_per_reported_share < 20:
+        return raw
+    result = raw.copy()
+    result["volume"] = volume * 100
+    return result
 
 
 def _format_akshare_date(value: date | str) -> str:
