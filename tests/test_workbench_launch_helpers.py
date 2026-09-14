@@ -113,6 +113,23 @@ def test_identity_requires_this_repository_workbench() -> None:
     )
 
 
+def test_python_resolution_prefers_development_and_supports_release_runtime(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    development = root / ".venv" / "Scripts" / "python.exe"
+    release = root / "runtime" / "python.exe"
+    development.parent.mkdir(parents=True)
+    release.parent.mkdir(parents=True)
+    development.write_bytes(b"development")
+    release.write_bytes(b"release")
+    escaped = str(root).replace("'", "''")
+
+    assert _powershell(f"Get-QuantPythonPath -RepoRoot '{escaped}'") == str(development)
+    development.unlink()
+    assert _powershell(f"Get-QuantPythonPath -RepoRoot '{escaped}'") == str(release)
+
+
 def test_fingerprint_is_stable_and_metadata_round_trips(tmp_path: Path) -> None:
     root = str(ROOT).replace("'", "''")
     first = _powershell(f"Get-QuantCodeFingerprint -RepoRoot '{root}'")

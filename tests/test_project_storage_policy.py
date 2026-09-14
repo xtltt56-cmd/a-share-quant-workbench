@@ -162,13 +162,15 @@ def test_authorize_rejects_external_drive_and_traversal_paths(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows drive policy")
-def test_production_policy_requires_d_drive(project_temp: Path) -> None:
+def test_default_policy_is_portable_and_explicit_drive_remains_enforced(
+    project_temp: Path,
+) -> None:
     repo = project_temp / "repo"
     repo.mkdir()
 
-    assert ProjectStoragePolicy(repo).repo_root.drive.casefold() == "d:"
+    assert ProjectStoragePolicy(repo).repo_root == repo.resolve(strict=True)
     with pytest.raises(StorageBoundaryError, match="D盘"):
-        ProjectStoragePolicy(Path("C:/"))
+        ProjectStoragePolicy(Path("C:/"), required_drive="D:")
 
 
 def test_child_environment_is_project_local_and_does_not_mutate_inputs(

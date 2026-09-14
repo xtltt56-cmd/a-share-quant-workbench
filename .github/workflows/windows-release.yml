@@ -1,0 +1,82 @@
+name: Windows release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build without publishing, for example 0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Resolve and verify version
+        id: version
+        shell: pwsh
+        run: |
+          $projectVersion = python -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])"
+          $requestedVersion = if ('${{ github.event_name }}' -eq 'push') { '${{ github.ref_name }}'.TrimStart('v') } else { '${{ inputs.version }}' }
+          if ($requestedVersion -ne $projectVersion) {
+            throw "Version mismatch: requested=$requestedVersion pyproject=$projectVersion"
+          }
+          "value=$projectVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Create project virtual environment
+        run: python -m venv .venv
+      - name: Install locked test environment
+        run: >-
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free]" lightgbm scikit-learn
+          -c constraints/runtime-py312.txt
+      - name: Verify, lint, and test
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pip check
+          .\.venv\Scripts\python.exe -m ruff check .
+          .\.venv\Scripts\python.exe -m pytest -q
+
+      - name: Build online and portable Windows packages
+        shell: pwsh
+        run: >-
+          .\scripts\build_windows_release.ps1
+          -Version '${{ steps.version.outputs.value }}'
+          -OutputDirectory '${{ github.workspace }}\release-artifacts'
+          -Flavor Both
+
+      - name: Upload verified build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: a-share-quant-workbench-${{ steps.version.outputs.value }}-windows-x64
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' release-artifacts/* `
+            --repo '${{ github.repository }}' `
+            --verify-tag `
+            --title "A股量化交易工作台 ${{ github.ref_name }} 公开预览版" `
+            --notes-file docs/RELEASE_NOTES_ZH.md `
+            --latest

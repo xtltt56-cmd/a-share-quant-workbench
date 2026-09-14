@@ -1,0 +1,15 @@
+# Windows x64 runtime dependencies for the public distribution.
+# Keep this file synchronized with the tested runtime constraints.
+akshare==1.18.83
+baostock==0.9.3
+duckdb==1.5.5
+lightgbm==4.7.0
+numpy==2.5.1
+openpyxl==3.1.5
+pandas==2.3.3
+pyarrow==23.0.1
+pydantic-settings==2.15.0
+python-dotenv==1.2.2
+PyYAML==6.0.3
+scikit-learn==1.9.0
+xlrd==2.0.2
