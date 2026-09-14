@@ -584,13 +584,14 @@ def _rollover_needed(
     policy: ProjectStoragePolicy,
     existing: dict[str, object],
 ) -> bool:
-    """Detect a new model bundle before any prediction is recorded.
+    """Detect a new model bundle without mutating append-only predictions.
 
-    An immutable contest remains the active baseline while it has predictions.
-    If code/data provenance changed before the first prediction, archive that
-    empty baseline and create a fresh contest for the current verified model.
-    Daily signal digest changes alone are intentionally not a rollover: they
-    are handled as forward sessions by the research worker.
+    The active contest is a pointer to the model accepting *new* predictions;
+    it is not ownership of old ledger rows.  A changed bundle therefore rolls
+    the pointer forward even when the old contest already has observations.
+    The old frozen contest is archived and its predictions remain available to
+    the version-agnostic settlement worker.  Daily signal digest changes alone
+    are forward sessions and intentionally do not trigger a rollover.
     """
 
     try:
@@ -598,20 +599,7 @@ def _rollover_needed(
         previous_bundle = str(existing.get("model_bundle_digest", "")).strip()
         if not current_bundle or current_bundle == previous_bundle:
             return False
-        from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
-
-        ledger = ProspectiveLedgerStore(policy=policy)
-        model_id = str(existing.get("model_id", ""))
-        model_version = str(existing.get("model_version", ""))
-        config_hash = str(existing.get("config_hash", ""))
-        snapshot_hash = str(existing.get("training_snapshot_hash", ""))
-        return not any(
-            prediction.model_id == model_id
-            and prediction.model_version == model_version
-            and prediction.config_hash == config_hash
-            and prediction.training_snapshot_hash == snapshot_hash
-            for prediction in ledger.predictions()
-        )
+        return True
     except Exception:
         # A missing/invalid current signal must never mutate an immutable
         # contest; the normal registration path will report the real blocker.
@@ -635,7 +623,7 @@ def _archive_frozen_contest(
     destination: Path,
     existing: dict[str, object],
 ) -> None:
-    """Move an empty superseded contest to a recoverable D-drive archive."""
+    """Move a superseded contest to a recoverable project-local archive."""
 
     raw = destination.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
@@ -751,6 +739,16 @@ def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, obj
     data_refreshed = _fresh_daily_signal_available(policy, now)
     outcome_cutoff = None
     contest_path = policy.authorize(".runtime/research/prospective-contest.json")
+    if data_refreshed:
+        # Keep the active contest aligned with the verified model bundle.  A
+        # rollover archives only the frozen contest descriptor; predictions
+        # stay in the append-only ledger and continue through settlement.
+        try:
+            _freeze_contest(repo_root)
+        except (OSError, SystemExit, ValueError):
+            # Research remains fail-closed while the dashboard continues to
+            # serve its independently validated paper-monitoring state.
+            pass
     # A frozen model is not itself a forecast input.  The supervisor receives
     # a predict window only after this session's verified official daily
     # artifact is present, so a BLOCKED pre-refresh child cannot consume the
@@ -802,10 +800,25 @@ def _derived_model_registration(
     if any(signal.model_bundle_digest != bundle_digest for signal in signals):
         raise SystemExit("官方日选与当前模型包摘要不一致，不能开始未来竞赛")
     registration["model_bundle_digest"] = bundle_digest
-    snapshot_hash = _verified_research_manifest_digest(policy)
-    if snapshot_hash is None:
-        raise SystemExit("模型登记训练快照未通过D盘研究数据校验")
-    registration["training_snapshot_hash"] = snapshot_hash
+    # The production candidate is a deterministic rule ranking and has no
+    # fitted training state.  Binding its registration to the mutable history
+    # manifest caused an unnecessary new contest after every data refresh.
+    # Freeze an explicit no-training declaration with the executable bundle
+    # instead; each prediction separately binds its exact input artifact.
+    training_declaration = {
+        "kind": "DETERMINISTIC_RULE_NO_FITTED_STATE",
+        "model_id": registration["model_id"],
+        "model_version": registration["model_version"],
+        "model_bundle_digest": bundle_digest,
+    }
+    registration["training_snapshot_hash"] = hashlib.sha256(
+        json.dumps(
+            training_declaration,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return registration
 
 

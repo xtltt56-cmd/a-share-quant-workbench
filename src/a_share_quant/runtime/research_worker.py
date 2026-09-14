@@ -406,7 +406,10 @@ def _run_predict(
     ):
         raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
     now = _current_time()
-    cycle_key = str(context.get("cycle_key") or _worker_instance_id("predict") or "").strip()
+    # Prediction identity is derived from the immutable daily evidence, not
+    # from the supervisor process/job id.  A restart or a changed research
+    # manifest must not register the same daily forecast twice.
+    cycle_key = _prediction_cycle_key(signals, str(context["daily_signal_digest"]))
     try:
         competition = ProspectiveCompetition(
             store=ProspectiveLedgerStore(policy=policy),
@@ -487,14 +490,12 @@ def _run_settle(
     )
     from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
-    contest = _contest_from_payload(context.get("contest"))
     outcomes = context.get("outcomes")
     if not isinstance(outcomes, tuple) or not outcomes:
         raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
     try:
         competition = ProspectiveCompetition(
             store=ProspectiveLedgerStore(policy=policy),
-            contest=contest,
             now=_current_time(),
         )
         results = competition.settle(outcomes)
@@ -821,6 +822,22 @@ def _stable_prediction_id(
     return f"prediction-{hashlib.sha256(_canonical_json(payload)).hexdigest()[:32]}"
 
 
+def _prediction_cycle_key(signals: tuple[Any, ...], source_input_digest: str) -> str:
+    """Build one stable cycle identity for one verified daily signal artifact."""
+
+    if not signals or not _is_sha256(source_input_digest):
+        raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
+    signal_dates = {
+        signal.signal_date
+        for signal in signals
+        if isinstance(getattr(signal, "signal_date", None), date)
+    }
+    if len(signal_dates) != 1:
+        raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
+    signal_date = next(iter(signal_dates))
+    return f"predict-{signal_date:%Y%m%d}-{source_input_digest[:24]}"
+
+
 def _derive_settle_context(
     policy: ProjectStoragePolicy, contest: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -828,7 +845,9 @@ def _derive_settle_context(
 
     from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
-    frozen = _contest_from_payload(contest)
+    # Validate the active descriptor, but do not use it to filter old rows.
+    # Archived contests must keep settling after a new model becomes active.
+    _contest_from_payload(contest)
     now = _current_time()
     ledger = ProspectiveLedgerStore(policy=policy)
     settled = {item.prediction_id for item in ledger.settlements()}
@@ -837,18 +856,6 @@ def _derive_settle_context(
         for prediction in ledger.predictions()
         if prediction.id not in settled
         and prediction.maturity_date <= now.date()
-        and (
-            prediction.model_id,
-            prediction.model_version,
-            prediction.config_hash,
-            prediction.training_snapshot_hash,
-        )
-        == (
-            frozen.model_id,
-            frozen.model_version,
-            frozen.config_hash,
-            frozen.training_snapshot_hash,
-        )
     )
     if not due:
         raise _Blocked("NO_MATURED_PREDICTIONS")
@@ -861,17 +868,41 @@ def _derive_settle_context(
 
 
 def _derived_outcome(policy: ProjectStoragePolicy, prediction: Any, now: datetime) -> Any:
-    """Read one mature actual price from a verified immutable return artifact."""
+    """Read one mature actual price from verified post-prediction evidence.
+
+    The small canonical daily lake is checked first because it is the normal
+    production refresh path.  A verified research-return artifact remains a
+    fallback when the lake does not contain the maturity session.  Both paths
+    are schema-checked and hashed before their digest is appended to the
+    immutable prospective ledger.
+    """
+
+    try:
+        return _derived_market_lake_outcome(policy, prediction, now)
+    except _Blocked:
+        return _derived_research_outcome(policy, prediction, now)
+
+
+def _derived_research_outcome(
+    policy: ProjectStoragePolicy, prediction: Any, now: datetime
+) -> Any:
+    """Fallback to a verified immutable research-return artifact."""
 
     import pandas as pd
 
-    from a_share_quant.research.prospective_competition import OutcomeObservation
     from a_share_quant.storage.research_data_store import ResearchDataset, ResearchDataStore
 
     try:
         store = ResearchDataStore(policy)
-        artifact = store.active_artifact(ResearchDataset.RESEARCH_RETURNS, prediction.symbol)
-        if not store.verify(artifact) or artifact.created_at < prediction.prediction_at:
+        try:
+            artifact = store.active_artifact(
+                ResearchDataset.RESEARCH_RETURNS, prediction.symbol
+            )
+        except KeyError:
+            raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+        if not store.verify(artifact):
+            raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
+        if artifact.created_at < prediction.prediction_at:
             raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
         policy.revalidate(artifact.path)
         frame = pd.read_parquet(artifact.path)
@@ -894,25 +925,153 @@ def _derived_outcome(policy: ProjectStoragePolicy, prediction: Any, now: datetim
             or str(row["trade_status"]).strip() != "1"
         ):
             raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
-        return OutcomeObservation(
-            prediction_id=prediction.id,
-            symbol=prediction.symbol,
-            maturity_date=prediction.maturity_date,
-            outcome_at=now,
-            realized_price=price,
-            realized_return=price / reference - 1.0,
+        return _outcome_observation(
+            prediction,
+            now,
+            price=price,
             data_version=artifact.data_version,
             data_sha256=artifact.sha256,
-            status="OK",
-            fresh=True,
-            complete=True,
-            session_aligned=True,
-            corporate_action_ok=True,
         )
     except _Blocked:
         raise
     except Exception:
         raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+
+
+def _derived_market_lake_outcome(
+    policy: ProjectStoragePolicy, prediction: Any, now: datetime
+) -> Any:
+    """Derive one outcome from a stable, canonical daily Parquet snapshot."""
+
+    import pandas as pd
+
+    path = policy.authorize(f"data/lake/daily_bars/{prediction.symbol}.parquet")
+    try:
+        policy.revalidate(path)
+        raw = path.read_bytes()
+        if not raw or len(raw) > _MAX_INTEGRITY_ARTIFACT_BYTES:
+            raise ValueError("daily outcome artifact is outside the bounded size")
+        digest = hashlib.sha256(raw).hexdigest()
+        frame = pd.read_parquet(path)
+        policy.revalidate(path)
+        if (
+            path.stat().st_size != len(raw)
+            or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+        ):
+            raise ValueError("daily outcome artifact changed while reading")
+        required = {
+            "symbol",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "source",
+            "fetched_at",
+            "data_version",
+        }
+        if not required.issubset(frame.columns):
+            raise ValueError("daily outcome schema is incomplete")
+        parsed_dates = pd.to_datetime(frame["date"], errors="raise").dt.date
+        rows = frame.loc[parsed_dates == prediction.maturity_date].copy()
+        if len(rows) != 1:
+            raise ValueError("daily outcome session is not uniquely available")
+        row = rows.iloc[0]
+        if str(row["symbol"]).strip() != prediction.symbol:
+            raise ValueError("daily outcome symbol does not match")
+        source = str(row["source"]).strip().casefold()
+        data_version = str(row["data_version"]).strip()
+        if (
+            not source
+            or source in {"fixture", "replay", "synthetic", "test", "test-data"}
+            or not data_version
+        ):
+            raise ValueError("daily outcome provenance is not usable")
+        fetched_at = pd.to_datetime(row["fetched_at"], utc=True, errors="raise").to_pydatetime()
+        if fetched_at > now or fetched_at.date() < prediction.maturity_date:
+            raise ValueError("daily outcome fetch time is invalid")
+        prices = tuple(float(row[field]) for field in ("open", "high", "low", "close"))
+        open_price, high, low, close = prices
+        if (
+            any(not value > 0 for value in prices)
+            or high < max(open_price, close)
+            or low > min(open_price, close)
+            or float(row["volume"]) < 0
+            or float(row["amount"]) < 0
+        ):
+            raise ValueError("daily outcome values are invalid")
+        # BaoStock supplies exchange daily percentage changes.  Across a
+        # corporate action the compounded exchange return and the raw close
+        # ratio diverge; accepting the latter would score a mechanical
+        # ex-right adjustment as model performance.  Require all horizon
+        # sessions and agreement within rounding tolerance before asserting
+        # ``corporate_action_ok``.
+        horizon_rows = frame.loc[
+            (parsed_dates > prediction.as_of)
+            & (parsed_dates <= prediction.maturity_date)
+        ].sort_values("date")
+        changes = pd.to_numeric(horizon_rows["change_pct"], errors="coerce")
+        if (
+            len(horizon_rows) != int(prediction.horizon)
+            or changes.isna().any()
+            or (changes <= -100.0).any()
+            or (changes > 100.0).any()
+        ):
+            raise ValueError("daily outcome adjustment evidence is incomplete")
+        compounded_return = float((1.0 + changes / 100.0).prod() - 1.0)
+        reference = float(prediction.guidance_price_bands["reference"][0])
+        raw_return = close / reference - 1.0
+        if abs(compounded_return - raw_return) > 0.001:
+            raise ValueError("daily outcome contains a corporate action conflict")
+        return _outcome_observation(
+            prediction,
+            now,
+            price=close,
+            data_version=f"market-lake:{data_version}",
+            data_sha256=digest,
+            realized_return=compounded_return,
+        )
+    except _Blocked:
+        raise
+    except Exception:
+        raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+
+
+def _outcome_observation(
+    prediction: Any,
+    now: datetime,
+    *,
+    price: float,
+    data_version: str,
+    data_sha256: str,
+    realized_return: float | None = None,
+) -> Any:
+    from a_share_quant.research.prospective_competition import OutcomeObservation
+
+    reference = float(prediction.guidance_price_bands["reference"][0])
+    if not price > 0 or not reference > 0:
+        raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
+    return OutcomeObservation(
+        prediction_id=prediction.id,
+        symbol=prediction.symbol,
+        maturity_date=prediction.maturity_date,
+        outcome_at=now,
+        realized_price=price,
+        realized_return=(
+            price / reference - 1.0
+            if realized_return is None
+            else float(realized_return)
+        ),
+        data_version=data_version,
+        data_sha256=data_sha256,
+        status="OK",
+        fresh=True,
+        complete=True,
+        session_aligned=True,
+        corporate_action_ok=True,
+    )
 
 
 def _verified_official_signals(

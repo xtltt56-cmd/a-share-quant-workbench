@@ -434,6 +434,7 @@ class BaoStockDataProvider:
             raw = raw.loc[
                 raw[trade_status_column].astype(str).str.strip().eq("1")
             ].copy()
+        raw = raw.rename(columns={"pctChg": "change_pct"})
         return normalize_daily_bars(
             raw,
             symbol=normalized,
