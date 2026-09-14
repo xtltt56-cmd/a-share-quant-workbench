@@ -56,6 +56,10 @@ def test_release_builder_does_not_package_private_runtime_data() -> None:
     for required in ("'src'", "'scripts'", "'config'", "'LICENSE'"):
         assert required in payload
 
+    assert "$installParameters = @{" in builder
+    assert "@installParameters" in builder
+    assert "$installArguments" not in builder
+
 
 def test_release_workflow_publishes_only_versioned_tags_after_tests() -> None:
     workflow = (ROOT / ".github" / "workflows" / "windows-release.yml").read_text(
