@@ -14,12 +14,18 @@ from a_share_quant.advisory.price_overlay import PriceGuidanceOverlay
 from a_share_quant.analysis.breadth import calculate_market_breadth
 from a_share_quant.contracts.realtime import DataQualityStatus, RealTimeQuote
 from a_share_quant.contracts.realtime_overlay import RealtimeOverlay
+from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.data.realtime.base import RealTimeDataProvider
 from a_share_quant.data.realtime.cache import CachedQuoteSnapshot, RealtimeQuoteCache
 from a_share_quant.data.realtime.registry import (
     FailoverRealTimeProvider,
     ProviderRegistry,
     build_default_registry,
+)
+from a_share_quant.intelligence.contracts import (
+    EventRiskLevel,
+    PublicRiskAssessment,
+    PublicRiskSnapshot,
 )
 from a_share_quant.runtime.realtime_telemetry import LiveDataQualityGate, ProviderTelemetry
 from a_share_quant.runtime.scheduler import (
@@ -74,6 +80,20 @@ class WorkbenchState:
     daily_data_cutoff: str | None = None
     daily_generated_at: str | None = None
     price_guidance_plans: list[dict[str, Any]] = field(default_factory=list)
+    public_risk_health: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "NOT_CONFIGURED",
+            "source": "CNINFO",
+            "notice_zh": "公告风险检查尚未配置。",
+            "fetched_at": None,
+            "window_start": None,
+            "window_end": None,
+            "checked_count": 0,
+            "review_count": 0,
+            "blocked_count": 0,
+            "unknown_count": 0,
+        }
+    )
     paper_only: bool = True
     live_trading_enabled: bool = False
 
@@ -97,6 +117,8 @@ class WorkbenchService:
         quote_cache: RealtimeQuoteCache | None = None,
         official_signal_store: OfficialSignalStore | None = None,
         price_guidance_store: PriceGuidanceStore | None = None,
+        public_risk_snapshot: PublicRiskSnapshot | None = None,
+        public_risk_required: bool = False,
         realtime_overlay_store: RealtimeOverlayStore | None = None,
         symbols: Sequence[str] = (),
         priority_symbols: Sequence[str] = (),
@@ -115,6 +137,23 @@ class WorkbenchService:
         self.official_signal_store = official_signal_store or OfficialSignalStore()
         self.price_guidance_store = price_guidance_store
         self.price_guidance_overlay = PriceGuidanceOverlay()
+        self._public_risk_required = bool(public_risk_required)
+        self._public_risk_snapshot = public_risk_snapshot
+        self._public_risk_status = (
+            public_risk_snapshot.status
+            if public_risk_snapshot is not None
+            else "WAITING"
+            if self._public_risk_required
+            else "NOT_CONFIGURED"
+        )
+        self._public_risk_notice = (
+            public_risk_snapshot.notice_zh
+            if public_risk_snapshot is not None
+            else "正在等待首次公告风险检查。"
+            if self._public_risk_required
+            else "公告风险检查尚未配置。"
+        )
+        self._public_risk_refresh_request: Callable[[], None] | None = None
         self.realtime_overlay_store = realtime_overlay_store or RealtimeOverlayStore()
         self.registry = registry
         self.allow_network = allow_network
@@ -127,6 +166,7 @@ class WorkbenchService:
         self.telemetry = ProviderTelemetry(max_latency_samples=telemetry_latency_samples)
         self._last_switch_event_count = 0
         self.state = WorkbenchState()
+        self._set_public_risk_health()
         self._state_lock = threading.RLock()
         # Serialize provider polls without holding the state lock.  HTTP
         # readers must remain responsive while a public endpoint is slow.
@@ -345,6 +385,63 @@ class WorkbenchService:
                 self.scheduler.priority_symbols = self._priority_symbols
                 self.scheduler.expected_symbols = self._priority_symbols
             self._apply_stored_signal_state(now=self.clock())
+        if self._public_risk_refresh_request is not None:
+            self._public_risk_refresh_request()
+
+    def set_public_risk_refresh_request(self, request: Callable[[], None] | None) -> None:
+        self._public_risk_refresh_request = request
+
+    def public_risk_symbols(self) -> tuple[str, ...]:
+        """Return the current candidates and account symbols for low-frequency checks."""
+
+        with self._state_lock:
+            return tuple(
+                dict.fromkeys(
+                    (
+                        *self._requested_priority_symbols,
+                        *(signal.symbol for signal in self.official_signal_store.latest()),
+                    )
+                )
+            )
+
+    def publish_public_risk(
+        self,
+        snapshot: PublicRiskSnapshot | None,
+        status: str,
+        notice_zh: str,
+    ) -> None:
+        """Publish one coherent, metadata-only public-event risk view."""
+
+        with self._state_lock:
+            if snapshot is not None:
+                self._public_risk_snapshot = snapshot
+            self._public_risk_status = str(status).strip().upper()
+            self._public_risk_notice = str(notice_zh).strip()
+            self._set_public_risk_health()
+            guidance = self._guidance_plans_by_symbol()
+            self.state.official_daily_candidates = [
+                _official_signal_payload(
+                    signal,
+                    now=self.clock(),
+                    price_guidance=guidance.get(signal.symbol),
+                    event_risk=self._risk_assessment(signal.symbol),
+                )
+                for signal in self.official_signal_store.latest()
+            ]
+            self.state.intraday_monitor = [
+                _apply_event_risk_to_monitor_payload(
+                    row,
+                    self._risk_assessment(str(row.get("symbol", ""))),
+                )
+                for row in self.state.intraday_monitor
+            ]
+
+    def public_risk_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Return sanitized public risk evidence for the advisory composition layer."""
+
+        with self._state_lock:
+            assessment = self._risk_assessment(symbol)
+            return assessment.to_dict() if assessment is not None else None
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -577,6 +674,9 @@ class WorkbenchService:
             monitor_rows[-1]["price_guidance"] = self._quote_guidance_payload(
                 guidance_plans.get(quote.symbol), quote=quote, data_quality=quote_quality, now=now
             )
+            monitor_rows[-1] = _apply_event_risk_to_monitor_payload(
+                monitor_rows[-1], self._risk_assessment(quote.symbol)
+            )
             overlays.append(overlay)
         self.realtime_overlay_store.put_overlays(overlays)
         self.state.intraday_monitor = monitor_rows
@@ -585,6 +685,7 @@ class WorkbenchService:
                 signal,
                 now=now,
                 price_guidance=guidance_plans.get(signal.symbol),
+                event_risk=self._risk_assessment(signal.symbol),
             )
             for signal in self.official_signal_store.latest()
         ]
@@ -632,23 +733,65 @@ class WorkbenchService:
         )
         self.state.official_daily_candidates = [
             _official_signal_payload(
-                signal, now=now, price_guidance=self._guidance_plans_by_symbol().get(signal.symbol)
+                signal,
+                now=now,
+                price_guidance=self._guidance_plans_by_symbol().get(signal.symbol),
+                event_risk=self._risk_assessment(signal.symbol),
             )
             for signal in signals
         ]
         self.state.intraday_monitor = [
-            {
-                **_stale_candidate_payload(signal, now=now),
-                "price_guidance": self._quote_guidance_payload(
-                    self._guidance_plans_by_symbol().get(signal.symbol),
-                    quote=None,
-                    data_quality=DataQualityStatus.FAILED,
-                    now=now,
-                ),
-            }
+            _apply_event_risk_to_monitor_payload(
+                {
+                    **_stale_candidate_payload(signal, now=now),
+                    "price_guidance": self._quote_guidance_payload(
+                        self._guidance_plans_by_symbol().get(signal.symbol),
+                        quote=None,
+                        data_quality=DataQualityStatus.FAILED,
+                        now=now,
+                    ),
+                },
+                self._risk_assessment(signal.symbol),
+            )
             for signal in signals
         ]
         self.state.price_guidance_plans = [item.to_dict() for item in self._guidance_plans()]
+
+    def _risk_assessment(self, symbol: str) -> PublicRiskAssessment | None:
+        try:
+            normalized = normalize_symbol(symbol)
+        except ValueError:
+            return None
+        if self._public_risk_snapshot is not None:
+            assessment = self._public_risk_snapshot.by_symbol().get(normalized)
+            if assessment is not None:
+                return assessment
+        if not self._public_risk_required:
+            return None
+        return PublicRiskAssessment(
+            symbol=normalized,
+            name=normalized,
+            level=EventRiskLevel.UNKNOWN,
+            reason_codes=("PUBLIC_RISK_NOT_CHECKED",),
+            events=(),
+            checked_at=self.clock(),
+        )
+
+    def _set_public_risk_health(self) -> None:
+        snapshot = self._public_risk_snapshot
+        assessments = snapshot.assessments if snapshot is not None else ()
+        self.state.public_risk_health = {
+            "status": self._public_risk_status,
+            "source": snapshot.source if snapshot is not None else "CNINFO",
+            "notice_zh": self._public_risk_notice,
+            "fetched_at": snapshot.fetched_at.isoformat() if snapshot is not None else None,
+            "window_start": snapshot.window_start.isoformat() if snapshot is not None else None,
+            "window_end": snapshot.window_end.isoformat() if snapshot is not None else None,
+            "checked_count": len(assessments),
+            "review_count": sum(item.level is EventRiskLevel.REVIEW for item in assessments),
+            "blocked_count": sum(item.level is EventRiskLevel.BLOCKED for item in assessments),
+            "unknown_count": sum(item.level is EventRiskLevel.UNKNOWN for item in assessments),
+        }
 
     def _guidance_plans(self) -> tuple[PriceGuidancePlan, ...]:
         if self.price_guidance_store is None:
@@ -862,10 +1005,11 @@ def _official_signal_payload(
     *,
     now: datetime | None = None,
     price_guidance: PriceGuidancePlan | None = None,
+    event_risk: PublicRiskAssessment | None = None,
 ) -> dict[str, Any]:
     reference = now or datetime.now(timezone.utc)
     age_days = max(0, (reference.date() - signal.signal_date).days)
-    return {
+    payload = {
         "signal_date": signal.signal_date.isoformat(),
         "symbol": signal.symbol,
         "name": signal.name,
@@ -888,6 +1032,49 @@ def _official_signal_payload(
         "monitoring_only": True,
         "price_guidance": _official_price_guidance_payload(price_guidance),
     }
+    return _apply_event_risk_to_monitor_payload(payload, event_risk)
+
+
+def _apply_event_risk_to_monitor_payload(
+    payload: dict[str, Any],
+    assessment: PublicRiskAssessment | None,
+) -> dict[str, Any]:
+    result = dict(payload)
+    result["event_risk"] = (
+        assessment.to_dict()
+        if assessment is not None
+        else {
+            "level": "NOT_CHECKED",
+            "reason_codes": [],
+            "events": [],
+            "checked_at": None,
+        }
+    )
+    if assessment is None or assessment.level is EventRiskLevel.CLEAR:
+        return result
+    guidance = dict(result.get("price_guidance") or {})
+    reasons = tuple(assessment.reason_codes) or ("PUBLIC_EVENT_RISK",)
+    guidance.update(
+        {
+            "state": GuidanceState.NO_RELIABLE_GUIDANCE.value,
+            "reason_codes": list(dict.fromkeys(("PUBLIC_EVENT_RISK", *reasons))),
+            "manual_execution_required": True,
+            "notice_zh": (
+                "暂无可靠指导价；巨潮公告包含需要人工核查的重大事件。"
+                if assessment.level in {EventRiskLevel.REVIEW, EventRiskLevel.BLOCKED}
+                else "暂无可靠指导价；该股票的公告风险检查未成功完成。"
+            ),
+        }
+    )
+    for price_field in (
+        "entry_lower",
+        "entry_upper",
+        "maximum_acceptable_price",
+        "invalidation_price",
+    ):
+        guidance[price_field] = None
+    result["price_guidance"] = guidance
+    return result
 
 
 def _official_price_guidance_payload(plan: PriceGuidancePlan | None) -> dict[str, Any]:

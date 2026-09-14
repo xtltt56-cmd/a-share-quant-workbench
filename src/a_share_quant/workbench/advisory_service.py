@@ -119,12 +119,21 @@ class AdvisoryWorkbenchService:
         self._account_import_confirmations: dict[str, _AccountImportConfirmation] = {}
         self._manual_buy_lock = RLock()
         self._holding_guidance_engine = HoldingPriceGuidanceEngine()
+        self._event_risk_provider: Callable[[str], dict[str, object] | None] | None = None
 
     def set_quote_provider(
         self,
         provider: Callable[[str], Mapping[str, object] | None],
     ) -> None:
         self._quote_provider = provider
+
+    def set_event_risk_provider(
+        self,
+        provider: Callable[[str], dict[str, object] | None] | None,
+    ) -> None:
+        """Attach read-only public event evidence without granting execution access."""
+
+        self._event_risk_provider = provider
 
     def list_account_imports(self) -> dict[str, object]:
         """List safe file identifiers without exposing filesystem paths."""
@@ -392,11 +401,50 @@ class AdvisoryWorkbenchService:
         result: list[dict[str, object]] = []
         for item in positions_by_symbol.values():
             plan = plans.get(str(item["code"]))
+            try:
+                event_risk = (
+                    self._event_risk_provider(str(item["code"]))
+                    if self._event_risk_provider is not None
+                    else None
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                event_risk = {
+                    "level": "UNKNOWN",
+                    "reason_codes": ["PUBLIC_RISK_PROVIDER_FAILED"],
+                    "events": [],
+                    "checked_at": None,
+                }
+            event_level = (
+                str(event_risk.get("level", "UNKNOWN")).upper()
+                if isinstance(event_risk, dict)
+                else "NOT_CHECKED"
+            )
+            if event_level in {"BLOCKED", "REVIEW", "UNKNOWN"}:
+                result.append(
+                    {
+                        **(plan.to_dict() if plan is not None else {"symbol": item["code"]}),
+                        "state": "NO_RELIABLE_GUIDANCE",
+                        "current_price": None,
+                        "protection_price": None,
+                        "reduce_lower": None,
+                        "reduce_upper": None,
+                        "suggested_sell_quantity": 0,
+                        "event_risk": event_risk,
+                        "manual_execution_required": True,
+                        "notice_zh": (
+                            "公告风险检查未成功完成，持仓价格指引暂不可用。"
+                            if event_level == "UNKNOWN"
+                            else "巨潮公告包含需要人工核查的事件，持仓价格指引暂不可用。"
+                        ),
+                    }
+                )
+                continue
             if plan is None:
                 result.append(
                     {
                         "symbol": item["code"],
                         "state": "NO_RELIABLE_GUIDANCE",
+                        "event_risk": event_risk,
                         "manual_execution_required": True,
                     }
                 )
@@ -423,7 +471,7 @@ class AdvisoryWorkbenchService:
                     plan,
                     current_price=quote["current_price"],
                 )
-                result.append(guidance.to_dict())
+                result.append({**guidance.to_dict(), "event_risk": event_risk})
             except (TypeError, ValueError):
                 result.append(
                     {
