@@ -22,9 +22,11 @@ from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
 from a_share_quant.runtime.eod_coordinator import EODCoordinator
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import load_or_generate_price_guidance_store
+from a_share_quant.runtime.public_risk import PublicRiskCoordinator
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
+from a_share_quant.storage.public_risk_store import PublicRiskStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.service import WorkbenchService
 
@@ -618,6 +620,19 @@ def run_server(
         official_store = OfficialSignalStore(path=official_signal_path)
     else:
         official_store = None
+    public_risk_store = None
+    public_risk_cache_rejected = False
+    if repo_root is not None:
+        public_risk_path = (
+            repo_root.resolve() / ".runtime" / "intelligence" / "cninfo-risk.json"
+        )
+        try:
+            public_risk_store = PublicRiskStore(public_risk_path)
+        except ValueError:
+            # This cache is regenerable public metadata.  Keep startup available,
+            # fail guidance closed, and atomically replace it only after a good fetch.
+            public_risk_store = PublicRiskStore(public_risk_path, load_existing=False)
+            public_risk_cache_rejected = True
     quote_cache = (
         RealtimeQuoteCache(repo_root.resolve() / ".runtime" / "realtime" / "quotes.json")
         if repo_root is not None
@@ -648,12 +663,23 @@ def run_server(
         quote_cache=quote_cache,
         official_signal_store=official_store,
         price_guidance_store=price_guidance_store,
+        public_risk_snapshot=(public_risk_store.latest() if public_risk_store is not None else None),
+        public_risk_required=repo_root is not None,
         priority_symbols=tuple(dict.fromkeys(priority_symbols)),
     )
+    if public_risk_cache_rejected:
+        service.publish_public_risk(
+            None,
+            "CACHE_REJECTED",
+            "本地公告缓存校验失败，正在重新获取；完成前不提供可靠价格指导。",
+        )
     if advisory_service is not None:
         set_quote_provider = getattr(advisory_service, "set_quote_provider", None)
         if set_quote_provider is not None:
             set_quote_provider(service.validated_quote)
+        set_event_risk_provider = getattr(advisory_service, "set_event_risk_provider", None)
+        if set_event_risk_provider is not None:
+            set_event_risk_provider(service.public_risk_for_symbol)
     research_lifecycle = None
     if supervisor is not None:
         supplier = research_context_supplier or _empty_research_context
@@ -676,7 +702,17 @@ def run_server(
 
         eod_coordinator = EODCoordinator(refresh=refresh_eod)
         eod_coordinator.start()
+    public_risk_coordinator = None
+    if allow_network and public_risk_store is not None:
+        public_risk_coordinator = PublicRiskCoordinator(
+            store=public_risk_store,
+            symbols=service.public_risk_symbols,
+            publish=service.publish_public_risk,
+        )
+        service.set_public_risk_refresh_request(public_risk_coordinator.request_refresh)
     service.start_background()
+    if public_risk_coordinator is not None:
+        public_risk_coordinator.start()
     server = create_server(
         service=service,
         advisory_service=advisory_service,
@@ -698,6 +734,8 @@ def run_server(
         server.shutdown()
         server.server_close()
         service.stop_background()
+        if public_risk_coordinator is not None:
+            public_risk_coordinator.stop()
         if eod_coordinator is not None:
             eod_coordinator.stop()
         if supervisor is not None:

@@ -58,6 +58,11 @@ def test_new_frontend_assets_and_classic_compatibility():
             with urlopen(base + "/assets/" + asset, timeout=3) as response:
                 assert response.headers["Content-Type"].startswith(mime)
                 assert response.headers["X-Content-Type-Options"] == "nosniff"
+                body = response.read().decode()
+                if asset == "workbench.js":
+                    assert "公告风险" in body
+                    assert "PUBLIC_RISK_NOT_CHECKED" in body
+                    assert "近期公告" in body
         with urlopen(base + "/classic/advisory", timeout=3) as response:
             assert "本地人工投顾" in response.read().decode()
         with pytest.raises(HTTPError) as error:

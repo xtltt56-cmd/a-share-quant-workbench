@@ -303,6 +303,8 @@ Copy-Item .env.example .env
 
 `.env` 只保存本机配置和可选 Token，绝不提交 Git。AKShare/BaoStock 默认不需要 Token；Tushare/RQData 必须显式启用。密钥不会写入源码、测试夹具、日志、模型 artifact 或报告。
 
+工作台还会对当前日选候选和已登记持仓执行低频的巨潮资讯公告检查。该检查不需要注册或 Token，只读取公告标题、发布时间和官方 PDF 链接，不下载 PDF 正文；成功快照保存在 D 盘项目内的 `.runtime/intelligence/cninfo-risk.json`。退市风险、监管立案、停牌、破产重整等标题级事件会暂停价格指导，监管措施、重大诉讼、减持、债务、减值、预亏、异常交易和审计意见等事件会要求人工核查。标题规则不能代替公告正文分析；检查失败或尚未覆盖的股票不会被当作“无风险”。
+
 普通 Windows 用户不需要执行上述开发命令。请从 [GitHub Releases 最新版本](https://github.com/xtltt56-cmd/a-share-quant-workbench/releases/latest) 下载在线版或便携版，并按照 [Windows 安装说明](README_RELEASE_ZH.md) 操作。每个 `v*` 版本标签都会触发干净 Windows 环境中的完整测试和打包；只有通过后才会更新 `releases/latest`。
 
 ## 许可证与投资风险
