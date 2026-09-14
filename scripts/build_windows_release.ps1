@@ -107,11 +107,16 @@ if ($Flavor -in @('Online', 'Both')) {
 if ($Flavor -in @('Portable', 'Both')) {
     $portableStage = New-PayloadStage -Channel 'Portable'
     try {
-        $installArguments = @('-NonInteractive', '-AllowSystemDrive', '-SkipShortcut', '-SkipLaunch')
-        if (-not [string]::IsNullOrWhiteSpace($PythonInstallerPath)) {
-            $installArguments += @('-PythonInstallerPath', $PythonInstallerPath)
+        $installParameters = @{
+            NonInteractive = $true
+            AllowSystemDrive = $true
+            SkipShortcut = $true
+            SkipLaunch = $true
         }
-        & (Join-Path $portableStage 'scripts\install_release.ps1') @installArguments
+        if (-not [string]::IsNullOrWhiteSpace($PythonInstallerPath)) {
+            $installParameters.PythonInstallerPath = $PythonInstallerPath
+        }
+        & (Join-Path $portableStage 'scripts\install_release.ps1') @installParameters
         if ($LASTEXITCODE -ne 0) {
             throw 'Portable runtime installation failed.'
         }
