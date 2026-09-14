@@ -484,6 +484,82 @@ def test_task8_empty_contest_rolls_over_to_new_model_bundle(
     assert json.loads(archives[0].read_text(encoding="utf-8"))["model_version"] == "v1"
 
 
+def test_active_contest_rolls_over_without_deleting_prior_predictions(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    """A new model gets a new contest while the append-only old evidence survives."""
+
+    from datetime import date, timedelta
+
+    from a_share_quant.research.prospective_competition import ProspectivePrediction
+    from a_share_quant.storage.project_storage import ProjectStoragePolicy
+    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
+    from scripts import quant_cli
+
+    terms = {
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+    }
+    registration = {
+        "model_id": "rule-ranking",
+        "model_version": "v1",
+        "config_hash": "c" * 64,
+        "training_snapshot_hash": "d" * 64,
+        "official_signal_digest": "e" * 64,
+        "model_bundle_digest": "b" * 64,
+    }
+    monkeypatch.setattr(quant_cli, "_contest_terms", lambda _root: terms)
+    monkeypatch.setattr(
+        quant_cli, "_derived_model_registration", lambda _root, _policy: dict(registration)
+    )
+    monkeypatch.setattr(
+        quant_cli,
+        "_current_signal_model_bundle",
+        lambda _policy: registration["model_bundle_digest"],
+    )
+    first = quant_cli._freeze_contest(d_cli_root)
+
+    policy = ProjectStoragePolicy(d_cli_root)
+    ledger = ProspectiveLedgerStore(policy=policy)
+    prediction = ProspectivePrediction(
+        model_id="rule-ranking",
+        model_version="v1",
+        config_hash="c" * 64,
+        training_snapshot_hash="d" * 64,
+        model_bundle_digest="b" * 64,
+        symbol="600001",
+        name="旧模型样本",
+        prediction_at=datetime.now(timezone.utc) - timedelta(days=2),
+        as_of=date.today() - timedelta(days=2),
+        horizon=5,
+        score=70.0,
+        probability=None,
+        probability_calibrated=False,
+        guidance_price_bands={"reference": (10.0, 10.0)},
+    )
+    ledger.append_prediction(prediction)
+
+    registration.update(
+        {
+            "model_version": "v2",
+            "official_signal_digest": "f" * 64,
+            "model_bundle_digest": "a" * 64,
+        }
+    )
+    second = quant_cli._freeze_contest(d_cli_root)
+
+    assert first["model_version"] == "v1"
+    assert second["model_version"] == "v2"
+    assert ProspectiveLedgerStore(policy=policy).predictions() == (prediction,)
+    archives = tuple((d_cli_root / ".runtime" / "research" / "contests").glob("*.json"))
+    assert len(archives) == 1
+    assert json.loads(archives[0].read_text(encoding="utf-8"))["model_version"] == "v1"
+
+
 def test_task8_contest_start_rejects_nonfixed_metric_or_tie_break(
     d_cli_root: Path, monkeypatch
 ) -> None:
@@ -557,4 +633,45 @@ def test_task8_workbench_context_does_not_queue_predict_before_daily_input(
     )
 
     assert context["data_refreshed"] is False
+    assert context["outcome_cutoff"] is None
+
+
+def test_workbench_context_automatically_aligns_contest_after_fresh_daily_input(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    from scripts import quant_cli
+
+    calls: list[Path] = []
+    monkeypatch.setattr(quant_cli, "_verified_research_manifest_digest", lambda _policy: None)
+    monkeypatch.setattr(quant_cli, "_completed_trading_session", lambda _now: True)
+    monkeypatch.setattr(quant_cli, "_fresh_daily_signal_available", lambda _policy, _now: True)
+    monkeypatch.setattr(quant_cli, "_freeze_contest", lambda root: calls.append(root) or {})
+
+    context = quant_cli._workbench_research_context(
+        d_cli_root, datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    )
+
+    assert calls == [d_cli_root]
+    assert context["data_refreshed"] is True
+
+
+def test_workbench_context_stays_fail_closed_when_contest_alignment_fails(
+    d_cli_root: Path, monkeypatch
+) -> None:
+    from scripts import quant_cli
+
+    monkeypatch.setattr(quant_cli, "_verified_research_manifest_digest", lambda _policy: None)
+    monkeypatch.setattr(quant_cli, "_completed_trading_session", lambda _now: True)
+    monkeypatch.setattr(quant_cli, "_fresh_daily_signal_available", lambda _policy, _now: True)
+    monkeypatch.setattr(
+        quant_cli,
+        "_freeze_contest",
+        lambda _root: (_ for _ in ()).throw(SystemExit("bad contest")),
+    )
+
+    context = quant_cli._workbench_research_context(
+        d_cli_root, datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    )
+
+    assert context["data_refreshed"] is True
     assert context["outcome_cutoff"] is None

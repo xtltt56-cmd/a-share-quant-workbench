@@ -191,6 +191,51 @@ def test_valid_settlement_is_hashed_idempotent_and_changed_result_rejected(tmp_p
         ledger.settle_due(changed)
 
 
+def test_contest_metrics_do_not_mix_archived_model_versions(tmp_path: Path) -> None:
+    store = ProspectiveLedgerStore(tmp_path / "prospective-ledger.jsonl")
+    global_ledger = ProspectiveCompetition(store=store, now=NOW)
+    old_prediction = _prediction(global_ledger, model_version="v1")
+    new_prediction = global_ledger.append_prediction(
+        model_id="challenger",
+        model_version="v2",
+        config_hash="cfg-v2",
+        training_snapshot_hash="train-v2",
+        symbol="600002",
+        name="新版示例",
+        prediction_at=datetime(2026, 8, 19, 8, 1, tzinfo=UTC),
+        as_of=date(2026, 8, 19),
+        horizon=5,
+        score=0.81,
+        probability=0.72,
+        guidance_price_bands=_bands(),
+        evidence_mode="PROSPECTIVE",
+    )
+    global_ledger.now = datetime(2026, 8, 30, 8, 0, tzinfo=UTC)
+    global_ledger.settle_due(_valid_outcome(old_prediction))
+    new_outcome = OutcomeObservation(
+        **{
+            **_valid_outcome(new_prediction).to_dict(),
+            "realized_return": -0.04,
+        }
+    )
+    global_ledger.settle_due(new_outcome)
+
+    contest = ProspectiveContest(now=NOW)
+    contest.start(
+        model_id="challenger",
+        model_version="v2",
+        config_hash="cfg-v2",
+        training_snapshot_hash="train-v2",
+    )
+    current = ProspectiveCompetition(store=store, contest=contest, now=global_ledger.now)
+
+    assert global_ledger.matured_predictions == 2
+    assert current.matured_predictions == 1
+    assert current.compute_metrics().coverage == 1.0
+    assert current.compute_metrics().net_cost_return is not None
+    assert current.compute_metrics().net_cost_return < 0
+
+
 def test_invalid_quality_flags_are_pending_not_failures(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     prediction = _prediction(ledger)

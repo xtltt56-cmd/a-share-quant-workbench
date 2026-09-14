@@ -547,14 +547,46 @@ class ProspectiveCompetition:
 
     @property
     def matured_predictions(self) -> int:
-        return self.store.matured_predictions
+        if self.contest is None:
+            return self.store.matured_predictions
+        prediction_ids = {item.id for item in self._contest_predictions()}
+        return sum(
+            item.prediction_id in prediction_ids for item in self.store.settlements()
+        )
+
+    def _contest_predictions(self) -> tuple[ProspectivePrediction, ...]:
+        """Return only observations belonging to the frozen model registration."""
+
+        if self.contest is None:
+            return self.store.predictions()
+        if not self.contest.started:
+            return ()
+        expected = (
+            self.contest.model_id,
+            self.contest.model_version,
+            self.contest.config_hash,
+            self.contest.training_snapshot_hash,
+        )
+        expected_bundle = self.contest.model_bundle_digest
+        return tuple(
+            item
+            for item in self.store.predictions()
+            if (
+                item.model_id,
+                item.model_version,
+                item.config_hash,
+                item.training_snapshot_hash,
+            )
+            == expected
+            and (expected_bundle is None or item.model_bundle_digest == expected_bundle)
+        )
 
     def compute_metrics(self, *, cost_bps: float = 20.0) -> ProspectiveMetrics:
         """Compute future-only metrics from settled ledger records."""
 
         if cost_bps < 0 or not math.isfinite(float(cost_bps)):
             raise ValueError("cost_bps must be finite and non-negative")
-        predictions = {item.id: item for item in self.store.predictions()}
+        predictions = {item.id: item for item in self._contest_predictions()}
         outcomes = [item for item in self.store.settlements() if item.prediction_id in predictions]
         total = len(predictions)
         coverage = len(outcomes) / total if total else 0.0

@@ -19,6 +19,7 @@ from a_share_quant.research.prospective_competition import (
 )
 from a_share_quant.runtime import research_worker
 from a_share_quant.signals.realtime import OfficialModelSignal
+from a_share_quant.storage.market_store import MarketDataStore
 from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
 from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
@@ -630,6 +631,70 @@ def test_task8_predict_replay_is_idempotent_for_one_cycle(
     assert predictions[0].source_artifact_path.endswith("/" + "f" * 64 + ".json")
 
 
+def test_task8_predict_restart_uses_signal_identity_not_worker_job_id(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """A supervisor restart cannot duplicate an unchanged daily forecast."""
+
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+    signal = OfficialModelSignal(
+        signal_date=date(2026, 8, 14),
+        symbol="600001",
+        name="测试股票",
+        normalized_score=82.0,
+        strategy_version="official-rule-v1",
+        model_version="daily-rule-v1",
+        feature_version="daily-features-v1",
+        data_mode="historical",
+        source="verified-free-source",
+        data_cutoff=date(2026, 8, 14),
+        generated_at=now - timedelta(minutes=1),
+        rank=1,
+        reference_price=10.0,
+        invalidation_price=9.0,
+    )
+    contest = {
+        "format_version": 3,
+        "contest_started_at": (now - timedelta(minutes=2)).isoformat(),
+        "model_id": "official-rule-v1",
+        "model_version": "daily-rule-v1",
+        "config_hash": "c" * 64,
+        "training_snapshot_hash": "d" * 64,
+        "official_signal_digest": "e" * 64,
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+        "evidence_mode": "PROSPECTIVE_ONLY",
+        "status": "PROSPECTIVE_COLLECTING",
+        "promotion": "NEVER",
+    }
+    calendar = tuple(
+        date(2026, 8, day) for day in (17, 18, 20, 21, 24, 25, 26, 27, 28, 31)
+    )
+    context = {
+        "contest": contest,
+        "signals": (signal,),
+        "daily_signal_digest": "f" * 64,
+        "source_artifact_path": ".runtime/research/signal-archive/" + "f" * 64 + ".json",
+        "session_calendar": calendar,
+        "session_calendar_digest": "a" * 64,
+    }
+    policy = ProjectStoragePolicy(d_worker_root)
+    monkeypatch.setattr(research_worker, "_current_time", lambda: now)
+    monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_JOB_ID", "predict-first-worker")
+    first = research_worker._run_predict(d_worker_root, policy, context)
+    monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_JOB_ID", "predict-restarted-worker")
+    second = research_worker._run_predict(d_worker_root, policy, context)
+
+    predictions = ProspectiveLedgerStore(policy=policy).predictions()
+    assert len(predictions) == 1
+    assert first["cycle_key"] == second["cycle_key"]
+    assert predictions[0].cycle_key == "predict-20260814-" + "f" * 24
+
+
 def test_task8_uncalibrated_rank_score_is_excluded_from_calibration_metrics(
     d_worker_root: Path,
 ) -> None:
@@ -837,6 +902,201 @@ def test_task8_settle_derives_actual_outcome_from_refreshed_return_artifact(
     assert len(outcomes) == 1
     assert outcomes[0].realized_price == 11.0
     assert outcomes[0].realized_return == pytest.approx(0.1)
+
+
+def test_settle_includes_due_predictions_from_archived_model_contests(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """Changing the active model must not strand unsettled old-model evidence."""
+
+    now = datetime.now(timezone.utc) + timedelta(minutes=1)
+    policy = ProjectStoragePolicy(d_worker_root)
+    ledger = ProspectiveLedgerStore(policy=policy)
+    predictions = tuple(
+        ProspectivePrediction(
+            model_id="rule-ranking",
+            model_version=version,
+            config_hash=digest * 64,
+            training_snapshot_hash=("d" if version == "v1" else "e") * 64,
+            model_bundle_digest=("a" if version == "v1" else "b") * 64,
+            symbol=symbol,
+            name=f"模型{version}",
+            prediction_at=datetime(2026, 8, 7, 8, tzinfo=timezone.utc),
+            as_of=date(2026, 8, 6),
+            horizon=5,
+            maturity_date=date(2026, 8, 13),
+            score=70.0,
+            probability=None,
+            probability_calibrated=False,
+            guidance_price_bands={"reference": (10.0, 10.0)},
+        )
+        for version, digest, symbol in (("v1", "c", "600001"), ("v2", "f", "600002"))
+    )
+    for prediction in predictions:
+        ledger.append_prediction(prediction)
+
+    active_contest = {
+        "format_version": 3,
+        "contest_started_at": datetime(2026, 8, 20, 8, tzinfo=timezone.utc).isoformat(),
+        "model_id": "rule-ranking",
+        "model_version": "v2",
+        "config_hash": "f" * 64,
+        "training_snapshot_hash": "e" * 64,
+        "model_bundle_digest": "b" * 64,
+        "official_signal_digest": "9" * 64,
+        "primary_metric": "net_cost_return",
+        "tie_break": ["max_drawdown", "brier", "ece", "rank_ic", "turnover"],
+        "provisional_sessions": 20,
+        "provisional_matured_predictions": 100,
+        "approval_sessions": 60,
+        "approval_matured_predictions": 200,
+        "evidence_mode": "PROSPECTIVE_ONLY",
+        "status": "PROSPECTIVE_COLLECTING",
+        "promotion": "NEVER",
+    }
+    monkeypatch.setattr(research_worker, "_current_time", lambda: now)
+    monkeypatch.setattr(
+        research_worker,
+        "_derived_outcome",
+        lambda _policy, prediction, observed_at: OutcomeObservation(
+            prediction_id=prediction.id,
+            symbol=prediction.symbol,
+            maturity_date=prediction.maturity_date,
+            outcome_at=observed_at,
+            realized_price=11.0,
+            realized_return=0.1,
+            data_version="verified-v1",
+            data_sha256="8" * 64,
+        ),
+    )
+
+    context = research_worker._derive_settle_context(policy, active_contest)
+
+    assert context is not None
+    assert {item.prediction_id for item in context["outcomes"]} == {
+        prediction.id for prediction in predictions
+    }
+
+
+def test_settle_uses_hashed_canonical_daily_lake_when_research_snapshot_is_behind(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    """A verified EOD bar may settle a forecast without a full history backfill."""
+
+    now = datetime.now(timezone.utc) + timedelta(minutes=1)
+    policy = ProjectStoragePolicy(d_worker_root)
+    prediction = ProspectivePrediction(
+        model_id="rule-ranking",
+        model_version="v1",
+        config_hash="c" * 64,
+        training_snapshot_hash="d" * 64,
+        model_bundle_digest="a" * 64,
+        symbol="600001",
+        name="测试股票",
+        prediction_at=datetime(2026, 8, 7, 8, tzinfo=timezone.utc),
+        as_of=date(2026, 8, 6),
+        horizon=5,
+        maturity_date=date(2026, 8, 13),
+        score=80.0,
+        probability=None,
+        probability_calibrated=False,
+        guidance_price_bands={"reference": (10.0, 10.0)},
+    )
+    ProspectiveLedgerStore(policy=policy).append_prediction(prediction)
+    closes = (10.1, 10.2, 10.3, 10.4, 11.0)
+    prior = 10.0
+    rows = []
+    for trading_date, close in zip(
+        (
+            date(2026, 8, 7),
+            date(2026, 8, 10),
+            date(2026, 8, 11),
+            date(2026, 8, 12),
+            prediction.maturity_date,
+        ),
+        closes,
+        strict=True,
+    ):
+        rows.append(
+            {
+                "symbol": prediction.symbol,
+                "date": trading_date,
+                "open": close,
+                "high": close + 0.1,
+                "low": close - 0.1,
+                "close": close,
+                "volume": 100_000,
+                "amount": close * 100_000,
+                "change_pct": (close / prior - 1.0) * 100.0,
+                "source": "baostock",
+                "data_version": "baostock-unadjusted-v1",
+            }
+        )
+        prior = close
+    bars = pd.DataFrame(rows)
+    MarketDataStore(d_worker_root / "data").write_daily_bars(bars)
+    monkeypatch.setattr(research_worker, "_current_time", lambda: now)
+
+    outcome = research_worker._derived_outcome(policy, prediction, now)
+
+    assert outcome.realized_price == 11.0
+    assert outcome.realized_return == pytest.approx(0.1)
+    assert outcome.data_version == "market-lake:baostock-unadjusted-v1"
+    assert len(outcome.data_sha256) == 64
+    assert outcome.status == "OK"
+
+
+def test_settle_rejects_unadjusted_lake_when_corporate_action_evidence_conflicts(
+    d_worker_root: Path, monkeypatch
+) -> None:
+    now = datetime.now(timezone.utc) + timedelta(minutes=1)
+    policy = ProjectStoragePolicy(d_worker_root)
+    prediction = ProspectivePrediction(
+        model_id="rule-ranking",
+        model_version="v1",
+        config_hash="c" * 64,
+        training_snapshot_hash="d" * 64,
+        symbol="600001",
+        name="测试股票",
+        prediction_at=datetime(2026, 8, 7, 8, tzinfo=timezone.utc),
+        as_of=date(2026, 8, 6),
+        horizon=5,
+        maturity_date=date(2026, 8, 13),
+        score=80.0,
+        probability=None,
+        probability_calibrated=False,
+        guidance_price_bands={"reference": (10.0, 10.0)},
+    )
+    rows = []
+    for trading_date in (
+        date(2026, 8, 7),
+        date(2026, 8, 10),
+        date(2026, 8, 11),
+        date(2026, 8, 12),
+        date(2026, 8, 13),
+    ):
+        rows.append(
+            {
+                "symbol": prediction.symbol,
+                "date": trading_date,
+                "open": 9.0,
+                "high": 9.1,
+                "low": 8.9,
+                "close": 9.0,
+                "volume": 100_000,
+                "amount": 900_000.0,
+                # Exchange return is flat while the raw close has mechanically
+                # dropped ten percent: this must not be scored as a forecast.
+                "change_pct": 0.0,
+                "source": "baostock",
+                "data_version": "baostock-unadjusted-v1",
+            }
+        )
+    MarketDataStore(d_worker_root / "data").write_daily_bars(pd.DataFrame(rows))
+    monkeypatch.setattr(research_worker, "_current_time", lambda: now)
+
+    with pytest.raises(research_worker._Blocked, match="REFRESHED_OUTCOME_NOT_READY"):
+        research_worker._derived_outcome(policy, prediction, now)
 
 
 @pytest.mark.parametrize("job", ["history", "screen", "predict", "settle"])
