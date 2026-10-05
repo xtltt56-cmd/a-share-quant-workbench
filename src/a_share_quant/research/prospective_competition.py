@@ -14,11 +14,12 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from types import MappingProxyType
 from typing import Any
 
 from a_share_quant.data.normalization import normalize_symbol
+from a_share_quant.market.trading_calendar import AShareTradingCalendar
 from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
 _ALLOWED_HORIZONS = frozenset({5, 10, 20})
@@ -63,12 +64,12 @@ def _finite(value: Any, *, field: str) -> float:
 
 
 def _future_weekday(start: date, horizon: int) -> date:
+    # Legacy name only; NEW default maturities count official sessions. Existing
+    # frozen predictions carry explicit maturity dates and are never rewritten.
+    calendar = AShareTradingCalendar()
     current = start
-    count = 0
-    while count < horizon:
-        current += timedelta(days=1)
-        if current.weekday() < 5:
-            count += 1
+    for _ in range(horizon):
+        current = calendar.next_session(current)
     return current
 
 

@@ -203,15 +203,19 @@ def test_run_server_owns_one_background_initial_daily_refresh(monkeypatch, tmp_p
     from a_share_quant.workbench import app
 
     calls = 0
+    called = threading.Event()
 
     def refresh(*args, **kwargs):
         nonlocal calls
         calls += 1
+        called.set()
+        return DailyRefreshSummary(skipped=True)
 
     class StopServer:
         server_address = ("127.0.0.1", 8765)
 
         def serve_forever(self):
+            assert called.wait(timeout=2)
             raise KeyboardInterrupt
 
         def shutdown(self):
@@ -220,7 +224,8 @@ def test_run_server_owns_one_background_initial_daily_refresh(monkeypatch, tmp_p
         def server_close(self):
             return None
 
-    monkeypatch.setattr(app, "refresh_daily_data_if_due", refresh)
+    from a_share_quant.runtime.daily_refresh import DailyRefreshSummary
+    monkeypatch.setattr(app, "run_bounded_daily_refresh", refresh)
     monkeypatch.setattr(app, "create_server", lambda **kwargs: StopServer())
 
     app.run_server(
@@ -266,6 +271,8 @@ def test_run_server_starts_and_stops_eod_coordinator(monkeypatch, tmp_path) -> N
         def __init__(self, **kwargs): calls.append("created")
         def start(self): calls.append("started")
         def stop(self): calls.append("stopped")
+        def snapshot(self): return {"status": "NOT_RUN"}
+        def retry_after_review(self): return {"status": "PENDING"}
 
     class StopServer:
         server_address = ("127.0.0.1", 8765)
@@ -400,62 +407,42 @@ def test_task8_lifecycle_stop_prevents_any_later_research_start() -> None:
 def test_eod_refresh_publishes_candidates_and_replaces_guidance_together(
     monkeypatch, tmp_path
 ) -> None:
-    from types import SimpleNamespace
-
+    from a_share_quant.runtime.daily_refresh import DailyRefreshSummary
+    from a_share_quant.storage.official_signal_store import OfficialSignalStore
+    from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
     from a_share_quant.workbench import app
+    from a_share_quant.workbench.service import WorkbenchService
+    from tests.test_official_daily_bootstrap import _signal
 
-    calls: list[object] = []
-
-    class OfficialStore:
-        path = tmp_path / "signals.json"
-
-        def set_refresh_status(self, status, notice):
-            calls.append((status, notice))
-
-    class RefreshedOfficial:
-        refresh_status = "FRESH"
-        refresh_notice_zh = "日线候选已更新。"
-
-        def latest(self):
-            return (SimpleNamespace(symbol="000001"),)
-
-    class Guidance:
-        def plans(self):
-            return ("new-guidance",)
-
-    class GuidanceStore:
-        path = tmp_path / "guidance.json"
-
-        def replace_plans(self, plans):
-            calls.append(("guidance", plans))
-
-    class Service:
-        def publish_official_daily(self, signals, *, status, notice_zh):
-            calls.append(("signals", signals, status, notice_zh))
+    official = OfficialSignalStore(tmp_path / "signals.json")
+    guidance = PriceGuidanceStore(tmp_path / "guidance.json")
+    service = WorkbenchService(
+        allow_network=False, official_signal_store=official, price_guidance_store=guidance,
+    )
+    expected = (_signal(signal_date=app.date(2026, 8, 13)),)
+    generate = app.load_or_generate_official_store
 
     monkeypatch.setattr(
         app,
         "refresh_daily_data_if_due",
-        lambda *args, **kwargs: SimpleNamespace(symbols_failed=0),
+        lambda *args, **kwargs: DailyRefreshSummary(skipped=True),
     )
     monkeypatch.setattr(
         app,
         "load_or_generate_official_store",
-        lambda *args, **kwargs: RefreshedOfficial(),
-    )
-    monkeypatch.setattr(
-        app,
-        "load_or_generate_price_guidance_store",
-        lambda *args, **kwargs: Guidance(),
+        lambda path, **kwargs: generate(path, generator=lambda: expected),
     )
 
-    app.refresh_eod_state(
+    result = app.refresh_eod_state(
         day=app.date(2026, 8, 13),
         repo_root=tmp_path,
-        official_store=OfficialStore(),
-        guidance_store=GuidanceStore(),
-        service=Service(),
+        official_store=official,
+        guidance_store=guidance,
+        service=service,
     )
 
-    assert ("guidance", ("new-guidance",)) in calls
-    assert any(item[0] == "signals" for item in calls)
+    assert result.success is True
+    assert OfficialSignalStore(official.path).latest() == expected
+    assert PriceGuidanceStore(guidance.path).plans()[0].calculation_date == expected[0].data_cutoff
+    assert official.latest() == expected
+    assert guidance.plans() == PriceGuidanceStore(guidance.path).plans()

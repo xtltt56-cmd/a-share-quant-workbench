@@ -118,8 +118,73 @@ class AdvisoryWorkbenchService:
         self._manual_buy_previews: dict[str, _ManualBuyPreview] = {}
         self._account_import_confirmations: dict[str, _AccountImportConfirmation] = {}
         self._manual_buy_lock = RLock()
+        self._holdings_notification_lock = RLock()
         self._holding_guidance_engine = HoldingPriceGuidanceEngine()
         self._event_risk_provider: Callable[[str], dict[str, object] | None] | None = None
+        self._holdings_changed_callback: Callable[[tuple[str, ...]], None] | None = None
+        self._holdings_sync_status = "NOT_CONFIGURED"
+        self._holdings_sync_error_code: str | None = None
+
+    def set_holdings_changed_callback(
+        self,
+        callback: Callable[[tuple[str, ...]], None] | None,
+    ) -> None:
+        self._holdings_changed_callback = callback
+        self._holdings_sync_status = "READY" if callback is not None else "NOT_CONFIGURED"
+        self._holdings_sync_error_code = None
+
+    def _notify_holdings_changed(self) -> str:
+        """Never turn a committed account event into an apparent failed transaction."""
+
+        # Serialize snapshot + callback, without keeping the account lock
+        # during the callback. An older notification cannot overtake a newer
+        # one and erase its monitoring universe.
+        with self._holdings_notification_lock:
+            return self._sync_holdings_changed()
+
+    def _sync_holdings_changed(self) -> str:
+        callback = self._holdings_changed_callback
+        if callback is None:
+            return self._holdings_sync_status
+        try:
+            with self._manual_buy_lock:
+                local = self._ledger.snapshot(as_of=self._today())
+                imported = (
+                    self._account_snapshot_store.load()
+                    if self._account_snapshot_store is not None
+                    else None
+                )
+                imported_symbols = (
+                    tuple(
+                        position.symbol
+                        for position in imported.positions
+                        if position.total_quantity > 0
+                    )
+                    if imported is not None
+                    else ()
+                )
+                symbols = tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                position.symbol
+                                for position in local.positions
+                                if position.total_quantity > 0
+                            ),
+                            *imported_symbols,
+                        )
+                    )
+                )
+            callback(symbols)
+            self._holdings_sync_status = "SUCCESS"
+            self._holdings_sync_error_code = None
+        except Exception as exc:
+            # The account event is already durable. Report the notification
+            # failure separately, including unexpected callback bugs, so the
+            # client never re-enters a successfully recorded fill.
+            self._holdings_sync_status = "UPDATE_FAILED"
+            self._holdings_sync_error_code = type(exc).__name__
+        return self._holdings_sync_status
 
     def set_quote_provider(
         self,
@@ -178,6 +243,10 @@ class AdvisoryWorkbenchService:
         return _account_preview_payload(preview, confirmation_token)
 
     def confirm_account_import(self, confirmation_token: str) -> dict[str, object]:
+        result = self._confirm_account_import_locked(confirmation_token)
+        return {**result, "holdings_sync_status": self._notify_holdings_changed()}
+
+    def _confirm_account_import_locked(self, confirmation_token: str) -> dict[str, object]:
         """Confirm a preview after rechecking its source digest."""
 
         with self._manual_buy_lock:
@@ -248,11 +317,14 @@ class AdvisoryWorkbenchService:
                 confirmation_token=confirmation_token,
                 receipt=receipt,
             )
-            estimated_total_cost = receipt.event.notional + prospective.fee_schedule.calculate(
-                side=receipt.event.side,
-                symbol=receipt.event.symbol,
-                notional=receipt.event.notional,
-            ).total
+            estimated_total_cost = (
+                receipt.event.notional
+                + prospective.fee_schedule.calculate(
+                    side=receipt.event.side,
+                    symbol=receipt.event.symbol,
+                    notional=receipt.event.notional,
+                ).total
+            )
         return {
             "confirmation_token": confirmation_token,
             "name": receipt.event.name,
@@ -266,6 +338,10 @@ class AdvisoryWorkbenchService:
         }
 
     def confirm_manual_buy(self, confirmation_token: str) -> dict[str, object]:
+        result = self._confirm_manual_buy_locked(confirmation_token)
+        return {**result, "holdings_sync_status": self._notify_holdings_changed()}
+
+    def _confirm_manual_buy_locked(self, confirmation_token: str) -> dict[str, object]:
         """Durably record one previously previewed, manually executed fill."""
 
         with self._manual_buy_lock:
@@ -352,6 +428,8 @@ class AdvisoryWorkbenchService:
         guidance = self._holding_guidance(imported, local_positions)
         return {
             "as_of": snapshot.as_of.isoformat(),
+            "holdings_sync_status": self._holdings_sync_status,
+            "holdings_sync_error_code": self._holdings_sync_error_code,
             "cash": f"{snapshot.cash:.2f}",
             "realized_pnl": f"{snapshot.realized_pnl:.2f}",
             "positions": local_positions,

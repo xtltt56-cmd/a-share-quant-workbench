@@ -18,6 +18,10 @@ from a_share_quant.data.realtime.validation import (
     TimestampTracker,
     assess_quote_quality,
 )
+from a_share_quant.market.trading_calendar import (
+    AShareTradingCalendar,
+    CalendarUnavailableError,
+)
 from a_share_quant.storage.realtime_store import RealTimeStore
 
 
@@ -64,8 +68,7 @@ class MarketHours:
 
 
 class TradingCalendar(Protocol):
-    def is_trading_day(self, value: date) -> bool:
-        ...
+    def is_trading_day(self, value: date) -> bool: ...
 
 
 class StaticTradingCalendar:
@@ -92,7 +95,7 @@ class SessionResolver:
         calendar: TradingCalendar | None = None,
     ) -> None:
         self.hours = hours or MarketHours()
-        self.calendar = calendar or StaticTradingCalendar()
+        self.calendar = calendar or AShareTradingCalendar()
         self.timezone = ZoneInfo(self.hours.timezone)
 
     def resolve(self, now: datetime) -> MarketSession:
@@ -241,7 +244,17 @@ class RealTimeScheduler:
 
     def run_once(self) -> SchedulerTick:
         now = self.clock()
-        session = self.resolver.resolve(now)
+        try:
+            session = self.resolver.resolve(now)
+        except CalendarUnavailableError:
+            return SchedulerTick(
+                timestamp=now,
+                session=MarketSession.NON_TRADING,
+                requested=False,
+                updated=False,
+                error="CALENDAR_UNAVAILABLE",
+                skip_reason="CALENDAR_UNAVAILABLE",
+            )
         if session is not MarketSession.OPEN:
             return SchedulerTick(
                 timestamp=now,
@@ -264,9 +277,7 @@ class RealTimeScheduler:
                         policy=self.retry_policy,
                     )
                 )
-                priority_report, priority_quarantined = self._check_quotes(
-                    priority_quotes, now=now
-                )
+                priority_report, priority_quarantined = self._check_quotes(priority_quotes, now=now)
                 if priority_report.is_usable:
                     usable_priority = tuple(
                         quote for quote in priority_report.quotes if not quote.is_stale
@@ -304,8 +315,7 @@ class RealTimeScheduler:
         current_monotonic = self.monotonic_clock()
         full_market_due = (
             self._last_full_market_at is None
-            or current_monotonic - self._last_full_market_at
-            >= self.full_market_interval_seconds
+            or current_monotonic - self._last_full_market_at >= self.full_market_interval_seconds
         )
         if self.priority_symbols and not full_market_due:
             if priority_report is not None and priority_report.is_usable:
@@ -381,9 +391,7 @@ class RealTimeScheduler:
         priority_report: Any | None,
         priority_count: int,
     ) -> SchedulerTick:
-        report, timestamp_quarantined = self._check_quotes(
-            tuple(snapshot.quotes), now=now
-        )
+        report, timestamp_quarantined = self._check_quotes(tuple(snapshot.quotes), now=now)
         if not report.is_usable:
             if priority_report is not None and priority_report.is_usable:
                 return SchedulerTick(
@@ -406,11 +414,7 @@ class RealTimeScheduler:
         usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
         self.store.replace_quote_snapshot(usable_quotes)
         bars = (
-            tuple(
-                self._retry(
-                    lambda: self.provider.get_minute_bars(self.symbols, self.frequency)
-                )
-            )
+            tuple(self._retry(lambda: self.provider.get_minute_bars(self.symbols, self.frequency)))
             if self.symbols
             else ()
         )

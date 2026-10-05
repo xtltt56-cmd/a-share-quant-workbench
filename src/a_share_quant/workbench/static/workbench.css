@@ -1,3 +1,10 @@
+.agent-mode-banner{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 18px;padding:12px 16px;border:1px solid var(--line);border-radius:10px;color:var(--muted);font-size:13px}
+.agent-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:14px 0}
+.agent-actions select{flex:1;min-width:180px;max-width:360px}
+.agent-analysis p,.agent-analysis li{overflow-wrap:anywhere;line-height:1.65}
+.agent-analysis ul{padding-left:20px}
+.agent-analysis .agent-claim-note{border-left:3px solid #bb913b;padding-left:12px}
+#agent-cloud-fields .check-label{margin-top:14px}
 :root{
   --bg:#f3f5f8;--surface:#fff;--surface-2:#f8fafc;--surface-3:#eef2f7;
   --ink:#172134;--muted:#68788d;--line:#dce3ec;--line-strong:#c9d3df;
@@ -177,6 +184,10 @@ dialog::backdrop{background:rgba(4,10,18,.66);backdrop-filter:blur(2px)}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 
 /* Reading density and mobile monitoring: primary information stays visible. */
+.evidence-panel{margin-top:20px;padding-top:16px;border-top:1px solid var(--line)}
+#stock-evidence{overflow-wrap:anywhere}#stock-evidence ul{padding-left:20px;line-height:1.8}
+#workflow-details td:last-child{white-space:normal;min-width:220px;line-height:1.6}
+@media(max-width:760px){#workflow-details td:last-child{min-width:0}.evidence-panel .panel-heading{flex-wrap:wrap;gap:10px}}
 table{font-size:14px}th,.stat-label,.stat small,.badge,.stock-button small,.panel-heading a,.attention-item p,.attention-item a,.status-row,.risk-row,.definition,.help,.plan-values small,.model-record small{font-size:12px}
 .stock-button{font-size:14px}.plan-values strong{font-size:16px}.cell-note{display:block;font-size:12px;line-height:1.5;margin-top:5px;max-width:220px;white-space:normal}
 .overview-grid{grid-template-columns:minmax(0,2.2fr) minmax(260px,.8fr)}

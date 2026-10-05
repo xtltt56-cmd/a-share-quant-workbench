@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -26,7 +27,9 @@ from a_share_quant.intelligence.contracts import (
     EventRiskLevel,
     PublicRiskAssessment,
     PublicRiskSnapshot,
+    effective_risk_assessment,
 )
+from a_share_quant.market.trading_calendar import AShareTradingCalendar, CalendarUnavailableError
 from a_share_quant.runtime.realtime_telemetry import LiveDataQualityGate, ProviderTelemetry
 from a_share_quant.runtime.scheduler import (
     RealTimeScheduler,
@@ -119,6 +122,7 @@ class WorkbenchService:
         price_guidance_store: PriceGuidanceStore | None = None,
         public_risk_snapshot: PublicRiskSnapshot | None = None,
         public_risk_required: bool = False,
+        public_risk_max_age_seconds: float = 6 * 60 * 60,
         realtime_overlay_store: RealtimeOverlayStore | None = None,
         symbols: Sequence[str] = (),
         priority_symbols: Sequence[str] = (),
@@ -138,6 +142,9 @@ class WorkbenchService:
         self.price_guidance_store = price_guidance_store
         self.price_guidance_overlay = PriceGuidanceOverlay()
         self._public_risk_required = bool(public_risk_required)
+        if not math.isfinite(public_risk_max_age_seconds) or public_risk_max_age_seconds <= 0:
+            raise ValueError("public risk maximum age must be positive")
+        self._public_risk_max_age_seconds = public_risk_max_age_seconds
         self._public_risk_snapshot = public_risk_snapshot
         self._public_risk_status = (
             public_risk_snapshot.status
@@ -154,6 +161,8 @@ class WorkbenchService:
             else "公告风险检查尚未配置。"
         )
         self._public_risk_refresh_request: Callable[[], None] | None = None
+        self._eod_status_provider: Callable[[], dict[str, Any]] | None = None
+        self._eod_retry_request: Callable[[], dict[str, object]] | None = None
         self.realtime_overlay_store = realtime_overlay_store or RealtimeOverlayStore()
         self.registry = registry
         self.allow_network = allow_network
@@ -177,6 +186,7 @@ class WorkbenchService:
         self._thread: threading.Thread | None = None
         self._poll_interval_seconds = max(1.0, float(poll_interval_seconds))
         self._requested_priority_symbols = tuple(dict.fromkeys(priority_symbols))
+        self._account_symbols: tuple[str, ...] = ()
 
         if self.quote_cache is not None:
             try:
@@ -189,9 +199,7 @@ class WorkbenchService:
         if provider is None:
             self.registry = registry or build_default_registry()
             capabilities = self.registry.discover()
-            self._provider = (
-                self.registry.build_failover() if self.registry.providers else None
-            )
+            self._provider = self.registry.build_failover() if self.registry.providers else None
             self.state.active_provider = self.registry.active_provider_name
             self.state.provider_capabilities = [
                 {
@@ -223,9 +231,7 @@ class WorkbenchService:
             "active_provider_name",
             getattr(self._provider, "name", None),
         )
-        self._set_source_metadata(
-            getattr(self._provider, "active_source_name", initial_provider)
-        )
+        self._set_source_metadata(getattr(self._provider, "active_source_name", initial_provider))
         # Load the last validated daily candidates immediately.  The dashboard
         # must not appear empty merely because the live provider is offline or
         # the first refresh has not completed yet.  These rows are explicitly
@@ -278,9 +284,7 @@ class WorkbenchService:
                 return self.state
             if self.scheduler is None:
                 with self._state_lock:
-                    self._apply_unavailable_state(
-                        now, error="NO_PROVIDER", evidence_mode="OFFLINE"
-                    )
+                    self._apply_unavailable_state(now, error="NO_PROVIDER", evidence_mode="OFFLINE")
                 return self.state
 
             started = self._monotonic_clock()
@@ -303,11 +307,13 @@ class WorkbenchService:
 
     def stop_background(self) -> None:
         self._stop_event.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        self._thread = None
+        # Interrupt the SDK subprocess BEFORE joining its owning poll thread.
         if self.scheduler is not None:
             self.scheduler.close()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
 
     def health(self) -> dict[str, Any]:
         with self._state_lock:
@@ -317,6 +323,10 @@ class WorkbenchService:
                 and self.state.data_quality == DataQualityStatus.GOOD.value
                 and self.state.schema_pass
                 and self.state.continuous_updates
+                and self.state.latest_quote_at is not None
+                and 0 <= (
+                    self.clock() - datetime.fromisoformat(self.state.latest_quote_at)
+                ).total_seconds() <= self.live_quality_gate.stale_after_seconds
             )
             if not self.allow_network:
                 status = "OFFLINE"
@@ -343,25 +353,113 @@ class WorkbenchService:
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
+            self._refresh_public_risk_view()
             return self.state.to_dict()
 
-    def validated_quote(self, symbol: str) -> dict[str, Any] | None:
-        quotes = self.store.quotes((symbol,))
-        if len(quotes) != 1:
-            return None
-        quote = quotes[0]
+    def set_eod_status_provider(self, provider: Callable[[], dict[str, Any]] | None) -> None:
+        self._eod_status_provider = provider
+
+    def set_eod_retry_request(self, request: Callable[[], dict[str, object]] | None) -> None:
+        self._eod_retry_request = request
+
+    def retry_daily_workflow(self) -> dict[str, object]:
+        if self._eod_retry_request is None:
+            raise RuntimeError("日线网络刷新未启用；请按正常联网模式启动系统。")
+        return self._eod_retry_request()
+
+    def workflow_health(self) -> dict[str, Any]:
+        """Expose live, mode-specific evidence rather than a static release checklist."""
+
+        state = self.snapshot()
         now = self.clock()
+        expected = None
+        calendar_error = None
+        try:
+            expected = AShareTradingCalendar().latest_completed_session(now).isoformat()
+        except CalendarUnavailableError:
+            calendar_error = "CALENDAR_UNAVAILABLE"
+        latest = state.get("latest_quote_at")
+        age = ((now - datetime.fromisoformat(latest)).total_seconds() if latest else None)
+        realtime_ready = bool(
+            self.allow_network and state["data_quality"] == "GOOD"
+            and state["schema_pass"] and state["continuous_updates"]
+            and age is not None and 0 <= age <= self.live_quality_gate.stale_after_seconds
+        )
+        refresh = {"status": "NOT_ENABLED", "notice_zh": "当前未启用日线后台网络刷新。"}
+        if self._eod_status_provider is not None:
+            refresh = self._eod_status_provider()
+        risk = state["public_risk_health"]
+        daily_status = "CALENDAR_UNAVAILABLE" if calendar_error else (
+            "STALE_DATA" if expected and state["daily_data_cutoff"]
+            and state["daily_data_cutoff"] < expected else state["daily_data_status"]
+        )
+        core_ready = (
+            realtime_ready and daily_status == "FRESH"
+            and bool(state["official_daily_candidates"])
+            and risk["status"] == "FRESH" and not risk["unknown_count"]
+        )
+        return {
+            "schema_version": 1, "observed_at": now.isoformat(),
+            "mode": "MANUAL_ASSISTANCE", "process_ready": True,
+            "status": "OK" if core_ready else "NEEDS_ATTENTION",
+            "paper_only": True, "live_trading_enabled": False,
+            "calendar": AShareTradingCalendar().metadata(),
+            "stages": {
+                "realtime": {
+                    "status": "GOOD" if realtime_ready else (
+                        "STALE" if state["data_quality"] == "GOOD" else state["data_quality"]
+                    ),
+                    "ready": realtime_ready, "source": state["active_source"],
+                    "quote_timestamp": latest, "data_age_seconds": age,
+                    "session": state["session"], "error_code": state["last_error"],
+                },
+                "daily": {
+                    "status": daily_status,
+                    "input_cutoff": state["daily_data_cutoff"],
+                    "expected_session": expected, "generated_at": state["daily_generated_at"],
+                    "candidate_count": len(state["official_daily_candidates"]),
+                    "notice_zh": state["daily_data_notice_zh"], "refresh": refresh,
+                },
+                "public_risk": risk,
+                "agent": {
+                    "status": "NOT_CONFIGURED", "enabled": False,
+                    "notice_zh": "尚未接入语言模型；核验依据为本地规则事实，不是 Agent 回答。",
+                },
+                "broker_read_only": {
+                    "status": "OPTIONAL", "required": False,
+                    "notice_zh": "人工辅助模式不要求券商接口开通。",
+                },
+            },
+        }
+
+    def validated_quote(
+        self, symbol: str, *, snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        symbol = normalize_symbol(symbol)
+        if snapshot is None:
+            quotes = self.store.quotes((symbol,))
+            payload = quotes[0].to_dict() if len(quotes) == 1 else None
+        else:
+            # A composed tool uses the quote in its captured snapshot, not a
+            # newer store value received midway through building the evidence.
+            rows = [row for row in snapshot["quotes"] if row["symbol"] == symbol]
+            payload = rows[0] if len(rows) == 1 else None
+        if payload is None:
+            return None
+        timestamp = datetime.fromisoformat(payload["timestamp_exchange"])
+        now = self.clock()
+        age = (now - timestamp).total_seconds()
         if (
-            quote.is_stale
-            or quote.quality_flag is not DataQualityStatus.GOOD
-            or quote.data_age_seconds(now=now) > self.live_quality_gate.stale_after_seconds
+            payload["is_stale"] or payload["quality_flag"] != DataQualityStatus.GOOD.value
+            or not 0 <= age <= self.live_quality_gate.stale_after_seconds
+            or payload["last"] is None
         ):
             return None
         return {
-            "symbol": quote.symbol,
-            "current_price": quote.last,
-            "quote_timestamp": quote.timestamp_exchange,
-            "data_quality": quote.quality_flag.value,
+            "symbol": symbol,
+            "current_price": payload["last"],
+            "quote_timestamp": timestamp,
+            "data_quality": payload["quality_flag"],
         }
 
     def publish_official_daily(
@@ -370,15 +468,20 @@ class WorkbenchService:
         *,
         status: str,
         notice_zh: str,
+        persist: bool = True,
     ) -> None:
         """Apply a validated daily refresh to the running dashboard."""
 
         with self._state_lock:
-            self.official_signal_store.put_signals(signals)
+            self.official_signal_store.put_signals(signals, persist=persist)
             self.official_signal_store.set_refresh_status(status, notice_zh)
             self._priority_symbols = tuple(
                 dict.fromkeys(
-                    (*self._requested_priority_symbols, *(signal.symbol for signal in signals))
+                    (
+                        *self._requested_priority_symbols,
+                        *self._account_symbols,
+                        *(signal.symbol for signal in signals),
+                    )
                 )
             )
             if self.scheduler is not None:
@@ -388,8 +491,44 @@ class WorkbenchService:
         if self._public_risk_refresh_request is not None:
             self._public_risk_refresh_request()
 
+    def publish_daily_bundle(
+        self, signals: Sequence[OfficialModelSignal] | Callable[[], Sequence[OfficialModelSignal]],
+        *, status: str, notice_zh: str,
+        commit: Callable[[], object],
+    ) -> None:
+        """Commit files before changing the live candidate/plan view."""
+        with self._state_lock:
+            store = self.price_guidance_store
+            if store is None:
+                commit()
+            else:
+                with store.transaction_lock:
+                    commit()
+                    store.reload()
+            selected = signals() if callable(signals) else signals
+            self.publish_official_daily(selected, status=status, notice_zh=notice_zh, persist=False)
+
+    def account_symbols(self) -> tuple[str, ...]:
+        with self._state_lock:
+            return self._account_symbols
+
     def set_public_risk_refresh_request(self, request: Callable[[], None] | None) -> None:
         self._public_risk_refresh_request = request
+
+    def update_account_symbols(self, symbols: Sequence[str]) -> None:
+        """Update a mutable account universe without retaining removed positions."""
+
+        normalized = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
+        with self._state_lock:
+            if normalized == self._account_symbols:
+                return
+            self._account_symbols = normalized
+            self._priority_symbols = self.public_risk_symbols()
+            if self.scheduler is not None:
+                self.scheduler.priority_symbols = self._priority_symbols
+                self.scheduler.expected_symbols = self._priority_symbols
+        if self._public_risk_refresh_request is not None:
+            self._public_risk_refresh_request()
 
     def public_risk_symbols(self) -> tuple[str, ...]:
         """Return the current candidates and account symbols for low-frequency checks."""
@@ -399,6 +538,7 @@ class WorkbenchService:
                 dict.fromkeys(
                     (
                         *self._requested_priority_symbols,
+                        *self._account_symbols,
                         *(signal.symbol for signal in self.official_signal_store.latest()),
                     )
                 )
@@ -417,31 +557,61 @@ class WorkbenchService:
                 self._public_risk_snapshot = snapshot
             self._public_risk_status = str(status).strip().upper()
             self._public_risk_notice = str(notice_zh).strip()
-            self._set_public_risk_health()
-            guidance = self._guidance_plans_by_symbol()
-            self.state.official_daily_candidates = [
-                _official_signal_payload(
-                    signal,
-                    now=self.clock(),
-                    price_guidance=guidance.get(signal.symbol),
-                    event_risk=self._risk_assessment(signal.symbol),
+            self._refresh_public_risk_view()
+
+    def _refresh_public_risk_view(self) -> None:
+        """Recompute gates on reads, including expiry and recovery after a refresh."""
+
+        self._set_public_risk_health()
+        guidance = self._guidance_plans_by_symbol()
+        now = self.clock()
+        self.state.official_daily_candidates = [
+            _official_signal_payload(
+                signal,
+                now=now,
+                price_guidance=guidance.get(signal.symbol),
+                event_risk=self._risk_assessment(signal.symbol),
+            )
+            for signal in self.official_signal_store.latest()
+        ]
+        rows = []
+        for row in self.state.intraday_monitor:
+            symbol = str(row.get("symbol", ""))
+            quotes = self.store.quotes((symbol,))
+            quote = quotes[0] if len(quotes) == 1 else None
+            if quote is not None and (
+                row.get("quote_timestamp") != quote.timestamp_exchange.isoformat()
+                or row.get("current_price", row.get("last")) != quote.last
+            ):
+                # Scheduler ingestion may precede publication of its tick.
+                # Never calculate a new guide beside the old visible quote.
+                quote = None
+            quality = DataQualityStatus.STALE
+            if quote is not None and self.state.data_quality in {"GOOD", "REPLAY"}:
+                quality = _quote_effective_quality(
+                    quote,
+                    batch_quality=DataQualityStatus.GOOD,
+                    now=now,
+                    stale_after_seconds=self.live_quality_gate.stale_after_seconds,
                 )
-                for signal in self.official_signal_store.latest()
-            ]
-            self.state.intraday_monitor = [
-                _apply_event_risk_to_monitor_payload(
-                    row,
-                    self._risk_assessment(str(row.get("symbol", ""))),
-                )
-                for row in self.state.intraday_monitor
-            ]
+            base = {
+                **row,
+                "price_guidance": self._quote_guidance_payload(
+                    guidance.get(symbol),
+                    quote=quote,
+                    data_quality=quality,
+                    now=now,
+                ),
+            }
+            rows.append(_apply_event_risk_to_monitor_payload(base, self._risk_assessment(symbol)))
+        self.state.intraday_monitor = rows
 
     def public_risk_for_symbol(self, symbol: str) -> dict[str, Any] | None:
         """Return sanitized public risk evidence for the advisory composition layer."""
 
         with self._state_lock:
             assessment = self._risk_assessment(symbol)
-            return assessment.to_dict() if assessment is not None else None
+            return _public_risk_payload(assessment) if assessment is not None else None
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -457,9 +627,7 @@ class WorkbenchService:
             getattr(self._provider, "name", None),
         )
         self.state.active_provider = active_provider
-        self._set_source_metadata(
-            getattr(self._provider, "active_source_name", active_provider)
-        )
+        self._set_source_metadata(getattr(self._provider, "active_source_name", active_provider))
         self.state.last_error = tick.error or (tick.skip_reason or None)
         self._record_new_fallbacks(observed_at=tick.timestamp)
 
@@ -482,9 +650,7 @@ class WorkbenchService:
             )
             self._apply_quality_report(report, replay=False)
             self.state.evidence_mode = (
-                tick.skip_reason
-                if not tick.requested and tick.skip_reason
-                else "OFFLINE"
+                tick.skip_reason if not tick.requested and tick.skip_reason else "OFFLINE"
             )
             self.state.circuit_breaker_state = self.scheduler.circuit_breaker.state
             self.state.provider_telemetry = self.telemetry.snapshot().to_dict()
@@ -516,9 +682,7 @@ class WorkbenchService:
             observed_at=tick.timestamp,
         )
         quality_quotes = (
-            self.store.quotes(self.scheduler.expected_symbols)
-            if tick.priority_only
-            else quotes
+            self.store.quotes(self.scheduler.expected_symbols) if tick.priority_only else quotes
         )
         report = self.live_quality_gate.evaluate(
             quality_quotes,
@@ -624,9 +788,7 @@ class WorkbenchService:
         now: datetime,
         data_quality: DataQualityStatus,
     ) -> None:
-        official_signals = {
-            signal.symbol: signal for signal in self.official_signal_store.latest()
-        }
+        official_signals = {signal.symbol: signal for signal in self.official_signal_store.latest()}
         guidance_plans = self._guidance_plans_by_symbol()
         ordered_quotes = tuple(
             sorted(
@@ -689,9 +851,7 @@ class WorkbenchService:
             )
             for signal in self.official_signal_store.latest()
         ]
-        self.state.price_guidance_plans = [
-            item.to_dict() for item in self._guidance_plans()
-        ]
+        self.state.price_guidance_plans = [item.to_dict() for item in self._guidance_plans()]
 
     def _apply_quote_metrics(
         self,
@@ -705,15 +865,10 @@ class WorkbenchService:
             1
             for quote in ordered
             if quote.is_stale
-            or quote.data_age_seconds(now=now)
-            > self.live_quality_gate.stale_after_seconds
+            or quote.data_age_seconds(now=now) > self.live_quality_gate.stale_after_seconds
         )
-        self.state.oldest_quote_at = (
-            ordered[0].timestamp_exchange.isoformat() if ordered else None
-        )
-        self.state.latest_quote_at = (
-            ordered[-1].timestamp_exchange.isoformat() if ordered else None
-        )
+        self.state.oldest_quote_at = ordered[0].timestamp_exchange.isoformat() if ordered else None
+        self.state.latest_quote_at = ordered[-1].timestamp_exchange.isoformat() if ordered else None
 
     def _apply_stored_signal_state(self, *, now: datetime) -> None:
         """Expose durable candidates while live quotes are unavailable."""
@@ -765,7 +920,12 @@ class WorkbenchService:
         if self._public_risk_snapshot is not None:
             assessment = self._public_risk_snapshot.by_symbol().get(normalized)
             if assessment is not None:
-                return assessment
+                return effective_risk_assessment(
+                    assessment,
+                    now=self.clock(),
+                    refresh_status=self._public_risk_status,
+                    maximum_age_seconds=self._public_risk_max_age_seconds,
+                )
         if not self._public_risk_required:
             return None
         return PublicRiskAssessment(
@@ -779,18 +939,56 @@ class WorkbenchService:
 
     def _set_public_risk_health(self) -> None:
         snapshot = self._public_risk_snapshot
-        assessments = snapshot.assessments if snapshot is not None else ()
+        assessments = (
+            tuple(
+                effective_risk_assessment(
+                    item,
+                    now=self.clock(),
+                    refresh_status=self._public_risk_status,
+                    maximum_age_seconds=self._public_risk_max_age_seconds,
+                )
+                for item in snapshot.assessments
+            )
+            if snapshot is not None
+            else ()
+        )
+        expired = sum(
+            bool(set(item.reason_codes) & {"PUBLIC_RISK_EXPIRED", "PUBLIC_RISK_FUTURE_TIMESTAMP"})
+            for item in assessments
+        )
+        status = self._public_risk_status
+        if expired and status in {"FRESH", "PARTIAL"}:
+            status = "STALE" if expired == len(assessments) else "PARTIAL"
+        required_symbols = set((
+            *getattr(self, "_requested_priority_symbols", ()),
+            *getattr(self, "_account_symbols", ()),
+            *(signal.symbol for signal in self.official_signal_store.latest()),
+        ))
+        missing = required_symbols - {item.symbol for item in assessments}
+        if missing and status == "FRESH":
+            status = "PARTIAL"
         self.state.public_risk_health = {
-            "status": self._public_risk_status,
+            "status": status,
             "source": snapshot.source if snapshot is not None else "CNINFO",
-            "notice_zh": self._public_risk_notice,
+            "notice_zh": (
+                "公告检查已过期或时间无效，需要重新核验。" if expired else self._public_risk_notice
+            ),
+            "maximum_age_seconds": self._public_risk_max_age_seconds,
+            "expired_count": expired,
+            "required_count": len(required_symbols),
+            "missing_count": len(missing),
+            "coverage_ratio": (
+                (len(required_symbols) - len(missing)) / len(required_symbols)
+                if required_symbols else None
+            ),
             "fetched_at": snapshot.fetched_at.isoformat() if snapshot is not None else None,
             "window_start": snapshot.window_start.isoformat() if snapshot is not None else None,
             "window_end": snapshot.window_end.isoformat() if snapshot is not None else None,
             "checked_count": len(assessments),
             "review_count": sum(item.level is EventRiskLevel.REVIEW for item in assessments),
             "blocked_count": sum(item.level is EventRiskLevel.BLOCKED for item in assessments),
-            "unknown_count": sum(item.level is EventRiskLevel.UNKNOWN for item in assessments),
+            "unknown_count": sum(item.level is EventRiskLevel.UNKNOWN for item in assessments)
+            + len(missing),
         }
 
     def _guidance_plans(self) -> tuple[PriceGuidancePlan, ...]:
@@ -912,9 +1110,7 @@ def _monitor_signal(
             "current_price": quote.last,
             "change_pct": quote.change_pct,
             "data_quality": (
-                DataQualityStatus.STALE.value
-                if quality_blocks_ready
-                else quote.quality_flag.value
+                DataQualityStatus.STALE.value if quality_blocks_ready else quote.quality_flag.value
             ),
             "is_stale": quote.is_stale or quality_blocks_ready,
             "normalized_score": official.normalized_score if official is not None else None,
@@ -933,7 +1129,10 @@ def _quote_effective_quality(
 ) -> DataQualityStatus:
     if batch_quality in {DataQualityStatus.FAILED, DataQualityStatus.STALE}:
         return batch_quality
-    if quote.is_stale or quote.data_age_seconds(now=now) > stale_after_seconds:
+    if (
+        quote.is_stale or quote.timestamp_exchange > now
+        or quote.data_age_seconds(now=now) > stale_after_seconds
+    ):
         return DataQualityStatus.STALE
     return quote.quality_flag
 
@@ -1027,12 +1226,32 @@ def _official_signal_payload(
         "average_amount": signal.average_amount,
         "invalidation_price": signal.invalidation_price,
         "signal_age_days": age_days,
-        "signal_stale": age_days > 3,
+        "signal_stale": _signal_input_stale(signal, now=reference),
         "frequency": signal.frequency.value,
         "monitoring_only": True,
         "price_guidance": _official_price_guidance_payload(price_guidance),
     }
     return _apply_event_risk_to_monitor_payload(payload, event_risk)
+
+
+def _signal_input_stale(signal: OfficialModelSignal, *, now: datetime | None) -> bool:
+    if now is None:
+        return True
+    try:
+        expected = AShareTradingCalendar().latest_completed_session(now)
+    except CalendarUnavailableError:
+        return True
+    return signal.data_cutoff != expected
+
+
+def _public_risk_payload(assessment: PublicRiskAssessment) -> dict[str, Any]:
+    result = assessment.to_dict()
+    if (assessment.level is EventRiskLevel.UNKNOWN
+        and assessment.reason_codes == ("PUBLIC_RISK_NOT_CHECKED",) and not assessment.events):
+        # Synthetic absence is not a real check. Normalize only the UI/evidence
+        # projection, preserving the persisted risk contract and genuine times.
+        result["checked_at"] = None
+    return result
 
 
 def _apply_event_risk_to_monitor_payload(
@@ -1041,7 +1260,7 @@ def _apply_event_risk_to_monitor_payload(
 ) -> dict[str, Any]:
     result = dict(payload)
     result["event_risk"] = (
-        assessment.to_dict()
+        _public_risk_payload(assessment)
         if assessment is not None
         else {
             "level": "NOT_CHECKED",
@@ -1057,7 +1276,9 @@ def _apply_event_risk_to_monitor_payload(
     guidance.update(
         {
             "state": GuidanceState.NO_RELIABLE_GUIDANCE.value,
-            "reason_codes": list(dict.fromkeys(("PUBLIC_EVENT_RISK", *reasons))),
+            "reason_codes": list(dict.fromkeys((
+                "PUBLIC_EVENT_RISK", *reasons, *(guidance.get("reason_codes") or ()),
+            ))),
             "manual_execution_required": True,
             "notice_zh": (
                 "暂无可靠指导价；巨潮公告包含需要人工核查的重大事件。"

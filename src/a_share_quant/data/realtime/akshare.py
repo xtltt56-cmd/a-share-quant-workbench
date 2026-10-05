@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from types import ModuleType
 from typing import Any
 
 import pandas as pd
@@ -24,6 +26,7 @@ from a_share_quant.data.realtime.normalization import (
     normalize_minute_bars,
     normalize_realtime_quotes,
 )
+from a_share_quant.data.realtime.sdk_process import call_sdk_process
 from a_share_quant.data.realtime.transport import TransportPolicy
 
 
@@ -76,6 +79,7 @@ class AKShareRealTimeProvider:
             thread_name_prefix="akshare-transport",
         )
         self._closed = False
+        self._stop_event = threading.Event()
 
     @property
     def active_source_name(self) -> str:
@@ -113,11 +117,20 @@ class AKShareRealTimeProvider:
             self._wait_for_rate_limit()
             if self._closed:
                 raise ProviderRequestError("AKShare provider is closed")
-            future = self._executor.submit(function, **kwargs)
             try:
+                if isinstance(self._module, ModuleType):
+                    # A running third-party HTTP call cannot be cancelled by a
+                    # Future timeout. Production calls use a killable OS child.
+                    return call_sdk_process(
+                        function_name, kwargs, timeout_seconds=call_timeout,
+                        stop_event=self._stop_event,
+                    )
+                # In-process fake clients remain injectable for deterministic tests.
+                future = self._executor.submit(function, **kwargs)
                 return future.result(timeout=call_timeout)
             except FutureTimeoutError as exc:
-                future.cancel()
+                if not isinstance(self._module, ModuleType):
+                    future.cancel()
                 last_error = exc
                 if not retry_on_timeout:
                     break
@@ -133,6 +146,7 @@ class AKShareRealTimeProvider:
         if self._closed:
             return
         self._closed = True
+        self._stop_event.set()
         self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _wait_for_rate_limit(self) -> None:

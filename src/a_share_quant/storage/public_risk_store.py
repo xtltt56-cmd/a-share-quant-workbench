@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
 from a_share_quant.intelligence.contracts import (
+    EventRiskLevel,
     PublicRiskAssessment,
     PublicRiskEvent,
     PublicRiskSnapshot,
@@ -58,6 +60,8 @@ class PublicRiskStore:
         with self._lock:
             if self._snapshot is not None and snapshot.fetched_at < self._snapshot.fetched_at:
                 raise ValueError("older public risk snapshot cannot replace newer evidence")
+            if self._snapshot is not None:
+                snapshot = _retain_adverse_evidence(self._snapshot, snapshot)
             self._persist(snapshot)
             self._snapshot = snapshot
 
@@ -124,7 +128,7 @@ class PublicRiskStore:
         if not isinstance(payload, dict) or set(payload) != cls._SNAPSHOT_FIELDS:
             raise ValueError("invalid public risk snapshot")
         assessments = payload["assessments"]
-        if not isinstance(assessments, list) or len(assessments) > 50:
+        if not isinstance(assessments, list) or len(assessments) > 1000:
             raise ValueError("invalid public risk assessments")
         return PublicRiskSnapshot(
             source=payload["source"],
@@ -174,3 +178,35 @@ class PublicRiskStore:
 
 
 __all__ = ["PublicRiskStore"]
+
+
+def _retain_adverse_evidence(
+    previous: PublicRiskSnapshot, incoming: PublicRiskSnapshot,
+) -> PublicRiskSnapshot:
+    """An empty rolling window is NOT proof that a severe event was resolved.
+
+    Title-only data cannot reliably prove resolution. Preserve warnings until a
+    future evidence-reviewed clearance workflow exists; never infer it here.
+    """
+    merged = incoming.by_symbol()
+    for symbol, old in previous.by_symbol().items():
+        if old.level not in {EventRiskLevel.BLOCKED, EventRiskLevel.REVIEW}:
+            continue
+        new = merged.get(symbol)
+        if new is None:
+            merged[symbol] = old
+            continue
+        reasons = tuple(dict.fromkeys((*old.reason_codes, *new.reason_codes,
+                                      "PUBLIC_RISK_CLEARANCE_REQUIRED")))
+        severity = EventRiskLevel.BLOCKED if EventRiskLevel.BLOCKED in {
+            old.level, new.level,
+        } else EventRiskLevel.REVIEW
+        events = {event.event_id: event for event in (*old.events, *new.events)}
+        merged[symbol] = replace(
+            new, level=severity, reason_codes=reasons, checked_at=old.checked_at,
+            events=tuple(sorted(events.values(), key=lambda event: event.announced_at,
+                                reverse=True)[:8]),
+        )
+    if len(merged) > 1000:
+        raise ValueError("retained public risk evidence exceeds bounded capacity")
+    return replace(incoming, assessments=tuple(merged.values()))

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from enum import Enum
 from urllib.parse import urlsplit
@@ -118,6 +118,44 @@ class PublicRiskAssessment:
             "events": [event.to_dict() for event in self.events],
             "checked_at": self.checked_at.isoformat(),
         }
+
+
+def effective_risk_assessment(
+    assessment: PublicRiskAssessment,
+    *,
+    now: datetime,
+    refresh_status: str,
+    maximum_age_seconds: float = 6 * 60 * 60,
+) -> PublicRiskAssessment:
+    """Expired clearance cannot authorize guidance; adverse evidence is retained."""
+
+    current = _aware_utc(now, field="now")
+    if maximum_age_seconds <= 0:
+        raise ValueError("maximum risk age must be positive")
+    age = (current - assessment.checked_at).total_seconds()
+    reasons = list(assessment.reason_codes)
+    if age < 0:
+        reasons.append("PUBLIC_RISK_FUTURE_TIMESTAMP")
+    elif age > maximum_age_seconds:
+        reasons.append("PUBLIC_RISK_EXPIRED")
+    if refresh_status not in {"FRESH", "PARTIAL"}:
+        reasons.append("PUBLIC_RISK_REFRESH_FAILED")
+    invalid = len(reasons) != len(assessment.reason_codes)
+    if not invalid:
+        return assessment
+    return replace(
+        assessment,
+        level=(
+            assessment.level
+            if assessment.level
+            in {
+                EventRiskLevel.BLOCKED,
+                EventRiskLevel.REVIEW,
+            }
+            else EventRiskLevel.UNKNOWN
+        ),
+        reason_codes=tuple(dict.fromkeys(reasons)),
+    )
 
 
 @dataclass(frozen=True)

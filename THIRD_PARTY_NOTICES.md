@@ -15,5 +15,7 @@ Python 第三方组件通过包、公开 API 或明确的 Adapter 接入。前�
 - [PyPortfolioOpt](https://github.com/PyPortfolio/PyPortfolioOpt)（可选）
 - [vn.py](https://github.com/vnpy/vnpy)（未来 Adapter 参考）
 - [RiceQuant Skills](https://github.com/ricequant/ricequant-skills)（可选 Skill/工作流参考）
+- [Ollama Python SDK](https://github.com/ollama/ollama-python) 0.6.3（可选，MIT；本地只读 Agent）
+- [OpenAI Python SDK](https://github.com/openai/openai-python) 3.24.0（可选，Apache-2.0；DeepSeek 官方兼容接口，不表示已授权 OpenAI API）
 
 如果后续将任何第三方文件复制进仓库，必须在复制同一提交中补充该项目的 LICENSE、版本、来源、变更说明和适用范围，并重新执行许可证审查。
