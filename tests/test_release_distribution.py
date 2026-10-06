@@ -18,6 +18,22 @@ def test_release_metadata_matches_project_version() -> None:
     assert metadata["channel"] == "preview"
 
 
+def test_release_ships_agent_dependencies_without_secrets() -> None:
+    release = (ROOT / "constraints" / "release-py312.txt").read_text(encoding="utf-8")
+    agent = (ROOT / "constraints" / "agent-py312.txt").read_text(encoding="utf-8")
+    assert "-r agent-py312.txt" in release
+    for dependency in ("openai", "ollama", "ddgs", "beautifulsoup4"):
+        assert re.search(rf"(?m)^{dependency}==", agent, re.IGNORECASE)
+    assert "DEEPSEEK_API_KEY=" not in agent
+
+
+def test_ci_installs_agent_dependencies_for_agent_regression_tests() -> None:
+    for filename in ("windows-tests.yml", "windows-release.yml"):
+        workflow = (ROOT / ".github" / "workflows" / filename).read_text(encoding="utf-8")
+        assert '[dev,data-free,agent]' in workflow
+        assert "-c constraints/agent-py312.txt" in workflow
+
+
 def test_release_runtime_excludes_development_dependencies() -> None:
     requirements = (ROOT / "constraints" / "release-py312.txt").read_text(
         encoding="utf-8"

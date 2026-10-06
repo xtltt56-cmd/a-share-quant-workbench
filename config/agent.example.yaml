@@ -1,0 +1,14 @@
+# 早期只读边界准备模板：当前启动器不加载此文件。
+# 实际双模式运行配置由系统页面写入 .runtime/agent/settings.json。
+# 已实现官方 SDK 适配；不要把 API Key 填在 YAML 中。
+enabled: false
+provider: null
+model: null
+api_key_env: null
+max_model_requests: 3
+max_tool_calls: 6
+deadline_seconds: 90
+max_context_bytes: 65536
+# 货币和价格须在选定供应商后明确；0 表示未授权收费。
+max_cost_per_task: 0
+cloud_scope: PUBLIC_STOCK_ONLY

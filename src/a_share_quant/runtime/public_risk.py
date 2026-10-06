@@ -74,7 +74,8 @@ class PublicRiskCoordinator:
         self._wake.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        self._thread = None
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
 
     def request_refresh(self) -> None:
         """Wake the worker after the daily candidate universe changes."""
@@ -96,6 +97,8 @@ class PublicRiskCoordinator:
                 now=now,
             )
             self.store.save(snapshot)
+            snapshot = self.store.latest()
+            assert snapshot is not None
         except (OSError, TimeoutError, RuntimeError, TypeError, ValueError):
             cached = self.store.latest()
             notice = (

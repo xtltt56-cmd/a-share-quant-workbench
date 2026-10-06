@@ -20,6 +20,7 @@ from a_share_quant.data.realtime.diagnostics import (
     collect_network_diagnostics,
     write_network_diagnostics_report,
 )
+from a_share_quant.market.trading_calendar import AShareTradingCalendar, CalendarUnavailableError
 from a_share_quant.research.daily_candidates import (
     generate_from_data_root,
     latest_complete_signal_date,
@@ -28,12 +29,11 @@ from a_share_quant.research.daily_candidates import (
 )
 from a_share_quant.research.evolution import EvolutionRegistry
 from a_share_quant.research.prospective_competition import ProspectiveContest
+from a_share_quant.runtime.daily_bundle import DailyBundleTransaction
 from a_share_quant.runtime.historical_backfill import HistoricalBackfillCoordinator
-from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import (
     PriceGuidanceRuntime,
     load_bars,
-    load_or_generate_price_guidance_store,
 )
 from a_share_quant.runtime.research_jobs import ResearchJobSupervisor
 from a_share_quant.storage.market_store import MarketDataStore
@@ -272,15 +272,9 @@ def main(argv: list[str] | None = None) -> int:
         governance = EvolutionRegistry(
             state_path=repo_root / ".runtime" / "research" / "evolution-registry.json"
         )
-        official_signal_store = load_or_generate_official_store(
-            official_signal_path,
-            repo_root=repo_root,
-        )
-        price_guidance_store = load_or_generate_price_guidance_store(
-            price_guidance_path,
-            repo_root=repo_root,
-            official_signal_store=official_signal_store,
-        )
+        DailyBundleTransaction(repo_root, official_signal_path, price_guidance_path).recover()
+        official_signal_store = OfficialSignalStore(official_signal_path)
+        price_guidance_store = PriceGuidanceStore(price_guidance_path)
         known_instruments = _load_default_instrument_map()
         if args.advisory_instrument_map is not None:
             known_instruments = load_instrument_map(args.advisory_instrument_map)
@@ -923,13 +917,17 @@ def _fresh_daily_signal_available(policy: ProjectStoragePolicy, now: datetime) -
                 for signal in signals
             )
         )
-    except SystemExit:
+    except (SystemExit, CalendarUnavailableError):
         return False
 
 
 def _completed_trading_session(now: datetime) -> bool:
     local = now.astimezone(ZoneInfo("Asia/Shanghai"))
-    return local.weekday() < 5 and local.timetz().replace(tzinfo=None) >= time(15, 10)
+    try:
+        return (AShareTradingCalendar().is_session(local.date())
+                and local.timetz().replace(tzinfo=None) >= time(15, 10))
+    except CalendarUnavailableError:
+        return False
 
 
 def _frozen_text(value: object, field: str) -> str:

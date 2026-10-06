@@ -54,7 +54,9 @@ class OfficialSignalStore:
         if self.path is not None and self.path.exists():
             self._load()
 
-    def put_signals(self, signals: Iterable[OfficialModelSignal]) -> None:
+    def put_signals(
+        self, signals: Iterable[OfficialModelSignal], *, persist: bool = True,
+    ) -> None:
         incoming = tuple(signals)
         with self._lock:
             for signal in incoming:
@@ -73,7 +75,7 @@ class OfficialSignalStore:
             for signal in incoming:
                 key = (signal.signal_date, signal.symbol, signal.strategy_version)
                 self._signals[key] = signal
-            if incoming and self.path is not None:
+            if incoming and self.path is not None and persist:
                 self._persist()
 
     def signals(self, *, signal_date: date | None = None) -> tuple[OfficialModelSignal, ...]:

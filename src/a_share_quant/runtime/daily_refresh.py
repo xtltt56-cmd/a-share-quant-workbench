@@ -9,11 +9,21 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.data.pipeline import IncrementalUpdater, UpdateSummary
 from a_share_quant.data.providers.baostock import BaoStockDataProvider
+from a_share_quant.market.trading_calendar import AShareTradingCalendar
 from a_share_quant.storage.market_store import MarketDataStore
 
 DEFAULT_INDEX_SYMBOLS = ("000300",)
+
+
+@dataclass(frozen=True)
+class DailySymbolResult:
+    symbol: str
+    status: str
+    latest_session: date | None
+    history_rows: int
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,7 @@ class DailyRefreshSummary:
     symbols_skipped: int = 0
     symbols_failed: int = 0
     errors: tuple[str, ...] = ()
+    symbol_results: tuple[DailySymbolResult, ...] = ()
 
 
 def refresh_daily_data_if_due(
@@ -32,9 +43,10 @@ def refresh_daily_data_if_due(
     *,
     end_date: date | None = None,
     provider: Any | None = None,
-    lookback_days: int = 370,
+    lookback_days: int = 420,
     minimum_history_rows: int = 252,
     index_symbols: tuple[str, ...] = DEFAULT_INDEX_SYMBOLS,
+    required_symbols: tuple[str, ...] = (),
 ) -> DailyRefreshSummary:
     """Incrementally update BaoStock bars only when the lake is behind.
 
@@ -48,9 +60,16 @@ def refresh_daily_data_if_due(
     if minimum_history_rows < 1:
         raise ValueError("minimum_history_rows must be positive")
     root = Path(data_root).resolve()
+    required = tuple(dict.fromkeys(normalize_symbol(item) for item in required_symbols))
+    if len(required) > 50:
+        raise ValueError("automatic account backfill is limited to 50 symbols")
     target = end_date or _latest_complete_weekday()
     daily_dir = root / "lake" / "daily_bars"
     paths = tuple(daily_dir.glob("*.parquet"))
+    if required:
+        paths = tuple(sorted(set(paths) | {
+            daily_dir / f"{symbol}.parquet" for symbol in (*required, *index_symbols)
+        }))
     profiles = tuple(_daily_file_profile(path) for path in paths)
     valid_profiles = tuple(profile for profile in profiles if profile is not None)
     required_version = getattr(provider, "daily_data_version", None)
@@ -65,10 +84,13 @@ def refresh_daily_data_if_due(
         )
     )
     if complete:
-        return DailyRefreshSummary(skipped=True)
+        return DailyRefreshSummary(
+            skipped=True,
+            symbol_results=_symbol_results(paths, target, minimum_history_rows),
+        )
 
     for path, profile in zip(paths, profiles, strict=True):
-        if profile is None:
+        if profile is None and path.exists():
             path.replace(path.with_name(f"{path.name}.corrupt-{uuid4().hex}"))
 
     owned_provider = provider is None
@@ -84,8 +106,6 @@ def refresh_daily_data_if_due(
                         existing_symbols
                     )
                 ].copy()
-            if instruments.empty:
-                return DailyRefreshSummary(skipped=True)
             # IncrementalUpdater will persist this restricted instrument
             # snapshot and never expand the automatic refresh into the whole
             # exchange universe.
@@ -117,6 +137,9 @@ def refresh_daily_data_if_due(
                 minimum_history_rows=minimum_history_rows,
                 summary=summary,
             )
+            missing = existing_symbols - set(instruments["symbol"].astype(str)) - set(index_symbols)
+            summary.symbols_failed += len(missing)
+            summary.errors.extend(f"{symbol}: SYMBOL_NOT_AVAILABLE" for symbol in sorted(missing))
             return DailyRefreshSummary(
                 skipped=False,
                 rows_written=summary.rows_written,
@@ -125,6 +148,7 @@ def refresh_daily_data_if_due(
                 symbols_skipped=summary.symbols_skipped,
                 symbols_failed=summary.symbols_failed,
                 errors=tuple(summary.errors),
+                symbol_results=_symbol_results(paths, target, minimum_history_rows, summary.errors),
             )
         start = target - timedelta(days=lookback_days)
         summary: UpdateSummary = IncrementalUpdater(
@@ -132,7 +156,7 @@ def refresh_daily_data_if_due(
             store=store,
             required_data_version=getattr(active_provider, "daily_data_version", None),
             minimum_history_rows=minimum_history_rows,
-        ).run(start_date=start, end_date=target)
+        ).run(start_date=start, end_date=target, limit=100)
         return DailyRefreshSummary(
             skipped=False,
             rows_written=summary.rows_written,
@@ -141,12 +165,30 @@ def refresh_daily_data_if_due(
             symbols_skipped=summary.symbols_skipped,
             symbols_failed=summary.symbols_failed,
             errors=tuple(summary.errors),
+            symbol_results=_symbol_results(
+                tuple(daily_dir.glob("*.parquet")), target, minimum_history_rows, summary.errors,
+            ),
         )
     finally:
         if owned_provider:
             close = getattr(active_provider, "close", None)
             if close is not None:
                 close()
+
+
+def _symbol_results(
+    paths: tuple[Path, ...], target: date, minimum: int, errors=(),
+) -> tuple[DailySymbolResult, ...]:
+    failed = {str(error).split(":", 1)[0] for error in errors}
+    results = []
+    for path in sorted(paths):
+        profile = _daily_file_profile(path)
+        latest, count = (profile[0], profile[1]) if profile else (None, 0)
+        status = ("FAILED" if path.stem in failed else "MISSING" if latest is None
+                  else "STALE_DATA" if latest < target else "FUTURE_DATA" if latest > target
+                  else "INSUFFICIENT_HISTORY" if count < minimum else "FRESH")
+        results.append(DailySymbolResult(path.stem, status, latest, count))
+    return tuple(results)
 
 
 def _daily_file_profile(path: Path) -> tuple[date, int, str] | None:
@@ -156,7 +198,10 @@ def _daily_file_profile(path: Path) -> tuple[date, int, str] | None:
         frame = pd.read_parquet(path, columns=["date", "data_version"])
         if frame.empty:
             return None
-        latest = pd.to_datetime(frame["date"], errors="coerce").dt.date.max()
+        dates = pd.to_datetime(frame["date"], errors="coerce").dt.date
+        if dates.isna().any() or dates.duplicated().any():
+            return None
+        latest = dates.max()
         versions = frame["data_version"].dropna().astype(str).unique().tolist()
         if latest is None or len(versions) != 1:
             return None
@@ -171,15 +216,10 @@ def _latest_date(path: Path) -> date | None:
 
 
 def _latest_complete_weekday(now: datetime | None = None) -> date:
-    local = (now or datetime.now(ZoneInfo("Asia/Shanghai"))).astimezone(
-        ZoneInfo("Asia/Shanghai")
+    # Keep the legacy helper name while sharing production session semantics.
+    return AShareTradingCalendar().latest_completed_session(
+        now or datetime.now(ZoneInfo("Asia/Shanghai"))
     )
-    candidate = local.date()
-    if local.hour < 15:
-        candidate -= timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
 
 
 __all__ = ["DailyRefreshSummary", "refresh_daily_data_if_due"]

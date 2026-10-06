@@ -41,8 +41,9 @@ jobs:
           Write-Host "Decision: $decision"
       - name: Install locked runtime and test dependencies
         run: >-
-          .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free]" lightgbm scikit-learn
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free,agent]" lightgbm scikit-learn
           -c constraints/runtime-py312.txt
+          -c constraints/agent-py312.txt
       - name: Verify environment
         run: .\.venv\Scripts\python.exe -m pip check
       - name: Lint

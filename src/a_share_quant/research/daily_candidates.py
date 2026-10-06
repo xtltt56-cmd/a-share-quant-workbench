@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -20,6 +20,7 @@ from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.experiments.pipeline import build_rule_features
 from a_share_quant.features.rule_factors import RuleFactorEngine
 from a_share_quant.features.universe import HistoricalUniverse
+from a_share_quant.market.trading_calendar import AShareTradingCalendar
 from a_share_quant.signals.realtime import OfficialModelSignal
 
 DEFAULT_STRATEGY_VERSION = "initial-free-data-v1"
@@ -272,11 +273,7 @@ def validate_daily_data_freshness(
     now: datetime,
     max_business_day_lag: int = 1,
 ) -> None:
-    """Reject a local cutoff that is too far behind the latest expected day.
-
-    The free-data path has no guaranteed exchange-holiday calendar, so this
-    uses weekdays conservatively and leaves a one-business-day grace period.
-    """
+    """Reject lag measured in official exchange sessions, not weekdays."""
 
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -289,23 +286,9 @@ def validate_daily_data_freshness(
 
 
 def latest_complete_signal_date(now: datetime) -> date:
-    """Return the latest weekday whose close can legally feed a signal.
+    """Resolve the latest completed exchange session using the shared calendar."""
 
-    Before the 15:00 close, today's bar is incomplete and the latest valid
-    signal is the previous weekday.  After the close, today's bar may be used.
-    This intentionally does not infer exchange holidays; freshness validation
-    still applies its bounded weekday lag separately.
-    """
-
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("now must be timezone-aware")
-    local = now.astimezone(ZoneInfo("Asia/Shanghai"))
-    candidate = local.date()
-    if local.timetz().replace(tzinfo=None) < time(15, 0):
-        candidate -= timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
+    return AShareTradingCalendar().latest_completed_session(now)
 
 
 def _business_day_distance(available: date, expected: date) -> int:
@@ -313,9 +296,10 @@ def _business_day_distance(available: date, expected: date) -> int:
         return 0
     current = available
     distance = 0
+    calendar = AShareTradingCalendar()
     while current < expected:
         current += timedelta(days=1)
-        if current.weekday() < 5:
+        if calendar.is_session(current):
             distance += 1
     return distance
 

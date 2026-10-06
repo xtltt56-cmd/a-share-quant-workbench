@@ -7,7 +7,9 @@ import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from a_share_quant.advisory.price_contracts import (
@@ -16,32 +18,49 @@ from a_share_quant.advisory.price_contracts import (
 )
 
 
+def _locked(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.transaction_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class PriceGuidanceStore:
     _FORMAT_VERSION = 1
     _MAX_BYTES = 16 * 1024 * 1024
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.transaction_lock = RLock()
         self._plans: dict[str, PriceGuidancePlan] = {}
         self._observations: dict[str, PriceGuidanceObservation] = {}
         if self.path.exists():
             self._load()
 
+    @_locked
     def replace_plans(self, plans: tuple[PriceGuidancePlan, ...]) -> None:
         if len(plans) > 5000 or any(not isinstance(item, PriceGuidancePlan) for item in plans):
             raise ValueError("price guidance artifact is invalid")
         identifiers = [item.plan_id for item in plans]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("price guidance artifact is invalid")
+        previous = self._plans, self._observations
         self._plans = {item.plan_id: item for item in plans}
         self._observations = {
             key: value for key, value in self._observations.items() if value.plan_id in self._plans
         }
-        self._persist()
+        try:
+            self._persist()
+        except Exception:
+            self._plans, self._observations = previous
+            raise
 
+    @_locked
     def plans(self) -> tuple[PriceGuidancePlan, ...]:
         return tuple(sorted(self._plans.values(), key=lambda item: (item.valid_for, item.symbol)))
 
+    @_locked
     def append_observation(self, observation: PriceGuidanceObservation) -> None:
         if not isinstance(observation, PriceGuidanceObservation):
             raise TypeError("price guidance store accepts only observations")
@@ -52,13 +71,23 @@ class PriceGuidanceStore:
         if len(self._observations) >= 100000:
             raise ValueError("price guidance artifact is invalid")
         self._observations[observation.observation_id] = observation
-        self._persist()
+        try:
+            self._persist()
+        except Exception:
+            del self._observations[observation.observation_id]
+            raise
 
+    @_locked
     def observations(self, plan_id: str | None = None) -> tuple[PriceGuidanceObservation, ...]:
         values = tuple(self._observations.values())
         if plan_id is not None:
             values = tuple(item for item in values if item.plan_id == plan_id)
         return tuple(sorted(values, key=lambda item: (item.observed_at, item.observation_id)))
+
+    @_locked
+    def reload(self) -> None:
+        loaded = PriceGuidanceStore(self.path)
+        self._plans, self._observations = loaded._plans, loaded._observations
 
     def _load(self) -> None:
         if self.path.is_symlink() or not self.path.is_file():

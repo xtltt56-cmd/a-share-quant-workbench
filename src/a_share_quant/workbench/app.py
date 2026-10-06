@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
+import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
@@ -18,8 +20,10 @@ from urllib.parse import parse_qs, urlparse
 
 from a_share_quant.data.realtime.cache import RealtimeQuoteCache
 from a_share_quant.research.evolution import EvolutionRegistry
+from a_share_quant.runtime.daily_bundle import DailyBundleTransaction
 from a_share_quant.runtime.daily_refresh import refresh_daily_data_if_due
-from a_share_quant.runtime.eod_coordinator import EODCoordinator
+from a_share_quant.runtime.daily_refresh_worker import run_bounded_daily_refresh
+from a_share_quant.runtime.eod_coordinator import EODCoordinator, EODRefreshResult
 from a_share_quant.runtime.official_daily import load_or_generate_official_store
 from a_share_quant.runtime.price_guidance import load_or_generate_price_guidance_store
 from a_share_quant.runtime.public_risk import PublicRiskCoordinator
@@ -28,12 +32,15 @@ from a_share_quant.storage.official_signal_store import OfficialSignalStore
 from a_share_quant.storage.price_guidance_store import PriceGuidanceStore
 from a_share_quant.storage.public_risk_store import PublicRiskStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
+from a_share_quant.workbench.agent_runtime import AgentRuntime
+from a_share_quant.workbench.context_tools import WorkbenchContextTools
 from a_share_quant.workbench.service import WorkbenchService
 
 _UI_ROOT = Path(__file__).with_name("static")
 _UI_ASSETS = {
     "/assets/workbench.css": ("workbench.css", "text/css; charset=utf-8"),
     "/assets/workbench.js": ("workbench.js", "text/javascript; charset=utf-8"),
+    "/assets/agent.js": ("agent.js", "text/javascript; charset=utf-8"),
     "/assets/echarts.min.js": ("echarts.min.js", "text/javascript; charset=utf-8"),
 }
 
@@ -142,6 +149,7 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         supervisor: ResearchJobSupervisor | None = None,
         governance: EvolutionRegistry | None = None,
         research_lifecycle: ResearchLifecycle | None = None,
+        agent_runtime: AgentRuntime | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
@@ -150,8 +158,15 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.supervisor = supervisor
         self.governance = governance
         self.research_lifecycle = research_lifecycle
+        self.agent_runtime = agent_runtime or AgentRuntime(
+            WorkbenchContextTools(service, advisory_service),
+        )
         self._governance_previews: dict[str, tuple[str, str, str]] = {}
         super().__init__(server_address, WorkbenchRequestHandler)
+
+    def server_close(self) -> None:
+        self.agent_runtime.stop()
+        super().server_close()
 
 
 class WorkbenchRequestHandler(BaseHTTPRequestHandler):
@@ -159,6 +174,10 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
+        if path.startswith("/api/agent/") and not self._agent_origin_valid():
+            self._write_json({"notice_zh": "Agent 请求须来自本地工作台。"},
+                             status=HTTPStatus.FORBIDDEN)
+            return
         if path == "/":
             self._write_html((_UI_ROOT / "index.html").read_text(encoding="utf-8"))
         elif path == "/advisory":
@@ -191,6 +210,31 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._write_json(self.server.service.health())
         elif path == "/api/state":
             self._write_json(self.server.service.snapshot())
+        elif path == "/api/workflow/health":
+            health = self.server.service.workflow_health()
+            health["stages"]["agent"] = self.server.agent_runtime.status()
+            self._write_json(health)
+        elif path == "/api/agent/status":
+            self._write_json(self.server.agent_runtime.status())
+        elif path == "/api/agent/task":
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                self._write_json(self.server.agent_runtime.task(query.get("id", [""])[0]))
+            except (KeyError, ValueError, RuntimeError, OSError):
+                self._write_json({"notice_zh": "任务不存在或当前证据无法核验。"},
+                                 status=HTTPStatus.NOT_FOUND)
+        elif path in {"/api/analysis/context", "/api/analysis/holding-context"}:
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                tools = WorkbenchContextTools(self.server.service, self.server.advisory_service)
+                symbol = query.get("symbol", [""])[0]
+                result = (tools.get_holding_context(symbol)
+                          if path.endswith("holding-context") else tools.get_stock_context(symbol))
+                self._write_json(result)
+            except (TypeError, ValueError):
+                self._write_json({"error": "证券代码无效或核验依据不完整"}, status=HTTPStatus.BAD_REQUEST)
+            except (OSError, RuntimeError):
+                self._write_json({"error": "核验依据暂不可用"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
         elif path == "/api/advisory/holdings":
             self._write_advisory_response(lambda service: service.holdings())
         elif path == "/api/advisory/guidance":
@@ -218,6 +262,22 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
+        if path.startswith("/api/agent/"):
+            self._agent_request(path)
+            return
+        if path == "/api/workflow/retry":
+            self._discard_request_body()
+            if self.headers.get("X-Quant-Workbench-Request") != "workflow-retry":
+                self._write_json({"error": "本地工作流重试请求头缺失。"}, status=HTTPStatus.FORBIDDEN)
+                return
+            try:
+                result = self.server.service.retry_daily_workflow()
+            except (OSError, ValueError, RuntimeError):
+                self._write_json({"error": "暂不能重试，请核验工作流状态、文件权限及联网模式。"},
+                                 status=HTTPStatus.CONFLICT)
+                return
+            self._write_json({"refresh": result, "notice_zh": "已重新排队，后台将在下一轮执行。"})
+            return
         if path == "/api/system/quit":
             if self.headers.get("X-Quant-Workbench-Request") != "safe-exit":
                 self._discard_request_body()
@@ -277,6 +337,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             )
             return
         lifecycle = self.server.research_lifecycle
+        self.server.agent_runtime.stop()
         if lifecycle is not None:
             lifecycle.stop(timeout_seconds=5.0)
         result = supervisor.shutdown(timeout_seconds=5.0)
@@ -286,6 +347,54 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
                 "children_stopped": result.children_stopped,
             }
         )
+
+    def _agent_origin_valid(self) -> bool:
+        expected_host = f"127.0.0.1:{self.server.server_address[1]}"
+        origin = self.headers.get("Origin")
+        return (self.headers.get("Host") == expected_host
+                and (origin is None or origin == f"http://{expected_host}"))
+
+    def _agent_request(self, path: str) -> None:
+        if (not self._agent_origin_valid()
+            or self.headers.get("X-Quant-Workbench-Request") != "agent"
+            or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json"):
+            self.close_connection = True
+            self._write_json({"notice_zh": "Agent 请求须来自本地工作台。"},
+                             status=HTTPStatus.FORBIDDEN)
+            return
+        try:
+            self.connection.settimeout(3)
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 1 <= length <= 8192:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            runtime = self.server.agent_runtime
+            if path == "/api/agent/config":
+                result = runtime.configure(payload)
+            elif path == "/api/agent/credential" and set(payload) == {"api_key"}:
+                result = runtime.save_credential(payload["api_key"])
+            elif path == "/api/agent/credential/remove" and not payload:
+                result = runtime.remove_credential()
+            elif path == "/api/agent/probe" and not payload:
+                result = runtime.probe()
+            elif path == "/api/agent/start" and set(payload) in (
+                {"symbol", "question"}, {"symbol", "question", "web_research"}
+            ):
+                result = runtime.start(payload["symbol"], payload["question"],
+                                       web_research=payload.get("web_research", True))
+            elif path == "/api/agent/cancel" and set(payload) == {"task_id"}:
+                result = runtime.cancel(payload["task_id"])
+            else:
+                raise ValueError
+            self._write_json(result)
+        except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+            self._write_json({"notice_zh": "配置或参数无效；云端需凭据和明确费用授权。"},
+                             status=HTTPStatus.BAD_REQUEST)
+        except (RuntimeError, OSError):
+            self._write_json({"notice_zh": "Agent 尚未就绪、已有任务或配置无法保存；请核验状态。"},
+                             status=HTTPStatus.CONFLICT)
 
     def _refresh(self) -> None:
         if self.headers.get("X-Quant-Workbench-Request") != "refresh":
@@ -579,6 +688,7 @@ def create_server(
     supervisor: ResearchJobSupervisor | None = None,
     governance: EvolutionRegistry | None = None,
     research_lifecycle: ResearchLifecycle | None = None,
+    agent_runtime: AgentRuntime | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -591,6 +701,7 @@ def create_server(
         supervisor,
         governance,
         research_lifecycle,
+        agent_runtime,
     )
 
 
@@ -615,7 +726,10 @@ def run_server(
         official_store = official_signal_store
     elif repo_root is not None:
         signal_path = official_signal_path or repo_root / ".runtime" / "signals" / "official-daily.json"
-        official_store = load_or_generate_official_store(signal_path, repo_root=repo_root)
+        DailyBundleTransaction(
+            repo_root, signal_path, price_guidance_store.path if price_guidance_store else None,
+        ).recover()
+        official_store = OfficialSignalStore(signal_path)
     elif official_signal_path is not None:
         official_store = OfficialSignalStore(path=official_signal_path)
     else:
@@ -639,8 +753,6 @@ def run_server(
         else None
     )
     priority_symbols: list[str] = []
-    if official_store is not None:
-        priority_symbols.extend(signal.symbol for signal in official_store.latest())
     if advisory_service is not None:
         try:
             holdings = advisory_service.holdings()
@@ -665,8 +777,9 @@ def run_server(
         price_guidance_store=price_guidance_store,
         public_risk_snapshot=(public_risk_store.latest() if public_risk_store is not None else None),
         public_risk_required=repo_root is not None,
-        priority_symbols=tuple(dict.fromkeys(priority_symbols)),
+        priority_symbols=(),
     )
+    service.update_account_symbols(tuple(dict.fromkeys(priority_symbols)))
     if public_risk_cache_rejected:
         service.publish_public_risk(
             None,
@@ -680,6 +793,9 @@ def run_server(
         set_event_risk_provider = getattr(advisory_service, "set_event_risk_provider", None)
         if set_event_risk_provider is not None:
             set_event_risk_provider(service.public_risk_for_symbol)
+        set_holdings_changed_callback = getattr(advisory_service, "set_holdings_changed_callback", None)
+        if set_holdings_changed_callback is not None:
+            set_holdings_changed_callback(service.update_account_symbols)
     research_lifecycle = None
     if supervisor is not None:
         supplier = research_context_supplier or _empty_research_context
@@ -691,17 +807,30 @@ def run_server(
         )
     eod_coordinator = None
     if repo_root is not None and allow_network and official_store is not None:
-        def refresh_eod(day: date) -> None:
-            refresh_eod_state(
+        def refresh_eod(day: date) -> EODRefreshResult:
+            return refresh_eod_state(
                 day=day,
                 repo_root=repo_root,
                 official_store=official_store,
                 guidance_store=price_guidance_store,
                 service=service,
+                cancel_event=eod_coordinator.stop_event,
             )
 
-        eod_coordinator = EODCoordinator(refresh=refresh_eod)
-        eod_coordinator.start()
+        eod_coordinator = EODCoordinator(
+            refresh=refresh_eod, retry_base_seconds=60,
+            checkpoint_path=repo_root / ".runtime" / "workflow" / "eod-checkpoint.json",
+            completion_is_valid=lambda day: completed_daily_bundle_is_valid(day, service),
+        )
+        service.set_eod_status_provider(eod_coordinator.snapshot)
+        service.set_eod_retry_request(eod_coordinator.retry_after_review)
+        if advisory_service is not None:
+            def holdings_changed(symbols: tuple[str, ...]) -> None:
+                previous = service.account_symbols()
+                service.update_account_symbols(symbols)
+                if service.account_symbols() != previous:
+                    eod_coordinator.request_refresh()
+            advisory_service.set_holdings_changed_callback(holdings_changed)
     public_risk_coordinator = None
     if allow_network and public_risk_store is not None:
         public_risk_coordinator = PublicRiskCoordinator(
@@ -710,18 +839,21 @@ def run_server(
             publish=service.publish_public_risk,
         )
         service.set_public_risk_refresh_request(public_risk_coordinator.request_refresh)
-    service.start_background()
-    if public_risk_coordinator is not None:
-        public_risk_coordinator.start()
     server = create_server(
         service=service,
         advisory_service=advisory_service,
         supervisor=supervisor,
         governance=governance,
         research_lifecycle=research_lifecycle,
+        agent_runtime=AgentRuntime(WorkbenchContextTools(service, advisory_service), repo_root),
         port=port,
     )
     try:
+        service.start_background()
+        if eod_coordinator is not None:
+            eod_coordinator.start()
+        if public_risk_coordinator is not None:
+            public_risk_coordinator.start()
         if research_lifecycle is not None:
             research_lifecycle.start()
         print(f"A股量化交易工作台：http://127.0.0.1:{server.server_address[1]}/")
@@ -768,33 +900,119 @@ def refresh_eod_state(
     official_store: OfficialSignalStore,
     guidance_store: PriceGuidanceStore | None,
     service: WorkbenchService,
-) -> None:
+    cancel_event: threading.Event | None = None,
+) -> EODRefreshResult:
     """Refresh durable daily artifacts before publishing one coherent state."""
 
     root = repo_root.resolve()
-    summary = refresh_daily_data_if_due(root / "data", end_date=day)
+    signal_path = official_store.path or root / ".runtime" / "signals" / "official-daily.json"
+    transaction = DailyBundleTransaction(
+        root, signal_path, guidance_store.path if guidance_store else None,
+    )
+    # A previous partial file replacement must be completed before any new batch.
+    if transaction.journal.exists():
+        service.publish_daily_bundle(
+            lambda: OfficialSignalStore(signal_path).latest(),
+            status="RECOVERED", notice_zh="已恢复上次已校验的完整日线发布。",
+            commit=transaction.recover,
+        )
+    holdings = service.account_symbols()
+    summary = (
+        refresh_daily_data_if_due(root / "data", end_date=day, required_symbols=holdings)
+        if cancel_event is None else run_bounded_daily_refresh(
+            root, day, holdings, stop_event=cancel_event,
+        )
+    )
+    coverage = {
+        "symbols_seen": summary.symbols_seen,
+        "symbols_failed": summary.symbols_failed,
+        "rows_written": summary.rows_written,
+        "required_holding_symbols": list(holdings),
+        "symbols": [{"symbol": row.symbol, "status": row.status,
+                     "latest_session": row.latest_session.isoformat() if row.latest_session else None,
+                     "history_rows": row.history_rows} for row in summary.symbol_results],
+    }
     if summary.symbols_failed:
-        official_store.set_refresh_status(
-            "UPDATE_FAILED",
-            f"日线刷新有 {summary.symbols_failed} 只股票失败，保留上次候选。",
+        notice = f"日线刷新有 {summary.symbols_failed} 只股票失败，保留上次候选。"
+        service.publish_official_daily(
+            official_store.latest(), status="UPDATE_FAILED", notice_zh=notice,
         )
-        return
-    refreshed = load_or_generate_official_store(
-        official_store.path or root / ".runtime" / "signals" / "official-daily.json",
-        repo_root=root,
-    )
-    if guidance_store is not None:
-        refreshed_guidance = load_or_generate_price_guidance_store(
-            guidance_store.path,
-            repo_root=root,
-            official_signal_store=refreshed,
+        return EODRefreshResult(False, "UPDATE_FAILED", notice, coverage)
+    staging_root = root / ".runtime" / "workflow"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=staging_root, prefix="daily-stage-") as directory:
+        staged_signal = Path(directory) / "signals.json"
+        if signal_path.exists():
+            shutil.copyfile(signal_path, staged_signal)
+        refreshed = load_or_generate_official_store(staged_signal, repo_root=root)
+        if refreshed.refresh_status != "FRESH" or not refreshed.latest():
+            service.publish_official_daily(
+                official_store.latest(), status=refreshed.refresh_status,
+                notice_zh=refreshed.refresh_notice_zh,
+            )
+            return EODRefreshResult(False, refreshed.refresh_status, refreshed.refresh_notice_zh, coverage)
+        if any(signal.data_cutoff != day for signal in refreshed.latest()):
+            notice = "日选输入与目标交易日不一致，保留上次候选并等待补齐。"
+            service.publish_official_daily(official_store.latest(), status="STALE_DATA", notice_zh=notice)
+            return EODRefreshResult(False, "STALE_DATA", notice, coverage)
+        staged = {"signals": staged_signal}
+        guidance_digest = None
+        if guidance_store is not None:
+            staged_guidance = Path(directory) / "guidance.json"
+            with guidance_store.transaction_lock:
+                if guidance_store.path.exists():
+                    shutil.copyfile(guidance_store.path, staged_guidance)
+                    guidance_digest = hashlib.sha256(staged_guidance.read_bytes()).hexdigest()
+            load_or_generate_price_guidance_store(
+                staged_guidance,
+                repo_root=root,
+                official_signal_store=refreshed,
+                holding_symbols=holdings,
+            )
+            staged["guidance"] = staged_guidance
+        def commit() -> str:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("DAILY_REFRESH_CANCELLED")
+            if guidance_store is not None:
+                current_digest = (hashlib.sha256(guidance_store.path.read_bytes()).hexdigest()
+                                  if guidance_store.path.exists() else None)
+                if current_digest != guidance_digest:
+                    raise RuntimeError("PRICE_OBSERVATIONS_CHANGED_DURING_GENERATION")
+            if service.account_symbols() != holdings:
+                raise RuntimeError("HOLDINGS_CHANGED_DURING_GENERATION")
+            return transaction.publish(day, staged, holding_symbols=holdings)
+        service.publish_daily_bundle(
+            refreshed.latest(), status=refreshed.refresh_status,
+            notice_zh=refreshed.refresh_notice_zh,
+            commit=commit,
         )
-        guidance_store.replace_plans(refreshed_guidance.plans())
+    return EODRefreshResult(True, refreshed.refresh_status, refreshed.refresh_notice_zh, coverage)
+
+
+def completed_daily_bundle_is_valid(day: date, service: WorkbenchService) -> bool:
+    """A checkpoint is not proof unless the current artifacts still cover the inputs."""
+    from a_share_quant.advisory.price_contracts import PricePlanType
+
+    signals = service.official_signal_store.latest()
+    if not signals or any(signal.data_cutoff != day for signal in signals):
+        return False
+    if service.price_guidance_store is not None:
+        plans = service.price_guidance_store.plans()
+        candidate_symbols = {item.symbol for item in plans
+                             if item.plan_type is PricePlanType.DAILY_CANDIDATE
+                             and item.calculation_date == day}
+        holding_symbols = {item.symbol for item in plans
+                           if item.plan_type is PricePlanType.HOLDING
+                           and item.calculation_date == day}
+        if candidate_symbols != {item.symbol for item in signals} or not set(
+            service.account_symbols()
+        ).issubset(holding_symbols):
+            return False
     service.publish_official_daily(
-        refreshed.latest(),
-        status=refreshed.refresh_status,
-        notice_zh=refreshed.refresh_notice_zh,
+        signals, status="FRESH", notice_zh=f"已核验完整日线批次：{day.isoformat()}。",
+        persist=False,
     )
+    return True
 
 
 def _governance_digest(value: Any) -> str:
@@ -897,6 +1115,11 @@ th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px
 <script>
 function esc(v){return String(v??'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 const labels={
+  'PUBLIC_EVENT_RISK':'公告事件风险','PUBLIC_RISK_NOT_CHECKED':'尚未完成公告检查',
+  'PUBLIC_RISK_EXPIRED':'公告检查超过有效期','PUBLIC_RISK_FUTURE_TIMESTAMP':'公告检查时间异常',
+  'PUBLIC_RISK_REFRESH_FAILED':'公告刷新失败，旧检查不能作为通过依据',
+  'CALENDAR_UNAVAILABLE':'缺少对应年份的正式交易日历',
+  'RESEARCH_ONLY':'仅供研究参考','RESEARCH_REFERENCE':'研究参考区间',
   'AKShare':'AKShare公开数据','akshare':'AKShare公开数据','AKShare / Sina':'AKShare / 新浪','AKShare / Eastmoney':'AKShare / 东方财富','AKShare / Tencent':'AKShare / 腾讯','Tushare':'Tushare数据','tushare':'Tushare数据',
   'BaoStock':'BaoStock数据','baostock':'BaoStock数据','Replay / Test Data':'回放/测试数据',
   'PUBLIC DATA SOURCE':'公开数据源','PROFESSIONAL DATA SOURCE':'专业数据源','REPLAY / NON-MARKET':'回放/非市场数据',

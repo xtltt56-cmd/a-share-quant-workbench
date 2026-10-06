@@ -4,6 +4,9 @@
 
 面向 A 股的本地量化研究、纸面监控和人工决策辅助系统。平台明确展示数据来源、新鲜度和模型前瞻验证状态；不会自动向券商提交真实委托，也不承诺投资收益。
 
+v0.2.4 增加独立的「AI 分析」页面，支持批量选择股票、公开信息联网研究，以及工作流事实与 Agent 补充判断对比；保留标准工作流、本地模型和云端 API 三种使用方式。Agent 默认关闭，不替代量化计算、不读取私人持仓、不自动下单。
+操作与密钥配置见 [分析助手简体中文说明](docs/AGENT_QUICKSTART_ZH.md)。发布包不包含 API 密钥、账户数据或本机运行状态，下载者需要使用自己的凭据并明确授权费用。云端链路已进行小样本真实调用验收；这不代表预测准确率或投资效果已经验证。
+
 ## Stage 2 progress (2026-08-08)
 
 - [x] PIT feature store with separate trade date, report period, announcement date, effective date, and ingest time.

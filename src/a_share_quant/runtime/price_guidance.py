@@ -43,12 +43,14 @@ class PriceGuidanceRuntime:
         candidate_symbols: tuple[str, ...] = (),
         holding_positions: tuple[Mapping[str, Any], ...] = (),
         engine: PriceGuidanceEngine | None = None,
+        require_current_session: bool = False,
     ) -> None:
         self.bars_by_symbol = dict(bars_by_symbol)
         self.store = store
         self.candidate_symbols = tuple(candidate_symbols)
         self.holding_positions = tuple(holding_positions)
         self.engine = engine or PriceGuidanceEngine()
+        self.require_current_session = require_current_session
 
     def generate(
         self,
@@ -73,6 +75,10 @@ class PriceGuidanceRuntime:
             try:
                 if bars is None:
                     raise ValueError("NO_RELIABLE_GUIDANCE")
+                if self.require_current_session:
+                    dates = pd.to_datetime(bars["date"], errors="coerce").dropna().dt.date
+                    if dates.empty or dates.max() != calculation:
+                        raise ValueError("STALE_DAILY_INPUT")
                 features = build_price_features(bars, cutoff=calculation)
                 previous = position.get("previous_protection") if position else None
                 corporate_action = previous is not None and abs(
@@ -165,6 +171,8 @@ def _reason(exc: Exception) -> str:
     text = str(exc).strip()
     if text == "NO_RELIABLE_GUIDANCE":
         return text
+    if text == "STALE_DAILY_INPUT":
+        return text
     if "252" in text:
         return "INSUFFICIENT_HISTORY"
     if "UNSUPPORTED_SECURITY_RULES" in text:
@@ -201,6 +209,7 @@ def load_or_generate_price_guidance_store(
     *,
     repo_root: str | Path,
     official_signal_store: OfficialSignalStore,
+    holding_symbols: tuple[str, ...] | None = None,
 ) -> PriceGuidanceStore:
     """Load durable plans and refresh daily plans from the latest official signals.
 
@@ -215,7 +224,8 @@ def load_or_generate_price_guidance_store(
     signals = official_signal_store.latest()
     if not signals:
         return store
-    symbols = tuple(signal.symbol for signal in signals)
+    candidate_symbols = tuple(signal.symbol for signal in signals)
+    symbols = tuple(dict.fromkeys((*candidate_symbols, *(holding_symbols or ()))))
     calculation = max(signal.data_cutoff or signal.signal_date for signal in signals)
     valid_for = AShareTradingCalendar().next_session(calculation)
     existing_holding_plans = tuple(
@@ -223,16 +233,18 @@ def load_or_generate_price_guidance_store(
     )
     try:
         bars_by_symbol = load_bars(Path(repo_root).resolve() / "data", symbols)
-        if not bars_by_symbol:
+        if not bars_by_symbol and holding_symbols is None:
             return store
         result = PriceGuidanceRuntime(
             bars_by_symbol=bars_by_symbol,
             store=store,
-            candidate_symbols=symbols,
+            candidate_symbols=candidate_symbols,
+            holding_positions=tuple({"symbol": symbol} for symbol in (holding_symbols or ())),
+            require_current_session=holding_symbols is not None,
         ).generate(calculation, valid_for)
     except (FileNotFoundError, OSError, RuntimeError, ValueError):
         return store
-    if existing_holding_plans:
+    if existing_holding_plans and holding_symbols is None:
         store.replace_plans(result.plans + existing_holding_plans)
     return store
 
