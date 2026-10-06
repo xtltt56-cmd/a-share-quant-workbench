@@ -1,6 +1,9 @@
 # Optional Agent SDKs; validated separately from the standard workflow.
 ollama==0.6.3
 openai==3.24.0
+ddgs==9.16.0
+primp==2.0.1
+beautifulsoup4==4.15.0
 httpx==0.28.1
 httpx2==2.13.1
 httpcore2==2.13.1

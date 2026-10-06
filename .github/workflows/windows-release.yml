@@ -43,8 +43,9 @@ jobs:
         run: python -m venv .venv
       - name: Install locked test environment
         run: >-
-          .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free]" lightgbm scikit-learn
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free,agent]" lightgbm scikit-learn
           -c constraints/runtime-py312.txt
+          -c constraints/agent-py312.txt
       - name: Verify, lint, and test
         shell: pwsh
         run: |

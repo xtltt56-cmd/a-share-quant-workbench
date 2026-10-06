@@ -32,7 +32,10 @@ def test_official_ollama_probe_and_chat_protocol(monkeypatch, remote):
         assert body["format"] == "json"
         assert body["options"]["num_ctx"] == 4096
         assert body["options"]["num_predict"] == 512
-        assert len(body["tools"]) == 2
+        assert {tool["function"]["name"] for tool in body["tools"]} == {
+            "get_stock_context", "get_workflow_health", "get_stock_research",
+            "search_public_web", "read_public_page",
+        }
         return httpx.Response(200, json={
             "model": "qwen-test:9b", "done": True, "done_reason": "stop",
             "message": {"role": "assistant", "content": "", "thinking": "do-not-expose",

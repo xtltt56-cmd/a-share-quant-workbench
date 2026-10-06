@@ -373,10 +373,17 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             runtime = self.server.agent_runtime
             if path == "/api/agent/config":
                 result = runtime.configure(payload)
+            elif path == "/api/agent/credential" and set(payload) == {"api_key"}:
+                result = runtime.save_credential(payload["api_key"])
+            elif path == "/api/agent/credential/remove" and not payload:
+                result = runtime.remove_credential()
             elif path == "/api/agent/probe" and not payload:
                 result = runtime.probe()
-            elif path == "/api/agent/start" and set(payload) == {"symbol", "question"}:
-                result = runtime.start(payload["symbol"], payload["question"])
+            elif path == "/api/agent/start" and set(payload) in (
+                {"symbol", "question"}, {"symbol", "question", "web_research"}
+            ):
+                result = runtime.start(payload["symbol"], payload["question"],
+                                       web_research=payload.get("web_research", True))
             elif path == "/api/agent/cancel" and set(payload) == {"task_id"}:
                 result = runtime.cancel(payload["task_id"])
             else:

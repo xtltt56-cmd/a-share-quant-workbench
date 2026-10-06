@@ -24,6 +24,7 @@
     <a href="#monitor" data-page="monitor"><span data-icon="monitor"></span><span class="nav-text">盘中监控</span></a>
     <a href="#holdings" data-page="holdings"><span data-icon="holdings"></span><span class="nav-text">我的持仓</span></a>
     <a href="#models" data-page="models"><span data-icon="models"></span><span class="nav-text">模型观察</span></a>
+    <a href="#agent" data-page="agent"><span data-icon="agent"></span><span class="nav-text">AI 分析</span></a>
     <a href="#system" data-page="system"><span data-icon="system"></span><span class="nav-text">数据与系统</span></a>
   </nav>
   <div class="sidebar-bottom"><span class="local-label"><i></i><span class="nav-text">本地工作空间</span></span><a href="/classic"><span class="nav-text">经典工作台</span> ↗</a></div>
@@ -34,7 +35,7 @@
   <main id="main" tabindex="-1">
     <div class="page-heading"><div><h1 id="page-title">投资总览</h1><p id="page-subtitle">先看数据状态，再看候选与价格。</p></div><button class="primary" id="refresh"><span data-icon="refresh"></span>刷新数据</button></div>
     <div id="alert" role="status" aria-live="polite"></div>
-    <div class="agent-mode-banner"><span id="agent-mode-label">标准工作流 · 不调用 AI</span><a href="#system">配置分析助手 →</a></div>
+    <div class="agent-mode-banner"><span id="agent-mode-label">标准工作流 · 不调用 AI</span><a href="#agent">进入 AI 分析 →</a></div>
 
     <section data-view="overview" aria-label="投资总览">
       <div id="overview-stats" class="stats"></div>
@@ -76,12 +77,21 @@
       <details class="help"><summary>预测如何对证</summary><ol><li>记录预测和当时可见数据。</li><li>等待预测周期结束。</li><li>在相同周期和样本上比较。</li><li>审核后决定是否晋级。</li></ol></details>
     </section>
 
+    <section data-view="agent" hidden>
+      <article class="panel agent-intro"><div class="panel-heading"><div><h2>Agent 联网研究</h2><p>选股票 → 开始分析 → 对比规则与补充判断</p></div><a href="#agent-settings" id="agent-config-link">API 与模式设置 →</a></div><p id="agent-analysis-mode" class="muted">正在读取助手状态…</p><div class="agent-steps"><span>① 配置连接 <b id="agent-step-config">待核验</b></span><span>② 选择股票 <b id="agent-step-selection">0 / 10</b></span><span>③ 按需分析 <b id="agent-step-run">未启动</b></span></div></article>
+      <div class="agent-layout">
+        <article class="panel agent-picker"><div class="panel-heading"><h2>选择研究股票</h2><span class="muted">每批最多 10 只</span></div><label class="search"><input id="agent-stock-search" type="search" placeholder="搜索名称或代码" aria-label="筛选研究股票"></label><div class="agent-actions"><button id="agent-select-all">全选当前列表</button><button id="agent-clear">清空选择</button></div><form id="agent-add-form" class="agent-code-form"><label class="sr-only" for="agent-add-code">添加证券代码</label><input id="agent-add-code" placeholder="其他股票：6 位代码" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required><button type="submit">添加</button></form><p id="agent-selection-message" class="muted" role="status"></p><div id="agent-stock-list"></div></article>
+        <div class="agent-main"><article class="panel"><div class="panel-heading"><h2>分析任务</h2><span id="agent-selected-count" class="badge">已选 0 只</span></div><label>研究重点<select id="agent-question"><option value="research">综合研究：联网信息 + 趋势与风险</option><option value="selection">规则解释：为什么入选</option><option value="guidance">规则解释：指导价与适用条件</option><option value="freshness">规则解释：数据是否有效</option><option value="workflow">诊断：工作流异常</option></select></label><label class="check-label agent-web-option"><input id="agent-web-research" type="checkbox" checked>主动检索公开网页与最新新闻（综合研究）</label><p class="muted">联网仅传递股票名称与研究关键词；不发送私人持仓。逐只分析，费用不足自动停止，不会自动下单。</p><div class="agent-actions"><button id="agent-start" class="primary" disabled>开始分析已选股票</button><button id="agent-cancel" hidden>停止本批分析</button></div><p id="agent-start-notice" role="status" aria-live="polite"></p><div id="agent-progress" role="status" aria-live="polite"></div></article><div id="agent-result" aria-live="polite"><div class="panel agent-empty"><h3>还没有分析结果</h3><p>在左侧勾选股票，再点击“开始分析已选股票”。结果将分开展示工作流事实、Agent 补充判断与网络来源。</p></div></div></div>
+      </div>
+    </section>
+
     <section data-view="system" hidden>
-      <article class="panel agent-settings"><div class="panel-heading"><div><h2>分析助手</h2><p>量化计算保持独立；只在点击分析后调用模型。</p></div><span id="agent-status" class="badge">标准工作流</span></div>
+      <article class="panel agent-settings" id="agent-settings"><div class="panel-heading"><div><h2>分析助手设置</h2><p>量化计算保持独立；只在点击分析后调用模型。</p></div><span id="agent-status" class="badge">标准工作流</span></div>
+        <div class="agent-credential"><h3>DeepSeek API 密钥</h3><p id="agent-key-status" role="status">正在读取凭据状态…</p><form id="agent-key-form"><label for="agent-api-key">输入或更换密钥</label><input id="agent-api-key" type="password" autocomplete="new-password" minlength="16" maxlength="512" placeholder="粘贴完整 API 密钥，保存后清空输入" required><div class="agent-actions"><button id="agent-key-save" type="submit">安全保存到本机</button><button id="agent-key-remove" type="button" disabled>移除网页保存的密钥</button></div></form><p id="agent-key-message" role="status" aria-live="polite"></p><p class="muted">Windows 当前账户加密保存；不进入浏览器缓存、配置响应或 Git 仓库。移除后仍可能使用原有环境变量配置。</p></div>
         <form id="agent-settings-form"><div class="form-grid">
           <label>工作方式<select id="agent-mode"><option value="WORKFLOW">标准工作流（不调用 AI）</option><option value="CLOUD">Agent 辅助 · DeepSeek V4.1 Flash（主模型）</option><option value="LOCAL">Agent 辅助 · 本地模型（可选实验）</option></select></label>
           <label id="agent-local-field">本地模型名称<input id="agent-local-model" maxlength="128" value="qwen3.5-local:9b-q4_k_m" autocomplete="off"></label>
-        </div><div id="agent-cloud-fields" hidden><p class="quiet-note">主模型：DeepSeek V4.1 Flash（接口标识 deepseek-flash）。后台读取本机 DEEPSEEK_API_KEY；密钥不填入网页。仅发送公开股票信息，不发送私人持仓或成交文件。</p><div class="form-grid"><label>每日费用上限（美元）<input id="agent-daily-budget" type="number" min="0" max="0.10" step="0.01" value="0"></label><label>每任务费用上限（美元）<input id="agent-task-budget" type="number" min="0" max="0.02" step="0.01" value="0"></label><label>本次实验累计上限（人民币）<input id="agent-experiment-budget" type="number" min="0" max="3" step="0.01" value="0"></label></div><label class="check-label"><input id="agent-payment" type="checkbox">确认上述费用限额（不代表立即开始测试）</label><label class="check-label"><input id="agent-generation" type="checkbox">核验连接后，确认启用收费分析 / 测试</label><p class="muted">累计实验额度不会跨日重置；重启保留已用及预留费用。取消不保证远端停止计费。保存设置和连接核验均不发送生成请求。</p></div>
+        </div><div id="agent-cloud-fields" hidden><p class="quiet-note">主模型：DeepSeek V4.1 Flash（接口标识 deepseek-flash）。使用上方保存的密钥，或已有 DEEPSEEK_API_KEY。仅发送公开股票信息，不发送私人持仓或成交文件。</p><div class="form-grid"><label>每日费用上限（美元）<input id="agent-daily-budget" type="number" min="0" max="0.10" step="0.01" value="0"></label><label>每任务费用上限（美元）<input id="agent-task-budget" type="number" min="0" max="0.02" step="0.01" value="0"></label><label>本次实验累计上限（人民币）<input id="agent-experiment-budget" type="number" min="0" max="3" step="0.01" value="0"></label></div><label class="check-label"><input id="agent-payment" type="checkbox">确认上述费用限额（不代表立即开始测试）</label><label class="check-label"><input id="agent-generation" type="checkbox">核验连接后，确认启用收费分析 / 测试</label><p class="muted">累计实验额度不会跨日重置；重启保留已用及预留费用。取消不保证远端停止计费。保存设置和连接核验均不发送生成请求。</p></div>
         <div class="agent-actions"><button class="primary" type="submit">保存模式</button><button id="agent-probe" type="button">核验连接（不生成内容）</button></div></form>
         <p id="agent-budget-usage" class="muted"></p><p id="agent-experiment-usage" class="muted"></p><p id="agent-connection-status" role="status"></p><p id="agent-settings-message" role="status" aria-live="polite"></p><p class="muted">试用阶段：尚未完成全部真实任务评测。不修改指导价、不下单、不自动转用云端。缺少模型或凭据时仍可使用标准工作流。</p>
       </article>
@@ -95,11 +105,11 @@
 
 <dialog id="stock-dialog" aria-labelledby="stock-title">
   <div class="drawer-heading"><h2 id="stock-title"></h2><button id="close-stock" class="icon-button" aria-label="关闭股票详情"><span data-icon="close"></span></button></div>
+  <div class="agent-detail-entry"><span>想核查规则以外的信息？</span><button id="stock-agent-entry" class="primary">加入 AI 分析 →</button></div>
   <div id="stock-summary"></div><section id="price-plan" class="price-plan"></section>
   <div class="chart-heading"><h3>历史日 K 线</h3><select id="chart-range" aria-label="K线范围"><option value="60">最近 60 条</option><option value="120" selected>最近 120 条</option><option value="252">最近 252 条</option><option value="600">最近 600 条</option></select></div>
   <div id="stock-chart" role="img" aria-label="股票日K线与成交量图"></div><div id="chart-note" class="muted"></div><div id="stock-reasons"></div>
   <section class="evidence-panel"><div class="panel-heading"><h3>核验依据</h3><button id="stock-evidence-button">查看核验依据</button></div><p class="muted">后台事实摘要，不是 AI 预测；不会调用付费模型或提交委托。</p><div id="stock-evidence" aria-live="polite"></div></section>
-  <section class="evidence-panel agent-analysis"><div class="panel-heading"><h3>Agent 辅助分析</h3><a href="#system" id="agent-config-link">设置模式</a></div><p id="agent-analysis-mode" class="muted">标准工作流模式，不调用模型。</p><div class="agent-actions"><select id="agent-question" aria-label="分析问题"><option value="selection">为什么入选</option><option value="guidance">指导价与适用条件</option><option value="freshness">数据是否有效</option><option value="workflow">工作流异常</option></select><button id="agent-start" class="primary" disabled>开始分析</button><button id="agent-cancel" hidden>取消分析</button></div><div id="agent-result" role="status" aria-live="polite"></div></section>
 </dialog>
 <noscript>请启用 JavaScript，或<a href="/classic">打开经典工作台</a>。</noscript>
 </body>

@@ -85,7 +85,7 @@ class WorkbenchContextTools:
             "expected_session": expected,
             "source": (candidate or {}).get("source") or snapshot["active_source"],
             "summary_zh": (
-                "当前仅展示后台可复核的事实与限制；尚未接入语言模型，不能据此保证股价表现。"
+                "当前摘要是后台可复核的规则事实，不是 AI 研究结论，不能据此保证股价表现。"
             ),
             "manual_execution_required": True,
         }

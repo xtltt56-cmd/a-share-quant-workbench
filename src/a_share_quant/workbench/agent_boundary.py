@@ -19,6 +19,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.storage.atomic_json import canonical_bytes
+from a_share_quant.workbench.agent_research import build_research
+from a_share_quant.workbench.agent_web import WebResearch
 from a_share_quant.workbench.context_tools import WorkbenchContextTools
 
 
@@ -59,6 +61,21 @@ class EvidenceClaim(BaseModel):
 ShortText = Annotated[str, Field(min_length=1, max_length=500)]
 
 
+class ResearchInsight(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    evidence_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    observation_zh: ShortText
+    interpretation_zh: ShortText
+    source_ids: list[str] = Field(default_factory=list, max_length=6)
+
+
+class ResearchConclusion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    conclusion: Literal["WAIT_FOR_DATA", "RISK_REVIEW", "OBSERVE", "RESEARCH_CANDIDATE"]
+    insights: list[ResearchInsight] = Field(min_length=1, max_length=6)
+    next_steps: list[ShortText] = Field(min_length=1, max_length=6)
+
+
 class AgentExplanation(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -72,6 +89,7 @@ class AgentExplanation(BaseModel):
     missing_conditions: list[ShortText] = Field(max_length=64)
     evidence_ids: list[str] = Field(min_length=1, max_length=6)
     claims: list[EvidenceClaim] = Field(max_length=24)
+    research: ResearchConclusion | None = None
     manual_execution_required: Literal[True] = True
 
 
@@ -102,6 +120,7 @@ class ReadonlyAgentTools:
         config: AgentPreparationConfig | None = None,
         stop_event: threading.Event | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        allow_web: bool = False,
     ) -> None:
         self.tools = tools
         self.symbol = normalize_symbol(symbol)
@@ -112,6 +131,8 @@ class ReadonlyAgentTools:
         self.calls = 0
         self._evidence: dict[str, dict[str, Any]] = {}
         self._stock_evidence_id: str | None = None
+        self.allow_web = allow_web
+        self.web = WebResearch() if allow_web else None
 
     def _check_active(self) -> None:
         if self.stop_event.is_set():
@@ -121,14 +142,29 @@ class ReadonlyAgentTools:
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._check_active()
-        if name not in {"get_stock_context", "get_workflow_health"}:
+        if name not in {"get_stock_context", "get_workflow_health", "get_stock_research",
+                        "search_public_web", "read_public_page"}:
             raise PermissionError("AGENT_TOOL_NOT_ALLOWED")
-        if name == "get_stock_context":
+        if name in {"search_public_web", "read_public_page"}:
+            if not self.allow_web:
+                raise PermissionError("AGENT_TOOL_NOT_ALLOWED")
+            fields = {"symbol", "query"} if name == "search_public_web" else {"symbol", "source_id"}
+            allowed_fields = ((fields, fields | {"scope"})
+                              if name == "search_public_web" else (fields,))
+            if (set(arguments) not in allowed_fields
+                or not isinstance(arguments.get("symbol"), str)
+                or name == "search_public_web"
+                and (not isinstance(arguments.get("scope", "COMPANY"), str)
+                     or arguments.get("scope", "COMPANY") not in {"COMPANY", "TOPIC"})):
+                raise ValueError("AGENT_ARGUMENTS_REJECTED")
+            if normalize_symbol(arguments["symbol"]) != self.symbol:
+                raise PermissionError("AGENT_STOCK_SCOPE_REJECTED")
+        if name in {"get_stock_context", "get_stock_research"}:
             if set(arguments) != {"symbol"} or not isinstance(arguments["symbol"], str):
                 raise ValueError("AGENT_ARGUMENTS_REJECTED")
             if normalize_symbol(arguments["symbol"]) != self.symbol:
                 raise PermissionError("AGENT_STOCK_SCOPE_REJECTED")
-        elif arguments:
+        elif name == "get_workflow_health" and arguments:
             raise ValueError("AGENT_ARGUMENTS_REJECTED")
         if self.calls >= self.config.max_tool_calls:
             raise RuntimeError("AGENT_TOOL_BUDGET_EXHAUSTED")
@@ -137,6 +173,17 @@ class ReadonlyAgentTools:
         if name == "get_stock_context":
             payload = self._public_stock()
             self._stock_evidence_id = payload["evidence_id"]
+        elif name == "get_stock_research":
+            payload = self._public_research()
+        elif name in {"search_public_web", "read_public_page"}:
+            if name == "search_public_web":
+                context = self.tools.get_stock_context(self.symbol)
+                raw = self.web.search(self.symbol, context["name"], arguments["query"],
+                                      scope=arguments.get("scope", "COMPANY"),
+                                      initial=self.web.searches == 0)
+            else:
+                raw = self.web.read(self.symbol, arguments["source_id"])
+            payload = _evidence(raw, observed_at=raw["retrieved_at"])
         else:
             payload = self._public_health()
         self._check_active()
@@ -174,6 +221,10 @@ class ReadonlyAgentTools:
             },
         }, observed_at=raw["observed_at"])
 
+    def _public_research(self) -> dict[str, Any]:
+        payload = build_research(self.tools.get_stock_context(self.symbol))
+        return _evidence(payload, observed_at=payload.pop("observed_at"))
+
     def validate_explanation(self, payload: dict[str, Any]) -> AgentExplanation:
         """Check structure, scope, issued evidence and explicit factual claims.
 
@@ -194,11 +245,37 @@ class ReadonlyAgentTools:
         if health_ids and health_ids != {self._public_health()["evidence_id"]}:
             raise ValueError("AGENT_EVIDENCE_CHANGED")
         stock = self._evidence[self._stock_evidence_id]
+        research_ids = {eid for eid, item in self._evidence.items()
+                        if item.get("tool") == "get_stock_research"}
+        if research_ids and research_ids != {self._public_research()["evidence_id"]}:
+            raise ValueError("AGENT_EVIDENCE_CHANGED")
         missing = set(stock["blocking_reasons"])
         if not missing.issubset(answer.missing_conditions) or (
             missing and answer.status == "FACTS_ONLY"
         ):
             raise ValueError("AGENT_BLOCKING_CONDITIONS_OMITTED")
+        if answer.research:
+            if not research_ids or not research_ids.issubset(cited):
+                raise ValueError("AGENT_RESEARCH_EVIDENCE_MISSING")
+            if missing and answer.research.conclusion == "RESEARCH_CANDIDATE":
+                raise ValueError("AGENT_BLOCKING_CONDITIONS_OMITTED")
+            web_ids = {eid for eid, item in self._evidence.items()
+                       if item.get("tool") in {"search_public_web", "read_public_page"}}
+            if not web_ids.issubset(cited):
+                raise ValueError("AGENT_WEB_EVIDENCE_MISSING")
+            if (any(self._evidence[eid].get("sources") for eid in web_ids)
+                and not any(item.evidence_id in web_ids and item.source_ids
+                            for item in answer.research.insights)):
+                raise ValueError("AGENT_WEB_INSIGHT_MISSING")
+            for insight in answer.research.insights:
+                if insight.evidence_id not in cited:
+                    raise ValueError("AGENT_CLAIM_NOT_CITED")
+                evidence = self._evidence[insight.evidence_id]
+                sources = evidence.get("sources", {})
+                if any(source not in sources for source in insight.source_ids):
+                    raise ValueError("AGENT_CLAIM_NOT_CITED")
+                if sources and not insight.source_ids:
+                    raise ValueError("AGENT_CLAIM_NOT_CITED")
         for claim in answer.claims:
             if claim.evidence_id not in cited:
                 raise ValueError("AGENT_CLAIM_NOT_CITED")

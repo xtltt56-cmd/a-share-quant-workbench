@@ -10,6 +10,27 @@ from a_share_quant.workbench.agent_config import AgentRuntimeConfig
 
 TOOLS = [
     {"type": "function", "function": {
+        "name": "search_public_web", "description": "按当前股票检索新闻、行业政策或公司公开信息。",
+        "parameters": {"type": "object", "properties": {"symbol": {"type": "string"},
+                       "query": {"type": "string"}, "scope": {
+                           "type": "string", "enum": ["COMPANY", "TOPIC"],
+                           "description": "COMPANY 查公司；TOPIC 查相关行业、政策或宏观背景。"}},
+                       "required": ["symbol", "query"],
+                       "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
+        "name": "read_public_page", "description": "阅读本次已检索来源的正文节选。",
+        "parameters": {"type": "object", "properties": {"symbol": {"type": "string"},
+                       "source_id": {"type": "string"}}, "required": ["symbol", "source_id"],
+                       "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
+        "name": "get_stock_research",
+        "description": "读取当前股票的补充历史风险指标和公告标题证据。",
+        "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}},
+                       "required": ["symbol"], "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
         "name": "get_stock_context", "description": "读取当前指定股票的公开事实和阻塞原因。",
         "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}},
                        "required": ["symbol"], "additionalProperties": False},

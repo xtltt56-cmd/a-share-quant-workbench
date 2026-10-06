@@ -1,5 +1,7 @@
 # Windows x64 runtime dependencies for the public distribution.
 # Keep this file synchronized with the tested runtime constraints.
+# Ship the small Agent SDKs without enabling models or including credentials.
+-r agent-py312.txt
 akshare==1.18.83
 baostock==0.9.3
 duckdb==1.5.5

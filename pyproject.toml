@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a-share-quant"
-version = "0.2.3"
+version = "0.2.4"
 description = "Framework-first A-share quantitative research and paper-trading system"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,8 @@ dependencies = [
 agent = [
     "ollama==0.6.3",
     "openai==3.24.0",
+    "ddgs==9.16.0",
+    "beautifulsoup4>=4.12,<5",
 ]
 dev = [
     "pytest>=8,<9",

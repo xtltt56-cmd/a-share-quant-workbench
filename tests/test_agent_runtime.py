@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from a_share_quant.storage.atomic_json import write_checked_json
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
-from a_share_quant.workbench.agent_config import QUESTIONS, AgentRuntimeConfig
+from a_share_quant.workbench.agent_config import AgentRuntimeConfig
 from a_share_quant.workbench.agent_runtime import AgentRuntime, BudgetLedger, _prompt
 from a_share_quant.workbench.app import create_server
 from a_share_quant.workbench.context_tools import WorkbenchContextTools
@@ -113,7 +113,7 @@ def completed(runtime, job):
 
 # Versioned 40-case contract matrix: four supported questions x ten input conditions.
 # This is deliberately not described as forty real-model evaluations.
-@pytest.mark.parametrize("question", list(QUESTIONS))
+@pytest.mark.parametrize("question", ["selection", "guidance", "freshness", "workflow"])
 @pytest.mark.parametrize("condition", [
     "baseline", "stale", "no_guidance", "quote_missing", "risk_review",
     "future", "candidate_missing", "provider_failed", "history_missing", "injection",
