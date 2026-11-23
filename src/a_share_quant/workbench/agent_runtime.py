@@ -26,7 +26,11 @@ from a_share_quant.storage.atomic_json import canonical_bytes, read_checked_json
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
 from a_share_quant.storage.prospective_ledger_store import _lock_file, _unlock_file
 from a_share_quant.workbench.agent_boundary import AgentPreparationConfig, ReadonlyAgentTools
-from a_share_quant.workbench.agent_config import QUESTIONS, AgentRuntimeConfig
+from a_share_quant.workbench.agent_config import (
+    QUESTIONS,
+    AgentRuntimeConfig,
+    load_cloud_pricing,
+)
 from a_share_quant.workbench.agent_credentials import AgentCredentials
 from a_share_quant.workbench.agent_provider import TOOLS, SDKProvider, tool_arguments
 from a_share_quant.workbench.context_tools import WorkbenchContextTools
@@ -49,7 +53,7 @@ NOTICES = {
     "BUDGET_EXHAUSTED": "费用预留超过授权上限，未继续调用。",
     "BUSY": "已有分析任务，请先等待或取消。",
     "STALE": "数据已变化或缓存已过期，请重新分析；不会自动收费。",
-    "PRICE_REVIEW_REQUIRED": "云端计价快照已过复核期；暂停调用，需更新核实的价格配置。",
+    "PRICE_REVIEW_REQUIRED": "云端计价快照缺失或已过复核期；请安装含有效计价快照的工作台版本。",
     "BUDGET_UNAVAILABLE": "费用账本无法核验；已暂停云端调用，标准工作流仍可用。",
     "EXPERIMENT_EXHAUSTED": "本次实验累计额度已用尽，已停止收费调用；不会按日期重置。",
     "AWAITING_APPROVAL": "云端分析尚未启用；连接检查不生成内容，等待确认后再开始测试。",
@@ -59,11 +63,17 @@ NOTICES = {
 }
 
 
+def _shanghai_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+
 class BudgetLedger:
     """Durable cross-process conservative reservations; unknown charges stay reserved."""
 
-    def __init__(self, policy: ProjectStoragePolicy) -> None:
+    def __init__(self, policy: ProjectStoragePolicy, *,
+                 clock: Callable[[], datetime] = _shanghai_now) -> None:
         self.policy = policy
+        self.clock = clock
         self.path = policy.authorize(".runtime/agent/budget.json")
         self.lock_path = policy.authorize(".runtime/agent/budget.lock")
 
@@ -114,7 +124,7 @@ class BudgetLedger:
 
     def reserve(self, amount: Decimal, cfg: AgentRuntimeConfig, task_spent: Decimal, *,
                 amount_cny: Decimal | None = None) -> str:
-        day = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        day = self.clock().astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
         with self.locked():
             body = self.read()
             trial_limit = Decimal(cfg.experiment_budget_cny)
@@ -184,9 +194,12 @@ class BudgetLedger:
 
 class AgentRuntime:
     def __init__(self, tools: WorkbenchContextTools, repo_root: Path | None = None, *,
-                 provider_factory: Callable[[AgentRuntimeConfig], Any] = SDKProvider) -> None:
+                 provider_factory: Callable[[AgentRuntimeConfig], Any] = SDKProvider,
+                 clock: Callable[[], datetime] = _shanghai_now) -> None:
         self.tools = tools
         self.provider_factory = provider_factory
+        self.clock = clock
+        self._pricing = load_cloud_pricing()
         self.policy = ProjectStoragePolicy(repo_root) if repo_root else None
         self.config = AgentRuntimeConfig()
         self.config_error = False
@@ -201,7 +214,7 @@ class AgentRuntime:
         self.cache: dict[str, tuple[float, dict[str, Any], dict[str, Any]]] = {}
         self.probe_result: dict[str, Any] = {"status": "NOT_PROBED", "models": []}
         try:
-            self.budget = BudgetLedger(self.policy) if self.policy else None
+            self.budget = BudgetLedger(self.policy, clock=clock) if self.policy else None
             self.settings_path = (self.policy.authorize(".runtime/agent/settings.json")
                                   if self.policy else None)
         except (OSError, ValueError):
@@ -215,8 +228,17 @@ class AgentRuntime:
                 self.config = AgentRuntimeConfig.model_validate(
                     read_checked_json(self.settings_path, maximum_bytes=16384)
                 )
+                if self.config.backend == "CLOUD" and (
+                    self._pricing is None
+                    or self.config.approved_price_version != self._pricing.version
+                ):
+                    self.config = self.config.model_copy(update={"generation_authorized": False})
             except (OSError, ValueError, TypeError):
                 self.config_error = True
+
+    def _pricing_is_valid(self) -> bool:
+        today = self.clock().astimezone(ZoneInfo("Asia/Shanghai")).date()
+        return self._pricing is not None and self._pricing.valid_on(today)
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -230,9 +252,7 @@ class AgentRuntime:
                     status = "SDK_MISSING"
                 elif cfg.backend == "CLOUD" and not self._key():
                     status = "NOT_CONFIGURED"
-                elif cfg.backend == "CLOUD" and datetime.now(ZoneInfo("Asia/Shanghai")).date() > (
-                    date(2026, 11, 4)
-                ):
+                elif cfg.backend == "CLOUD" and not self._pricing_is_valid():
                     status = "PRICE_REVIEW_REQUIRED"
                 elif cfg.backend == "CLOUD" and not cfg.generation_authorized:
                     status = "AWAITING_APPROVAL"
@@ -247,7 +267,7 @@ class AgentRuntime:
             budget_notice = None
             if self.budget is not None:
                 try:
-                    day = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+                    day = self.clock().astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
                     body = self.budget.read()
                     today_spent = body["days"].get(day, "0")
                     experiment = copy.deepcopy(body.get("experiment"))
@@ -263,6 +283,7 @@ class AgentRuntime:
                         status = "BUDGET_UNAVAILABLE"
             return {"status": status, "enabled": cfg.enabled,
                     "notice_zh": NOTICES.get(status, status), "config": cfg.model_dump(),
+                    "pricing": self._pricing.model_dump(mode="json") if self._pricing else None,
                     "probe": copy.deepcopy(self.probe_result), "active_task_id": self.active_id,
                     "questions": QUESTIONS, "cloud_scope": "PUBLIC_STOCK_ONLY",
                     "quality_status": "EXPERIMENTAL_NOT_FULLY_EVALUATED",
@@ -314,6 +335,12 @@ class AgentRuntime:
                     "MODEL_AVAILABLE_NOT_GENERATED"
                 ))):
                 raise RuntimeError("AGENT_CONNECTION_NOT_VERIFIED")
+            if cfg.enabled and cfg.backend == "CLOUD" and cfg.generation_authorized:
+                if not self._pricing_is_valid():
+                    raise RuntimeError("PRICE_REVIEW_REQUIRED")
+                cfg = cfg.model_copy(update={"approved_price_version": self._pricing.version})
+            else:
+                cfg = cfg.model_copy(update={"approved_price_version": None})
             if self.settings_path is not None:
                 if Decimal(cfg.experiment_budget_cny) > 0:
                     self.budget.approve_experiment(Decimal(cfg.experiment_budget_cny))
@@ -559,6 +586,7 @@ class AgentRuntime:
             provider.api_key = self._key()
         task_cost = Decimal(0)
         task_cost_cny = Decimal(0)
+        pricing = self._pricing if cfg.backend == "CLOUD" else None
         known_cost = True
         usages = []
         try:
@@ -613,10 +641,11 @@ class AgentRuntime:
                     raise ValueError("AGENT_CONTEXT_TOO_LARGE")
                 # UTF-8 byte upper bound plus conservative protocol/tool overhead.
                 input_bound = len(raw) + len(canonical_bytes(TOOLS)) + 4096
-                reserved = _cost(input_bound, cfg.max_output_tokens, cfg)
-                reserved_cny = _cost_cny(input_bound, cfg.max_output_tokens, cfg)
                 day = None
                 if cfg.backend == "CLOUD":
+                    if pricing is None:
+                        raise RuntimeError("PRICE_REVIEW_REQUIRED")
+                    reserved, reserved_cny = pricing.cost(input_bound, cfg.max_output_tokens)
                     day = self.budget.reserve(reserved, cfg, task_cost, amount_cny=reserved_cny)
                     task_cost += reserved
                     task_cost_cny += reserved_cny
@@ -632,9 +661,10 @@ class AgentRuntime:
                                and all(type(usage.get(k)) is int and usage[k] >= 0
                                        for k in ("input", "output")))
                 if day:
-                    actual = _cost(usage["input"], usage["output"], cfg) if valid_usage else None
-                    actual_cny = (_cost_cny(usage["input"], usage["output"], cfg)
-                                  if valid_usage else None)
+                    actual, actual_cny = (
+                        pricing.cost(usage["input"], usage["output"])
+                        if valid_usage else (None, None)
+                    )
                     self.budget.settle(day, reserved, actual, reserved_cny=reserved_cny,
                                        actual_cny=actual_cny)
                     if actual is not None:
@@ -698,24 +728,13 @@ class AgentRuntime:
                              cost_status=("ESTIMATED_USAGE" if known_cost
                                           else "CONSERVATIVE_RESERVED")
                              if cfg.backend == "CLOUD" else "LOCAL_NO_API_FEE",
-                             price_version=cfg.price_version if cfg.backend == "CLOUD" else None,
-                             price_version_cny=cfg.price_version_cny
-                             if cfg.backend == "CLOUD" else None,
+                             price_version=pricing.version if pricing else None,
+                             price_version_cny=pricing.version if pricing else None,
                              finished_monotonic=time.monotonic())
                 return
             raise RuntimeError("AGENT_MODEL_BUDGET_EXHAUSTED")
         finally:
             await provider.close()
-
-
-def _cost(input_tokens: int, output_tokens: int, cfg: AgentRuntimeConfig) -> Decimal:
-    return (input_tokens * Decimal(cfg.input_usd_per_million)
-            + output_tokens * Decimal(cfg.output_usd_per_million)) / 1_000_000
-
-
-def _cost_cny(input_tokens: int, output_tokens: int, cfg: AgentRuntimeConfig) -> Decimal:
-    return (input_tokens * Decimal(cfg.input_cny_per_million)
-            + output_tokens * Decimal(cfg.output_cny_per_million)) / 1_000_000
 
 
 def _model_evidence(stock: dict[str, Any]) -> dict[str, Any]:

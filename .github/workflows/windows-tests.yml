@@ -50,3 +50,10 @@ jobs:
         run: .\.venv\Scripts\python.exe -m ruff check .
       - name: Test
         run: .\.venv\Scripts\python.exe -m pytest -q
+
+      - name: Install browser smoke dependencies
+        run: |
+          .\.venv\Scripts\python.exe -m pip install playwright==1.65.2
+          .\.venv\Scripts\python.exe -m playwright install chromium
+      - name: Check offline workbench in Chromium
+        run: .\.venv\Scripts\python.exe tests/browser_smoke.py

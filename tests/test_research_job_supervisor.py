@@ -176,6 +176,26 @@ def test_default_schedule_respects_session_fingerprint_and_refresh_boundaries(tm
     assert next_day[0].startswith("history-")
 
 
+def test_settlement_retries_transient_failure_without_a_new_signal(tmp_path) -> None:
+    launcher = FakeLauncher()
+    supervisor = ResearchJobSupervisor(tmp_path, launcher=launcher)
+    now = datetime(2026, 8, 14, 8, tzinfo=timezone.utc)
+
+    first = supervisor.register_default_jobs(now=now, settlement_fingerprint="daily-a")
+    assert len(first) == 1 and first[0].startswith("settle-")
+    assert supervisor.start_due_jobs(now=now) == first
+    launcher.children[0].running = False
+    assert supervisor.start_due_jobs(now=now + timedelta(seconds=1)) == ()
+    assert supervisor.register_default_jobs(
+        now=now + timedelta(minutes=14), settlement_fingerprint="daily-a",
+    ) == ()
+    retry = supervisor.register_default_jobs(
+        now=now + timedelta(minutes=15), settlement_fingerprint="daily-a",
+    )
+    assert len(retry) == 1 and retry != first
+    assert supervisor.start_due_jobs(now=now + timedelta(minutes=15)) == retry
+
+
 def test_start_due_jobs_limits_one_cpu_and_one_network_child(tmp_path) -> None:
     launcher = FakeLauncher()
     supervisor = ResearchJobSupervisor(tmp_path, launcher=launcher)

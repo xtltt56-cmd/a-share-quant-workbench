@@ -47,7 +47,22 @@ const pageInfo={overview:["投资总览","先看数据状态，再看候选与�
 function route(){let page=location.hash.slice(1);if(["entry","import-section"].includes(page))page="holdings";if(page==="agent-settings")page="system";if(!pageInfo[page])page=location.pathname==="/advisory"?"holdings":"overview";document.querySelectorAll("[data-view]").forEach(el=>el.hidden=el.dataset.view!==page);document.querySelectorAll("[data-page]").forEach(el=>{el.classList.toggle("active",el.dataset.page===page);if(el.dataset.page===page)el.setAttribute("aria-current","page");else el.removeAttribute("aria-current");});$("page-title").textContent=$("breadcrumb").textContent=pageInfo[page][0];$("page-subtitle").textContent=pageInfo[page][1];document.title=pageInfo[page][0]+" · A股量化交易工作台";if(["#entry","#import-section","#agent-settings"].includes(location.hash))$(location.hash.slice(1)).scrollIntoView({behavior:"smooth"});else window.scrollTo({top:0,behavior:"instant"});}
 window.addEventListener("hashchange",route);route();
 async function api(path,body,header){const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),20000);try{const response=await fetch(path,{cache:"no-store",signal:controller.signal,...(body!==undefined?{method:"POST",headers:{"Content-Type":"application/json","X-Quant-Workbench-Request":header||"manual-advisory"},body:JSON.stringify(body)}:{})});const result=await response.json();if(!response.ok)throw Error(result.notice_zh||"请求未完成，请检查数据或重新预览");return result;}finally{clearTimeout(timeout);}}
-function renderDaily(){const query=$("daily-search").value.trim().toLowerCase();let rows=[...(state.official_daily_candidates||[])].filter(x=>(String(x.name)+x.symbol).toLowerCase().includes(query)&&(!$("daily-plan").checked||(present(x.price_guidance?.entry_lower)&&present(x.price_guidance?.entry_upper))));if($("daily-sort").value==="symbol")rows.sort((a,b)=>a.symbol.localeCompare(b.symbol));else rows.sort((a,b)=>Number(b.normalized_score)-Number(a.normalized_score));$("daily-count").textContent=rows.length+" 只候选";$("daily-description").textContent=(state.daily_data_notice_zh||"本系统策略生成的日线候选")+" · 截止 "+(state.daily_data_cutoff||"暂无");$("daily-table").innerHTML=table(["股票名称 / 代码","候选分数","参考买入区间","价格指导","公告风险","信号日期","操作"],rows.map(x=>[
+function dailyPoolCaption(){
+  const input = workflow.stages?.daily?.refresh?.input_summary;
+  if(!input?.symbols?.length)return "范围为本机日线证券池，等待本轮覆盖统计";
+  const labels = {FAILED:"更新失败",MISSING:"缺少日线",STALE_DATA:"日线过期",
+    FUTURE_DATA:"日期超前",INSUFFICIENT_HISTORY:"历史长度不足"};
+  const counts = {};
+  for(const row of input.symbols){
+    if(row.symbol!=="000300")counts[row.status]=(counts[row.status]||0)+1;
+  }
+  const total = Object.values(counts).reduce((sum,count)=>sum+count,0);
+  const excluded = Object.entries(counts).filter(([status])=>status!=="FRESH")
+    .map(([status,count])=>(labels[status]||zh(status))+" "+count+" 只");
+  return "本机日线池 "+total+" 只，输入达标 "+(counts.FRESH||0)+" 只"
+    +(excluded.length?"，"+excluded.join("、"):"");
+}
+function renderDaily(){const query=$("daily-search").value.trim().toLowerCase();let rows=[...(state.official_daily_candidates||[])].filter(x=>(String(x.name)+x.symbol).toLowerCase().includes(query)&&(!$("daily-plan").checked||(present(x.price_guidance?.entry_lower)&&present(x.price_guidance?.entry_upper))));if($("daily-sort").value==="symbol")rows.sort((a,b)=>a.symbol.localeCompare(b.symbol));else rows.sort((a,b)=>Number(b.normalized_score)-Number(a.normalized_score));$("daily-count").textContent=rows.length+" 只候选";$("daily-description").textContent=(state.daily_data_notice_zh||"本系统策略生成的日线候选")+" · 截止 "+(state.daily_data_cutoff||"暂无")+" · "+dailyPoolCaption();$("daily-table").innerHTML=table(["股票名称 / 代码","候选分数","参考买入区间","价格指导","公告风险","信号日期","操作"],rows.map(x=>[
   stockButton(x),
   '<div class="score-line"><strong>'+number(x.normalized_score)+'</strong><span class="score-meter"><i style="width:'+Math.max(0,Math.min(100,Number(x.normalized_score)||0))+'%"></i></span></div>',
   esc(range(x.price_guidance)),
@@ -103,7 +118,10 @@ function renderState(){
   if(daily.some(x=>x.signal_stale))items.push(["日选等待更新","过期候选仅供回看","#daily","查看"]);
   if(guided<daily.length)items.push(["指导区间不完整",(daily.length-guided)+" 只候选缺少区间","#daily","查看"]);
   if((risk.blocked_count||0)+(risk.review_count||0)>0)items.push(["公告需要人工核查",((risk.blocked_count||0)+(risk.review_count||0))+" 只股票触发标题级风险规则","#daily","查看"]);
-  if((risk.unknown_count||0)>0||["UPDATE_FAILED","NOT_CONFIGURED","PARTIAL"].includes(risk.status))items.push(["公告检查未全部完成",(risk.unknown_count||0)+" 只股票尚未确认","#system","检查"]);
+  if((risk.unknown_count||0)>0||["UPDATE_FAILED","NOT_CONFIGURED","PARTIAL"].includes(risk.status))items.push(["公告检查未全部完成",[
+    risk.expired_count?risk.expired_count+" 条检查过期":"",
+    risk.unknown_count?risk.unknown_count+" 只尚未确认":"",
+  ].filter(Boolean).join("，")||risk.notice_zh||"请核验公告来源","#system","检查"]);
   if(!(account.positions||[]).length)items.push(["登记实际持仓","当前本机账本为空","#entry","登记"]);
   const shown=items.length?items:[["暂无额外待处理","仍需核对有效日期","#system","状态"]];
   $("attention-count").textContent=items.length?items.length+" 项":"已检查";
@@ -111,7 +129,7 @@ function renderState(){
   const stale=present(state.stale_quote_count)?Number(state.stale_quote_count):monitor.filter(x=>x.data_quality==="STALE").length;
   $("risk-summary").innerHTML='<div class="risk-row"><span class="risk-label"><i class="'+(quality==="GOOD"?"good":"warning")+'"></i>行情质量</span>'+badge(quality,quality)+'</div>'+ '<div class="risk-row"><span class="risk-label"><i class="'+(stale?"danger":"good")+'"></i>过期报价</span><strong>'+number(stale,0)+' 条</strong></div>'+'<div class="risk-row"><span class="risk-label"><i class="'+((risk.blocked_count||risk.review_count||risk.unknown_count)?"warning":"good")+'"></i>公告风险</span><strong>'+number((risk.blocked_count||0)+(risk.review_count||0),0)+' 只需核查</strong></div>'+ '<div class="risk-row"><span class="risk-label"><i class="warning"></i>执行方式</span><span>仅人工下单</span></div>';
   $("overview-freshness").innerHTML='<div class="status-row"><span>日线数据截止</span><strong>'+esc(cutoff)+'</strong></div><div class="status-row"><span>最后更新时间</span><strong>'+time(state.last_update||state.updated_at)+'</strong></div><div class="status-row"><span>当前数据源</span><strong>'+esc(zh(state.active_source||state.active_provider))+'</strong></div>';
-  $("overview-model").innerHTML='<div class="model-record"><div><strong>'+esc(governance.champion_id||"暂无已登记冠军")+'</strong><small>当前冠军</small></div><div><strong>'+esc(zh(governance.state))+'</strong><small>治理状态</small></div><div><strong>'+number(governance.audit_count,0)+'</strong><small>审计事件</small></div></div><div class="status-row"><span>对证原则</span><strong>只比较未来结果</strong></div>';
+  $("overview-model").innerHTML='<div class="model-record"><div><strong>'+esc(governance.champion_id||"暂无已登记冠军")+'</strong><small>治理登记模型</small></div><div><strong>'+esc(zh(governance.state))+'</strong><small>治理状态</small></div><div><strong>'+number(governance.audit_count,0)+'</strong><small>审计事件</small></div></div><div class="status-row"><span>对证原则</span><strong>只比较未来结果</strong></div>';
   $("system-stats").innerHTML=stat("当前数据源",zh(state.active_source||state.active_provider))+stat("行情总数",number(state.quote_count,0))+stat("过期行情数",number(state.stale_quote_count,0))+stat("故障切换",number(state.fallback_count,0)+" 次");
   $("system-details").innerHTML=def("数据源类别",state.source_class==="PUBLIC DATA SOURCE"?"公开数据源":zh(state.source_class))+def("最后更新时间",time(state.last_update||state.updated_at))+def("日线数据截止",state.daily_data_cutoff)+def("日线数据状态",zh(state.daily_data_status))+def("数据年龄",present(state.data_age_seconds)?number(state.data_age_seconds,0)+" 秒":"暂无")+def("请求延迟",present(state.latency_ms)?number(state.latency_ms,0)+" 毫秒":"暂无")+def("连续更新",state.continuous_updates?"是":"否")+def("最近异常",state.last_error?zh(state.last_error):"无已报告异常");
   $("overview-freshness").innerHTML+=def("日线状态",zh(state.daily_data_status))+def("行情缓存说明",state.data_quality==="GOOD"?"行情已通过质量核验":"缓存报价不可视为实时行情；休市不会使旧缓存恢复有效");
@@ -122,10 +140,22 @@ function renderState(){
 function positionsTable(rows){return table(["股票","总数量（股）","可用数量","成本价"],rows.map(x=>[stockButton(x),number(x.total_quantity,0),number(x.available_quantity,0),number(x.average_cost)]));}
 function renderAccount(){renderAllocation();$("account-stats").innerHTML=stat("本机账本现金",number(account.cash),"元 · 非券商实时资金")+stat("已实现盈亏",number(account.realized_pnl),"元 · 仅依据完整登记")+stat("本机持仓",(account.positions||[]).length+" 只")+stat("券商快照",(account.imported_account_snapshot?.positions||[]).length+" 只");$("holding-table").innerHTML=positionsTable(account.positions||[]);const imported=account.imported_account_snapshot;$("imported-date").textContent=imported?("来源："+imported.source_name+" · 截至 "+imported.as_of):"尚未确认导入券商持仓快照";$("imported-table").innerHTML=positionsTable(imported?.positions||[]);$("holding-plans").innerHTML=(account.price_guidance||[]).map(g=>'<div class="quiet-note"><strong>'+esc(g.name||g.symbol)+'</strong> · '+badge(g.state,g.state)+'<div class="status-row"><span>公告风险</span><strong>'+esc(riskZh(g.event_risk?.level||"NOT_CHECKED"))+'</strong></div><div class="status-row"><span>保护价</span><strong>'+number(g.protection_price)+'</strong></div><div class="status-row"><span>减仓区间</span><strong>'+number(g.reduce_lower)+' – '+number(g.reduce_upper)+'</strong></div><div class="status-row"><span>建议卖出</span><strong>'+number(g.suggested_sell_quantity,0)+' 股</strong></div><small>'+esc(g.notice_zh||"")+'</small></div>').join("");$("guidance").innerHTML=def("当前结论",guidance.action_zh||zh(guidance.state||"INSUFFICIENT_DATA"))+def("依据",guidance.explanation_zh||(guidance.reason_codes||[]).map(zh).join("；")||"暂无可核验的指导上下文")+def("数据截止",guidance.evidence_cutoff||"暂无")+def("人工执行",guidance.notice_zh||"所有成交由用户在券商客户端完成");}
 function progressPanel(){
+  const settlementLabels={
+    REFRESHED_OUTCOME_NOT_READY:"结果数据尚未通过核验",OUTCOME_CONFLICT:"结果记录冲突",
+    OUTCOME_ADJUSTMENT_CONFLICT:"收盘价与交易所涨跌幅口径冲突",
+    MISSING:"缺少结果数据",SUSPENDED:"停牌",STALE:"结果数据过期",CONFLICT:"结果口径冲突",
+  };
+  const reasons=Object.entries(progress.settlement_reasons||{}).map(
+    ([code,count])=>(settlementLabels[code]||code)+" "+number(count)+" 条"
+  );
   if(progress.status!=="OK")return '<div class="notice">'+esc(progress.notice_zh||"前瞻进度尚未读取")+'</div>';
-  return '<div class="stats">'+stat("已记录预测",progress.prediction_count)+stat("等待到期",progress.waiting_count)+stat("到期待结算",progress.overdue_count)+stat("已完成对证",progress.settled_count)+'</div>'+def("最近预测",time(progress.latest_prediction_at))+def("模型版本数",progress.model_count)+def("证据口径",progress.notice_zh)+(progress.overdue_count?'<div class="notice">存在到期未结算记录，需核验结算任务和结果数据；当前不能据此判定模型成熟。</div>':'');
+  return '<div class="stats">'+stat("已记录预测",progress.prediction_count)+stat("等待到期",progress.waiting_count)+stat("到期待结算",progress.overdue_count)+stat("已完成对证",progress.settled_count)+'</div>'+def("最近预测",time(progress.latest_prediction_at))+def("最近结算",time(progress.latest_settlement_at))
+    +def("模型版本数",progress.model_count)
+    +def("近期未采集",progress.missed_sessions?.join("、")||"暂无记录")
+    +def("结算阻塞",reasons.join("；")||(progress.overdue_count?"等待核验":"暂无"))
+    +def("证据口径",progress.notice_zh)+(progress.overdue_count?'<div class="notice">存在到期未结算记录，需核验结算任务和结果数据；当前不能据此判定模型成熟。</div>':'');
 }
-function renderModels(){$("models").innerHTML=progressPanel()+'<div class="model-record"><div><strong>'+esc(governance.champion_id||"暂无已登记冠军")+'</strong><small>当前冠军</small></div><div><strong>'+esc(zh(governance.state))+'</strong><small>治理状态</small></div><div><strong>'+number(governance.audit_count,0)+'</strong><small>审计事件</small></div></div>'+def("模型记录",zh(modelHealth.model_status))+def("数据验证",zh(modelHealth.data_status))+def("预测对证成绩","接口尚未提供可比较的成绩明细")+def("晋级规则","仅使用预测后的未来数据；由人工审核批准");}
+function renderModels(){$("models").innerHTML=progressPanel()+'<div class="model-record"><div><strong>'+esc(governance.champion_id||"暂无已登记冠军")+'</strong><small>治理登记模型</small></div><div><strong>'+esc(zh(governance.state))+'</strong><small>治理状态</small></div><div><strong>'+number(governance.audit_count,0)+'</strong><small>审计事件</small></div></div>'+def("模型记录",zh(modelHealth.model_status))+def("数据验证",zh(modelHealth.data_status))+def("预测对证成绩","接口尚未提供可比较的成绩明细")+def("晋级规则","仅使用预测后的未来数据；由人工审核批准");}
 function renderWorkflow(){
   const s=workflow.stages||{},d=s.daily||{},r=d.refresh||{};
   $("workflow-retry").disabled=!["FAILED","RETRY_EXHAUSTED","BLOCKED"].includes(r.status)||r.error_code==="CHECKPOINT_REJECTED";
@@ -137,7 +167,14 @@ function renderWorkflow(){
     ["公告风险",badge(s.public_risk?.status,s.public_risk?.status),esc(s.public_risk?.notice_zh||"暂无核验说明")],
     ["分析 Agent",badge(s.agent?.status,s.agent?.status),esc(s.agent?.notice_zh||"尚未接入真实语言模型")],
     ["券商只读连接",badge(s.broker_read_only?.status,s.broker_read_only?.status),"人工辅助模式不要求开通 QMT；本系统不会提交委托"]
-  ])+def("必要日线覆盖",r.input_summary?((r.input_summary.symbols||[]).filter(x=>x.status==="FRESH").length+" / "+(r.input_summary.symbols||[]).length+" 只已达到完整输入条件；失败 "+(r.input_summary.symbols_failed||0)+" 只"):"等待后台首次核验")+def("本次核验时间",time(workflow.observed_at));
+  ])+def("优先报价覆盖",s.realtime?.priority_required
+    ?s.realtime.priority_fresh+" / "+s.realtime.priority_required+" 只符合时效要求"
+    :"暂无优先标的")
+    +def("行情请求耗时","优先报价 "+number(s.realtime?.priority_request_ms)
+    +" ms · 全市场 "+number(s.realtime?.full_market_request_ms)+" ms")
+    +def("必要日线覆盖",r.input_summary?((r.input_summary.symbols||[]).filter(x=>x.status==="FRESH").length+" / "+(r.input_summary.symbols||[]).length+" 只已达到完整输入条件；失败 "+(r.input_summary.symbols_failed||0)+" 只"):"等待后台首次核验")+def("交易日历",workflow.calendar?.coverage_warning
+    ?"正式日历仅覆盖未来 "+number(workflow.calendar.lookahead_sessions)+" 个交易日，请检查新版日历"
+    :workflow.calendar?.version)+def("本次核验时间",time(workflow.observed_at));
 }
 async function load(){
   if(refreshing)return;refreshing=true;

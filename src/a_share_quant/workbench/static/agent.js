@@ -39,7 +39,7 @@
     $("agent-cancel").disabled = stopping;
     $("agent-question").disabled = running;
     $("agent-web-research").disabled = running || $("agent-question").value !== "research";
-    $("agent-start-notice").textContent = running ? (stopping ? "正在停止；不会继续队列中的股票。" : "切换页面不会中断任务；可随时停止本批。") : status?.status !== "READY" ? ((status?.notice_zh || "正在读取助手配置…") + " 请在“API 与模式设置”中处理。") : !selected.size ? "先勾选股票，再开始分析；本页不会自动产生 API 费用。" : "已准备好，点击按钮才开始联网检索与模型分析。";
+    $("agent-start-notice").textContent = running ? (stopping ? "正在停止；不会继续队列中的股票。" : "切换页面不会中断任务；可随时停止本批。") : status?.status !== "READY" ? ((status?.notice_zh || "正在读取助手配置…") + (status?.status === "PRICE_REVIEW_REQUIRED" ? "" : " 请在“API 与模式设置”中处理。")) : !selected.size ? "先勾选股票，再开始分析；本页不会自动产生 API 费用。" : "已准备好，点击按钮才开始联网检索与模型分析。";
     $("agent-step-run").textContent = running ? (stopping ? "正在停止" : "执行中") : results.length ? "已结束" : "未启动";
   }
   function renderStatus() {
@@ -53,6 +53,10 @@
     $("agent-key-status").textContent = credential.error ? "本机密钥文件无法解密或核验，请重新保存。" : credential.configured ? "已配置密钥 · " + ({SAVED:"网页保存（Windows 加密）",ENVIRONMENT:"已有环境变量",LEGACY_FILE:"已有本机配置"}[credential.source] || "本机配置") + " · 不显示密钥内容" : "尚未配置，请在下方粘贴 API 密钥。";
     $("agent-key-save").disabled = !credential.can_save || running || status.status === "RUNNING";
     $("agent-key-remove").disabled = !(credential.saved || credential.error) || running || status.status === "RUNNING";
+    const pricing = status.pricing;
+    $("agent-pricing").textContent = pricing
+      ? "云端计价 " + pricing.version + " · 复核 " + pricing.reviewed_on + " · 有效至 " + pricing.valid_through
+      : "暂无可核验的云端计价，请检查工作台版本。";
     $("agent-budget-usage").textContent = status.budget_notice_zh || "今日已结算及保守预留（美元）：" + (status.today_reserved_and_spent_usd ?? "暂不可核验");
     $("agent-experiment-usage").textContent = "实验累计（人民币）：" + (status.experiment?.reserved_and_spent ?? "0") + " / " + (status.experiment?.limit ?? cfg.experiment_budget_cny) + " 元 · 不跨日重置";
     $("agent-connection-status").textContent = "连接核验：" + label(status.probe.status) + (status.probe.checked_at ? " · " + time(status.probe.checked_at) : "");

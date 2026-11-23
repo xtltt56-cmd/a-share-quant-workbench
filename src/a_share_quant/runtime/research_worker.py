@@ -13,13 +13,16 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from a_share_quant.market.trading_calendar import AShareTradingCalendar
 from a_share_quant.research.daily_candidates import latest_complete_signal_date
+from a_share_quant.storage.atomic_json import write_checked_json
 from a_share_quant.storage.project_storage import ProjectStoragePolicy
+from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
 _JOBS = ("history", "screen", "predict", "settle")
 _REASONS = {
@@ -96,20 +99,21 @@ def run_job(
         artifact_relpath, digest = _write_instance_evidence(
             policy, job, instance_id, result
         )
+        incomplete = job == "settle" and bool(result.get("deferred"))
         payload: dict[str, Any] = {
             "format_version": 3,
             "job": job,
             "job_id": instance_id,
-            "status": "SUCCESS",
+            "status": "PARTIAL" if incomplete else "SUCCESS",
             "promotion": "NEVER",
-            "reason_code": None,
+            "reason_code": "SETTLEMENT_DEFERRED" if incomplete else None,
             "artifact_digest": digest,
             "artifact_relpath": artifact_relpath,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "status_path": str(status_path),
         }
         _write_status(policy, status_path, payload)
-        return 0
+        return 1 if incomplete else 0
     except _Partial as exc:
         payload = _blocked_payload(
             job,
@@ -251,12 +255,10 @@ def _verified_job_context(
     if job == "screen":
         return _derive_screen_context(policy)
 
+    if job == "settle":
+        return _derive_settle_context(policy)
     contest = _read_frozen_contest(policy)
-    if contest is None:
-        return None
-    if job == "predict":
-        return _derive_predict_context(policy, contest)
-    return _derive_settle_context(policy, contest)
+    return _derive_predict_context(policy, contest) if contest is not None else None
 
 
 def _run_history(
@@ -384,7 +386,6 @@ def _run_predict(
         ProspectiveCompetition,
         ProspectivePrediction,
     )
-    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
     contest = _contest_from_payload(context.get("contest"))
     signals = context.get("signals")
@@ -488,22 +489,35 @@ def _run_settle(
     from a_share_quant.research.prospective_competition import (
         ProspectiveCompetition,
     )
-    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
     outcomes = context.get("outcomes")
-    if not isinstance(outcomes, tuple) or not outcomes:
+    deferred = list(context.get("deferred", ()))
+    if not isinstance(outcomes, tuple) or not (outcomes or deferred):
         raise _Blocked("REFRESHED_OUTCOME_NOT_READY")
-    try:
-        competition = ProspectiveCompetition(
-            store=ProspectiveLedgerStore(policy=policy),
-            now=_current_time(),
-        )
-        results = competition.settle(outcomes)
-    except (TypeError, ValueError, KeyError):
-        raise _Blocked("REFRESHED_OUTCOME_NOT_READY") from None
+    competition = ProspectiveCompetition(
+        store=ProspectiveLedgerStore(policy=policy),
+        now=_current_time(),
+    )
+    results = []
+    for outcome in outcomes:
+        try:
+            result = competition.settle_due(outcome)
+        except (TypeError, ValueError, KeyError):
+            deferred.append({"prediction_id": outcome.prediction_id, "reason": "OUTCOME_CONFLICT"})
+        else:
+            if not result.matured:
+                deferred.append({"prediction_id": result.prediction_id,
+                                 "reason": result.delay_reason})
+            results.append(result)
     ledger_digest = _ledger_integrity_digest(policy)
+    summary_path = policy.authorize(".runtime/research/settlement-summary.json")
+    policy.revalidate(summary_path)
+    write_checked_json(summary_path, {
+        "checked_at": _current_time().isoformat(), "deferred": deferred[-100:],
+    }, maximum_bytes=32_768)
     return {
         "kind": "settle",
+        "deferred": deferred,
         "settlements": [
             {
                 "prediction_id": item.prediction_id,
@@ -658,6 +672,12 @@ def _derive_predict_context(
     frozen = _contest_from_payload(contest)
     now = _current_time()
     local_signal_date = latest_complete_signal_date(now)
+    calendar = AShareTradingCalendar()
+    if now >= calendar.prediction_deadline(local_signal_date):
+        raise _Blocked("PREDICTION_WINDOW_MISSED")
+    signal_close = datetime.combine(
+        local_signal_date, time(15), tzinfo=ZoneInfo("Asia/Shanghai")
+    )
     selected = tuple(
         signal
         for signal in signals
@@ -665,21 +685,28 @@ def _derive_predict_context(
         and signal.model_version == frozen.model_version
         and signal.signal_date == local_signal_date
         and signal.data_cutoff == signal.signal_date
-        and signal.generated_at <= now
+        and signal_close <= signal.generated_at <= now
         and signal.reference_price is not None
         and signal.invalidation_price is not None
     )
     if not selected:
         raise _Blocked("VERIFIED_DAILY_SIGNAL_NOT_READY")
     frozen_signal_digest = str(contest.get("official_signal_digest", ""))
+    cycle_key = _prediction_cycle_key(selected, digest)
+
+    archived_digests = {
+        item.session_calendar_digest
+        for item in ProspectiveLedgerStore(policy=policy).predictions()
+        if item.cycle_key == cycle_key
+    }
     if digest != frozen_signal_digest:
-        _require_forward_signal_rollover(policy, contest, selected)
+        _require_forward_signal_rollover(policy, contest, selected, digest)
     if frozen.model_bundle_digest is not None and any(
         signal.model_bundle_digest != frozen.model_bundle_digest for signal in selected
     ):
         raise _Blocked("MODEL_BUNDLE_MISMATCH")
     session_calendar, session_calendar_digest = _verified_session_calendar(
-        policy, selected[0].data_cutoff
+        policy, selected[0].data_cutoff, archived_digests=archived_digests
     )
     return {
         "contest": contest,
@@ -696,6 +723,7 @@ def _require_forward_signal_rollover(
     policy: ProjectStoragePolicy,
     contest: dict[str, Any],
     signals: tuple[Any, ...],
+    source_digest: str,
 ) -> None:
     """Allow a later daily artifact without weakening same-cycle binding.
 
@@ -707,7 +735,6 @@ def _require_forward_signal_rollover(
     start date; a same-day rewrite remains blocked.
     """
 
-    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
 
     current_dates = {
         signal.signal_date
@@ -718,8 +745,8 @@ def _require_forward_signal_rollover(
         raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
     current_date = next(iter(current_dates))
     ledger = ProspectiveLedgerStore(policy=policy)
-    prior_dates = {
-        prediction.as_of
+    prior = [
+        prediction
         for prediction in ledger.predictions()
         if (
             prediction.model_id == str(contest.get("model_id", ""))
@@ -728,11 +755,7 @@ def _require_forward_signal_rollover(
             and prediction.training_snapshot_hash
             == str(contest.get("training_snapshot_hash", ""))
         )
-    }
-    if prior_dates:
-        if current_date <= max(prior_dates):
-            raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
-        return
+    ]
     try:
         started = datetime.fromisoformat(str(contest["contest_started_at"]))
         if started.tzinfo is None or started.utcoffset() is None:
@@ -740,16 +763,47 @@ def _require_forward_signal_rollover(
         start_local_date = started.astimezone(ZoneInfo("Asia/Shanghai")).date()
     except (KeyError, TypeError, ValueError):
         raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH") from None
-    if current_date == start_local_date:
+    if current_date <= start_local_date:
         raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
+    if prior:
+        latest = max(item.as_of for item in prior)
+        same_batch = any(
+            item.as_of == current_date and item.source_input_digest == source_digest
+            for item in prior
+        )
+        if current_date < latest or (current_date == latest and not same_batch):
+            raise _Blocked("OFFICIAL_SIGNAL_DIGEST_MISMATCH")
 
 
 def _verified_session_calendar(
-    policy: ProjectStoragePolicy, as_of: date, *, horizon: int = 20
+    policy: ProjectStoragePolicy, as_of: date, *, horizon: int = 5,
+    archived_digests: set[str] | None = None,
 ) -> tuple[tuple[date, ...], str]:
     """Build and archive a bounded, holiday-aware A-share session calendar."""
 
-    from a_share_quant.market.trading_calendar import AShareTradingCalendar
+    if archived_digests:
+        if len(archived_digests) != 1:
+            raise _Blocked("TRADING_CALENDAR_NOT_READY")
+        digest = next(iter(archived_digests))
+        if not _is_sha256(digest):
+            raise _Blocked("TRADING_CALENDAR_NOT_READY")
+        path = policy.authorize(f".runtime/research/calendars/{digest}.json")
+        try:
+            policy.revalidate(path)
+            raw = path.read_bytes()
+            if (
+                len(raw) > _MAX_INTEGRITY_ARTIFACT_BYTES
+                or hashlib.sha256(raw).hexdigest() != digest
+            ):
+                raise ValueError("invalid calendar archive digest")
+            body = json.loads(raw)
+            if body["as_of"] != as_of.isoformat():
+                raise ValueError("calendar archive date mismatch")
+            sessions = tuple(date.fromisoformat(day) for day in body["sessions"])
+            _calendar_maturity_date(sessions, as_of, horizon=horizon)
+            return sessions, digest
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise _Blocked("TRADING_CALENDAR_NOT_READY") from exc
 
     if horizon < 5 or horizon > 256:
         raise ValueError("calendar horizon is outside the bounded range")
@@ -764,7 +818,7 @@ def _verified_session_calendar(
         raise _Blocked("TRADING_CALENDAR_NOT_READY") from exc
     body = {
         "format_version": 1,
-        "source": "A_SHARE_EXCHANGE_CALENDAR_2026_V1",
+        "source": calendar.metadata()["version"],
         "as_of": as_of.isoformat(),
         "sessions": [item.isoformat() for item in sessions],
     }
@@ -838,31 +892,47 @@ def _prediction_cycle_key(signals: tuple[Any, ...], source_input_digest: str) ->
     return f"predict-{signal_date:%Y%m%d}-{source_input_digest[:24]}"
 
 
-def _derive_settle_context(
-    policy: ProjectStoragePolicy, contest: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Derive actual outcomes from verified refreshed returns, never a JSON request."""
-
-    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
-
-    # Validate the active descriptor, but do not use it to filter old rows.
-    # Archived contests must keep settling after a new model becomes active.
-    _contest_from_payload(contest)
-    now = _current_time()
-    ledger = ProspectiveLedgerStore(policy=policy)
+def due_predictions(ledger: ProspectiveLedgerStore, now: datetime) -> tuple:
+    """Use the local market close, including when the worker clock is UTC."""
+    local = now.astimezone(ZoneInfo("Asia/Shanghai"))
     settled = {item.prediction_id for item in ledger.settlements()}
-    due = tuple(
+    return tuple(
         prediction
         for prediction in ledger.predictions()
         if prediction.id not in settled
-        and prediction.maturity_date <= now.date()
+        and prediction.maturity_date is not None
+        and (
+            prediction.maturity_date < local.date()
+            or (prediction.maturity_date == local.date() and local.time() >= time(15))
+        )
     )
+
+
+def _derive_settle_context(
+    policy: ProjectStoragePolicy, contest: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Derive actual outcomes from verified refreshed returns, never a JSON request."""
+
+    # Validate the active descriptor, but do not use it to filter old rows.
+    # Archived contests must keep settling after a new model becomes active.
+    if contest is not None:
+        _contest_from_payload(contest)
+    now = _current_time()
+    ledger = ProspectiveLedgerStore(policy=policy)
+    due = due_predictions(ledger, now)
     if not due:
         raise _Blocked("NO_MATURED_PREDICTIONS")
-    outcomes = tuple(_derived_outcome(policy, prediction, now) for prediction in due)
+    outcomes = []
+    deferred = []
+    for prediction in due:
+        try:
+            outcomes.append(_derived_outcome(policy, prediction, now))
+        except _Blocked as exc:
+            deferred.append({"prediction_id": prediction.id, "reason": exc.reason_code})
     return {
         "contest": contest,
-        "outcomes": outcomes,
+        "outcomes": tuple(outcomes),
+        "deferred": tuple(deferred),
         "input_integrity_digest": _ledger_integrity_digest(policy),
     }
 
@@ -879,7 +949,9 @@ def _derived_outcome(policy: ProjectStoragePolicy, prediction: Any, now: datetim
 
     try:
         return _derived_market_lake_outcome(policy, prediction, now)
-    except _Blocked:
+    except _Blocked as exc:
+        if exc.reason_code == "OUTCOME_ADJUSTMENT_CONFLICT":
+            raise
         return _derived_research_outcome(policy, prediction, now)
 
 
@@ -1024,7 +1096,7 @@ def _derived_market_lake_outcome(
         reference = float(prediction.guidance_price_bands["reference"][0])
         raw_return = close / reference - 1.0
         if abs(compounded_return - raw_return) > 0.001:
-            raise ValueError("daily outcome contains a corporate action conflict")
+            raise _Blocked("OUTCOME_ADJUSTMENT_CONFLICT")
         return _outcome_observation(
             prediction,
             now,

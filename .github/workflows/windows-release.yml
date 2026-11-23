@@ -46,26 +46,26 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install -e ".[dev,data-free,agent]" lightgbm scikit-learn
           -c constraints/runtime-py312.txt
           -c constraints/agent-py312.txt
-      - name: Verify, lint, and test
-        shell: pwsh
-        run: |
-          .\.venv\Scripts\python.exe -m pip check
-          .\.venv\Scripts\python.exe -m ruff check .
-          .\.venv\Scripts\python.exe -m pytest -q
+      - name: Verify dependencies
+        run: .\.venv\Scripts\python.exe -m pip check
+      - name: Lint
+        run: .\.venv\Scripts\python.exe -m ruff check .
+      - name: Test
+        run: .\.venv\Scripts\python.exe -m pytest -q
 
       - name: Build online and portable Windows packages
         shell: pwsh
         run: >-
           .\scripts\build_windows_release.ps1
           -Version '${{ steps.version.outputs.value }}'
-          -OutputDirectory '${{ github.workspace }}\release-artifacts'
+          -OutputDirectory '${{ runner.temp }}\qw-release'
           -Flavor Both
 
       - name: Upload verified build artifacts
         uses: actions/upload-artifact@v6
         with:
           name: a-share-quant-workbench-${{ steps.version.outputs.value }}-windows-x64
-          path: release-artifacts/*
+          path: ${{ runner.temp }}/qw-release/*
           if-no-files-found: error
           retention-days: 30
 
@@ -75,7 +75,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create '${{ github.ref_name }}' release-artifacts/* `
+          $packages = (Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'qw-release') -File).FullName
+          gh release create '${{ github.ref_name }}' @packages `
             --repo '${{ github.repository }}' `
             --verify-tag `
             --title "A股量化交易工作台 ${{ github.ref_name }} 公开预览版" `

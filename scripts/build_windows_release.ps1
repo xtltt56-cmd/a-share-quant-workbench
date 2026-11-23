@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [ValidateSet('Online', 'Portable', 'Both')][string]$Flavor = 'Both',
-    [string]$PythonInstallerPath = ''
+    [string]$PythonPackagePath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -43,7 +43,8 @@ function Get-Sha256Hex {
 function New-PayloadStage {
     param([Parameter(Mandatory = $true)][string]$Channel)
 
-    $stage = Join-Path $outputRoot ("stage-{0}-{1}" -f $Channel.ToLowerInvariant(), [Guid]::NewGuid().ToString('N'))
+    # Keep space for pip's build-isolation paths on Windows.
+    $stage = Join-Path $outputRoot ("{0}-{1}" -f $Channel.Substring(0, 1), [Guid]::NewGuid().ToString('N').Substring(0, 12))
     New-Item -ItemType Directory -Path $stage | Out-Null
     foreach ($relative in $payloadItems) {
         $source = Join-Path $repoRoot $relative
@@ -62,12 +63,14 @@ function New-PayloadStage {
     if ([string]::IsNullOrWhiteSpace($revision)) {
         $revision = 'unknown'
     }
+    $sourceDirty = @(& git -C $repoRoot status --porcelain --untracked-files=normal).Count -gt 0
     $metadata = [ordered]@{
         version = $Version
         channel = $Channel.ToLowerInvariant()
         product_name = 'A-Share Quant Workbench'
         distribution = 'windows-x64'
         git_commit = $revision.Trim()
+        source_dirty = $sourceDirty
         built_at = [DateTimeOffset]::UtcNow.ToString('o')
     }
     [IO.File]::WriteAllText(
@@ -88,7 +91,10 @@ function Compress-Payload {
     if (Test-Path -LiteralPath $archive) {
         Remove-Item -LiteralPath $archive -Force
     }
-    Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $archive -CompressionLevel Optimal
+    $payload = @(Get-ChildItem -LiteralPath $Stage -Force | Where-Object {
+        $_.Name -notin @('.env', '.runtime')
+    })
+    Compress-Archive -LiteralPath $payload.FullName -DestinationPath $archive -CompressionLevel Optimal
     return $archive
 }
 
@@ -113,8 +119,8 @@ if ($Flavor -in @('Portable', 'Both')) {
             SkipShortcut = $true
             SkipLaunch = $true
         }
-        if (-not [string]::IsNullOrWhiteSpace($PythonInstallerPath)) {
-            $installParameters.PythonInstallerPath = $PythonInstallerPath
+        if (-not [string]::IsNullOrWhiteSpace($PythonPackagePath)) {
+            $installParameters.PythonPackagePath = $PythonPackagePath
         }
         & (Join-Path $portableStage 'scripts\install_release.ps1') @installParameters
         if ($LASTEXITCODE -ne 0) {

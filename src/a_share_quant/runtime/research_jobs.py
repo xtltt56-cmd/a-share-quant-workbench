@@ -16,7 +16,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,8 @@ _VALID_STAGES = frozenset(_DEFAULT_STAGE.values())
 _MAX_CHECKPOINT_BYTES = 1_048_576
 _MAX_STATUS_BYTES = 65_536
 _MAX_RETAINED_TERMINAL_JOBS = 64
+_SETTLEMENT_RETRY_DELAYS = (timedelta(minutes=15), timedelta(hours=1))
+_SETTLEMENT_TRANSIENT_FAILURES = frozenset({"LAUNCH_FAILED", "STATUS_MISSING"})
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,7 @@ class ResearchJobSupervisor:
         data_fingerprint: str | None = None,
         data_refreshed: bool = False,
         outcome_cutoff: datetime | None = None,
+        settlement_fingerprint: str | None = "",
     ) -> tuple[str, ...]:
         """Register only lifecycle-eligible jobs at one workbench tick.
 
@@ -243,23 +246,39 @@ class ResearchJobSupervisor:
         ):
             registered.append(job_id)
 
-        if (
-            data_refreshed
-            and (
-                job_id := self._register_cycle(
-                    ("research", "settle"),
-                    current,
-                    fingerprint,
-                    cycle_key=(
-                        f"settle:{fingerprint or 'no-fingerprint'}:"
-                        f"{current.date().isoformat()}"
-                    ),
-                )
+        if settlement_fingerprint:
+            job_id = self._register_settlement(current, settlement_fingerprint)
+            if job_id:
+                registered.append(job_id)
+        elif data_refreshed and settlement_fingerprint == "":
+            job_id = self._register_cycle(
+                ("research", "settle"), current, fingerprint,
+                cycle_key=f"settle:{fingerprint or 'no-fingerprint'}:{session_key}",
             )
-        ):
-            registered.append(job_id)
+            if job_id:
+                registered.append(job_id)
         self._prune_terminal_history()
         return tuple(registered)
+
+    def _register_settlement(self, current: datetime, fingerprint: str) -> str | None:
+        command = ("research", "settle")
+        cycle = f"settle-evidence:{fingerprint}"
+        initial = self._jobs.get(_cycle_job_id(command, cycle))
+        if initial is None:
+            return self._register_cycle(command, current, fingerprint, cycle_key=cycle)
+
+        previous = initial
+        for attempt, delay in enumerate(_SETTLEMENT_RETRY_DELAYS, start=1):
+            if previous.failure_reason not in _SETTLEMENT_TRANSIENT_FAILURES:
+                return None
+            if previous.due_at + delay > current:
+                return None
+            retry_cycle = f"{cycle}:retry-{attempt}"
+            existing = self._jobs.get(_cycle_job_id(command, retry_cycle))
+            if existing is None:
+                return self._register_cycle(command, current, fingerprint, cycle_key=retry_cycle)
+            previous = existing
+        return None
 
     def start_due_jobs(self, *, now: datetime) -> tuple[str, ...]:
         """Launch at most one CPU and one network child owned by this process."""

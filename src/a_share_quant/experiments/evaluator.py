@@ -78,15 +78,31 @@ class FairPortfolioEvaluator:
         daily_bars: pd.DataFrame,
         *,
         benchmark: str,
+        signal_period: tuple[date, date] | None = None,
     ) -> FairEvaluationResult:
         bars = _prepare_bars(daily_bars)
         benchmark_symbol = normalize_symbol(benchmark)
         if benchmark_symbol not in set(bars["symbol"]):
             raise ValueError(f"benchmark is missing from daily bars: {benchmark_symbol}")
         enriched = self._add_forward_labels(predictions.copy(), bars, benchmark_symbol)
-        equity, trades = self._simulate(enriched, bars, benchmark_symbol)
+        calendar = sorted(bars.loc[bars["symbol"].eq(benchmark_symbol), "date"].unique())
+        if signal_period is not None:
+            start, end = signal_period
+            if start not in calendar or end not in calendar or end < start:
+                raise ValueError("evaluation period must use ordered benchmark sessions")
+            if not enriched["signal_date"].between(start, end).all():
+                raise ValueError("evaluation has signals outside its requested period")
+            # Include T+1 execution of the last signal without pre-test or later benchmark gains.
+            final_session = _delayed_date(calendar, end, self.config.signal_delay_days)
+            if final_session is None:
+                raise ValueError("evaluation data is missing the last signal execution session")
+            calendar = [session for session in calendar if start <= session <= final_session]
+        equity, trades = self._simulate(enriched, bars, benchmark_symbol, calendar)
         top_k = min(self.config.max_positions, max(enriched["symbol"].nunique(), 1))
         metrics = compute_comparison_metrics(enriched, equity, top_k=top_k)
+        metrics["forward_label_coverage"] = (
+            float(np.isfinite(enriched["forward_excess_return"]).mean()) if len(enriched) else 0.0
+        )
         return FairEvaluationResult(enriched, equity, trades, metrics)
 
     def _add_forward_labels(
@@ -106,6 +122,9 @@ class FairPortfolioEvaluator:
             symbol: group.set_index("date")["close"].sort_index()
             for symbol, group in bars.groupby("symbol", sort=False)
         }
+        # Keep the horizon on exchange sessions when an individual stock bar is absent.
+        for symbol in set(close) - {benchmark}:
+            close[symbol] = close[symbol].reindex(close[benchmark].index)
         returns = []
         excess = []
         for row in result.itertuples(index=False):
@@ -134,8 +153,8 @@ class FairPortfolioEvaluator:
         predictions: pd.DataFrame,
         bars: pd.DataFrame,
         benchmark: str,
+        calendar: list[date],
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        calendar = sorted(bars["date"].unique())
         bar_lookup = {(row.symbol, row.date): row._asdict() for row in bars.itertuples(index=False)}
         events: dict[date, pd.DataFrame] = {}
         for signal_date, group in predictions.groupby("signal_date", sort=True):

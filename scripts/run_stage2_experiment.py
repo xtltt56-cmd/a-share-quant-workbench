@@ -18,6 +18,7 @@ import pandas as pd
 import yaml
 
 from a_share_quant.config import Stage2Config
+from a_share_quant.data.normalization import normalize_symbol
 from a_share_quant.experiments.evaluator import (
     EvaluationConfig,
     FairEvaluationResult,
@@ -53,6 +54,8 @@ def main() -> int:
     parser.add_argument("--benchmark", default=None)
     parser.add_argument("--symbols", nargs="+")
     parser.add_argument("--fixture-periods", type=int, default=700)
+    parser.add_argument("--model", choices=("all", "lightgbm", "double_ensemble"),
+                        default="all")
     parser.add_argument(
         "--skip-walk-forward",
         action="store_true",
@@ -73,16 +76,22 @@ def _run(args: argparse.Namespace) -> None:
     config_dir = repo_root / "config"
     stage2 = Stage2Config.load(config_dir=config_dir)
     qlib_raw = _read_yaml(config_dir / "qlib.yaml").get("qlib", {})
-    benchmark = args.benchmark or stage2.comparison.benchmark
+    benchmark = normalize_symbol(args.benchmark or stage2.comparison.benchmark)
     bars, universe = _load_run_data(args, benchmark)
     symbols = _select_symbols(bars, benchmark, args.symbols)
-    calendar = sorted(pd.to_datetime(bars["date"]).dt.date.unique())
-    usable_dates = calendar[:-stage2.label.horizon_days]
+    calendar = sorted(bars.loc[bars["symbol"].eq(benchmark), "date"].unique())
+    if not bars["date"].isin(calendar).all():
+        raise ValueError("benchmark is missing sessions present in the local equity bars")
+    horizon = stage2.label.horizon_days
+    usable_dates = calendar[:-horizon]
+    if horizon != 5:
+        raise ValueError("Stage 2 Alpha158 requires the configured five-session label")
     split = fixed_time_split(
         usable_dates,
         train_ratio=stage2.comparison.split.train_ratio,
         validation_ratio=stage2.comparison.split.validation_ratio,
         test_ratio=stage2.comparison.split.test_ratio,
+        label_horizon_sessions=horizon,
     )
     walk_forward_config = _read_yaml(config_dir / "experiments.yaml").get("comparison", {}).get(
         "walk_forward", {}
@@ -93,7 +102,18 @@ def _run(args: argparse.Namespace) -> None:
         validation_dates=int(walk_forward_config.get("validation_dates", 63)),
         test_dates=int(walk_forward_config.get("test_dates", 63)),
         step_dates=int(walk_forward_config.get("step_dates", 63)),
+        label_horizon_sessions=horizon,
     )
+    if args.mode == "local" and not args.skip_walk_forward:
+        minimum_windows = int(
+            _read_yaml(config_dir / "research_maturity.yaml")
+            .get("validation", {}).get("minimum_oos_windows", 3)
+        )
+        if len(windows) < minimum_windows:
+            raise ValueError(
+                f"only {len(windows)} complete label-purged windows are available, "
+                f"need at least {minimum_windows}"
+            )
     if not windows:
         LOGGER.warning(
             "not enough dates for configured Walk-Forward windows; fixed OOS will still run"
@@ -135,8 +155,12 @@ def _run(args: argparse.Namespace) -> None:
     rule_features = build_rule_features(bars, benchmark=benchmark)
     rule_engine = RuleFactorEngine.from_yaml(config_dir / "strategy.yaml")
     rule_provider = RuleBasedSignalProvider(rule_engine)
-    rule_predictions = _rule_predictions(rule_provider, rule_features, _date_range(split.test))
-    rule_result = evaluator.evaluate(rule_predictions, bars, benchmark=benchmark)
+    rule_predictions = _rule_predictions(
+        rule_provider, rule_features, _date_range(split.test), dataset_artifact.frame,
+    )
+    rule_result = evaluator.evaluate(
+        rule_predictions, bars, benchmark=benchmark, signal_period=split.test,
+    )
     _write_strategy(
         experiment_runner,
         evaluator,
@@ -157,26 +181,9 @@ def _run(args: argparse.Namespace) -> None:
 
     qlib_runner = QlibModelRunner(
         seed=stage2.comparison.seed,
-        experiment_db=repo_root / "data" / "qlib_mlflow.db",
+        experiment_db=artifact_root / "qlib_mlflow.db",
     )
-    model_specs = (
-        (
-            "qlib_lightgbm_alpha158",
-            str(qlib_raw.get("model_versions", {}).get("lightgbm", "qlib_lgb_alpha158_v1")),
-            dict(qlib_raw.get("models", {}).get("lightgbm", {})),
-            "lightgbm",
-        ),
-        (
-            "qlib_double_ensemble_alpha158",
-            str(
-                qlib_raw.get("model_versions", {}).get(
-                    "double_ensemble", "qlib_doubleensemble_alpha158_v1"
-                )
-            ),
-            dict(qlib_raw.get("models", {}).get("double_ensemble", {})),
-            "double_ensemble",
-        ),
-    )
+    model_specs = _model_specs(qlib_raw, args.model)
     for strategy_id, model_version, params, model_name in model_specs:
         model_result = qlib_runner.run(
             dataset_artifact,
@@ -186,7 +193,10 @@ def _run(args: argparse.Namespace) -> None:
             model_version=model_version,
             params={**params, "seed": stage2.comparison.seed},
         )
-        evaluation_result = evaluator.evaluate(model_result.predictions, bars, benchmark=benchmark)
+        _require_same_cohort(rule_predictions, model_result.predictions)
+        evaluation_result = evaluator.evaluate(
+            model_result.predictions, bars, benchmark=benchmark, signal_period=split.test,
+        )
         _write_strategy(
             experiment_runner,
             evaluator,
@@ -215,6 +225,7 @@ def _run(args: argparse.Namespace) -> None:
             benchmark=benchmark,
             windows=windows,
             qlib_raw=qlib_raw,
+            model_specs=model_specs,
             stage2=stage2,
             rule_features=rule_features,
             rule_provider=rule_provider,
@@ -237,7 +248,7 @@ def _run(args: argparse.Namespace) -> None:
         mode=args.mode,
         benchmark=benchmark,
         dataset_hash=dataset_hash,
-        walk_forward_count=len(windows),
+        walk_forward_count=0 if args.skip_walk_forward else len(windows),
     )
     LOGGER.info("Stage 2 fixed OOS artifacts written under %s", artifact_root)
 
@@ -300,7 +311,14 @@ def _rule_predictions(
     provider: RuleBasedSignalProvider,
     features: pd.DataFrame,
     dates: list[date],
+    qlib_frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    cohort = qlib_frame.index.to_frame(index=False).rename(
+        columns={"datetime": "date", "instrument": "symbol"}
+    )
+    cohort["date"] = pd.to_datetime(cohort["date"]).dt.date
+    cohort["symbol"] = cohort["symbol"].map(normalize_symbol)
+    features = features.merge(cohort, on=["date", "symbol"], validate="one_to_one")
     records = []
     allowed_dates = set(dates)
     for signal_date, group in features.groupby("date", sort=True):
@@ -316,6 +334,46 @@ def _rule_predictions(
     if not records:
         raise ValueError("rule baseline generated no OOS signals")
     return pd.DataFrame([record.to_dict() for record in records]).drop(columns=["date"])
+
+
+def _require_same_cohort(rule: pd.DataFrame, model: pd.DataFrame) -> None:
+    columns = ["signal_date", "symbol"]
+    rule_keys = pd.MultiIndex.from_frame(rule[columns])
+    model_keys = pd.MultiIndex.from_frame(model[columns])
+    if (
+        rule_keys.has_duplicates
+        or model_keys.has_duplicates
+        or not rule_keys.sort_values().equals(model_keys.sort_values())
+    ):
+        shared = len(rule_keys.intersection(model_keys))
+        raise ValueError(
+            f"baseline and model prediction cohorts differ "
+            f"(rule={len(rule_keys)}, model={len(model_keys)}, shared={shared})"
+        )
+
+
+def _model_specs(
+    qlib_raw: dict[str, Any], model: str,
+) -> tuple[tuple[str, str, dict[str, Any], str], ...]:
+    model_specs = (
+        (
+            "qlib_lightgbm_alpha158",
+            str(qlib_raw.get("model_versions", {}).get("lightgbm", "qlib_lgb_alpha158_v1")),
+            dict(qlib_raw.get("models", {}).get("lightgbm", {})),
+            "lightgbm",
+        ),
+        (
+            "qlib_double_ensemble_alpha158",
+            str(
+                qlib_raw.get("model_versions", {}).get(
+                    "double_ensemble", "qlib_doubleensemble_alpha158_v1"
+                )
+            ),
+            dict(qlib_raw.get("models", {}).get("double_ensemble", {})),
+            "double_ensemble",
+        ),
+    )
+    return tuple(item for item in model_specs if model == "all" or item[-1] == model)
 
 
 def _write_strategy(
@@ -384,6 +442,7 @@ def _run_walk_forward(
     benchmark: str,
     windows: list[TimeSplit],
     qlib_raw: dict[str, Any],
+    model_specs: tuple[tuple[str, str, dict[str, Any], str], ...],
     stage2: Stage2Config,
     rule_features: pd.DataFrame,
     rule_provider: RuleBasedSignalProvider,
@@ -392,24 +451,6 @@ def _run_walk_forward(
     experiment_runner: ExperimentRunner,
     base_config: dict[str, Any],
 ) -> None:
-    model_specs = (
-        (
-            "qlib_lightgbm_alpha158",
-            str(qlib_raw.get("model_versions", {}).get("lightgbm", "qlib_lgb_alpha158_v1")),
-            dict(qlib_raw.get("models", {}).get("lightgbm", {})),
-            "lightgbm",
-        ),
-        (
-            "qlib_double_ensemble_alpha158",
-            str(
-                qlib_raw.get("model_versions", {}).get(
-                    "double_ensemble", "qlib_doubleensemble_alpha158_v1"
-                )
-            ),
-            dict(qlib_raw.get("models", {}).get("double_ensemble", {})),
-            "double_ensemble",
-        ),
-    )
     collected: dict[str, list[pd.DataFrame]] = {"rule_multifactor": []}
     aggregate_dataset_hash: str | None = None
     for strategy_id, _, _, _ in model_specs:
@@ -431,9 +472,12 @@ def _run_walk_forward(
             rule_provider,
             rule_features,
             _date_range(window.test),
+            dataset_artifact.frame,
         )
         collected["rule_multifactor"].append(rule_predictions)
-        rule_result = evaluator.evaluate(rule_predictions, bars, benchmark=benchmark)
+        rule_result = evaluator.evaluate(
+            rule_predictions, bars, benchmark=benchmark, signal_period=window.test,
+        )
         _write_strategy(
             experiment_runner,
             evaluator,
@@ -461,11 +505,13 @@ def _run_walk_forward(
                 model_version=model_version,
                 params={**params, "seed": stage2.comparison.seed},
             )
+            _require_same_cohort(rule_predictions, model_result.predictions)
             collected[strategy_id].append(model_result.predictions)
             evaluation_result = evaluator.evaluate(
                 model_result.predictions,
                 bars,
                 benchmark=benchmark,
+                signal_period=window.test,
             )
             _write_strategy(
                 experiment_runner,
@@ -491,7 +537,10 @@ def _run_walk_forward(
 
     for strategy_id, predictions_list in collected.items():
         combined_predictions = pd.concat(predictions_list, ignore_index=True)
-        combined_result = evaluator.evaluate(combined_predictions, bars, benchmark=benchmark)
+        combined_result = evaluator.evaluate(
+            combined_predictions, bars, benchmark=benchmark,
+            signal_period=(windows[0].test[0], windows[-1].test[1]),
+        )
         if strategy_id == "rule_multifactor":
             strategy_version = rule_provider.strategy_version
             model_version = rule_provider.model_version
@@ -620,6 +669,10 @@ def _experiment_config(
     return {
         "mode": args.mode,
         "benchmark": benchmark,
+        "model": args.model,
+        "label_horizon_sessions": 5,
+        "cohort": "shared_daily_qlib_universe",
+        "portfolio_period": "oos_through_last_signal_execution",
         "qlib": qlib_raw,
         "split": split.as_dict(),
         "walk_forward": [window.as_dict() for window in windows],

@@ -31,3 +31,22 @@ def test_rolling_walk_forward_only_moves_forward() -> None:
     assert windows[1].test[0] > windows[0].test[0]
     assert all(window.train[1] < window.validation[0] < window.test[0] for window in windows)
 
+
+def test_forward_labels_mature_before_each_next_segment() -> None:
+    dates = _dates(50)
+    horizon = 5
+    fixed = fixed_time_split(
+        dates, train_ratio=0.6, validation_ratio=0.2, test_ratio=0.2,
+        label_horizon_sessions=horizon,
+    )
+    windows = rolling_walk_forward(
+        dates, min_train_dates=15, validation_dates=10, test_dates=10, step_dates=10,
+        label_horizon_sessions=horizon,
+    )
+    assert len(windows) == 1
+    assert (windows[0].train[0], windows[0].train[1]) == (dates[0], dates[14])
+    assert windows[0].validation == (dates[20], dates[29])
+    for split in [fixed, *windows]:
+        assert dates.index(split.train[1]) + horizon < dates.index(split.validation[0])
+        assert dates.index(split.validation[1]) + horizon < dates.index(split.test[0])
+

@@ -284,16 +284,17 @@ def test_scheduler_quarantines_one_backward_quote_in_a_mixed_snapshot() -> None:
         hours=MarketHours(),
         calendar=StaticTradingCalendar({first_time.date()}),
     )
-    times = iter((first_time, second_time))
+    current = [first_time]
     scheduler = RealTimeScheduler(
         provider=provider,
         store=RealTimeStore(),
         resolver=resolver,
         symbols=("000001", "000002"),
-        clock=lambda: next(times),
+        clock=lambda: current[0],
     )
 
     first_tick = scheduler.run_once()
+    current[0] = second_time
     second_tick = scheduler.run_once()
 
     assert first_tick.updated is True

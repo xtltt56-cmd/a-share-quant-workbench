@@ -29,6 +29,7 @@ def fixed_time_split(
     train_ratio: float,
     validation_ratio: float,
     test_ratio: float,
+    label_horizon_sessions: int = 0,
 ) -> TimeSplit:
     normalized = _normalize_dates(dates)
     _validate_ratios(train_ratio, validation_ratio, test_ratio)
@@ -39,9 +40,13 @@ def fixed_time_split(
     if validation_end >= len(normalized):
         validation_end = len(normalized) - 1
         train_end = min(train_end, validation_end - 1)
+    if label_horizon_sessions < 0:
+        raise ValueError("label horizon must be non-negative")
+    if min(train_end, validation_end - train_end) <= label_horizon_sessions:
+        raise ValueError("fixed train and validation segments are too short for the label horizon")
     return TimeSplit(
-        train=(normalized[0], normalized[train_end - 1]),
-        validation=(normalized[train_end], normalized[validation_end - 1]),
+        train=(normalized[0], normalized[train_end - label_horizon_sessions - 1]),
+        validation=(normalized[train_end], normalized[validation_end - label_horizon_sessions - 1]),
         test=(normalized[validation_end], normalized[-1]),
     )
 
@@ -53,24 +58,28 @@ def rolling_walk_forward(
     validation_dates: int,
     test_dates: int,
     step_dates: int,
+    label_horizon_sessions: int = 0,
 ) -> list[TimeSplit]:
     normalized = _normalize_dates(dates)
     if min_train_dates < 1 or validation_dates < 1 or test_dates < 1 or step_dates < 1:
         raise ValueError("Walk-Forward window sizes must be positive")
+    if label_horizon_sessions < 0:
+        raise ValueError("label horizon must be non-negative")
     windows: list[TimeSplit] = []
-    start = 0
-    while start + min_train_dates + validation_dates + test_dates <= len(normalized):
-        train_end = start + min_train_dates
-        validation_end = train_end + validation_dates
-        test_end = validation_end + test_dates
+    for train_end in range(min_train_dates, len(normalized), step_dates):
+        validation_start = train_end + label_horizon_sessions
+        validation_end = validation_start + validation_dates
+        test_start = validation_end + label_horizon_sessions
+        test_end = test_start + test_dates
+        if test_end > len(normalized):
+            break
         windows.append(
             TimeSplit(
                 train=(normalized[0], normalized[train_end - 1]),
-                validation=(normalized[train_end], normalized[validation_end - 1]),
-                test=(normalized[validation_end], normalized[test_end - 1]),
+                validation=(normalized[validation_start], normalized[validation_end - 1]),
+                test=(normalized[test_start], normalized[test_end - 1]),
             )
         )
-        start += step_dates
     return windows
 
 
