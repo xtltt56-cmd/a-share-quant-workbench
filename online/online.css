@@ -1,0 +1,9 @@
+.online-watchlist{width:min(1024px,100%);margin-inline:auto;padding:clamp(18px,5vw,54px);font-size:16px}
+.online-watchlist h1{margin:0;font-size:clamp(30px,6vw,44px)}
+.online-watchlist header>p{margin:10px 0 26px}
+.online-columns{display:grid;grid-template-columns:1.1fr 1fr;gap:16px;align-items:start}
+.online-columns .search{display:flex;margin:6px 0 10px}
+.online-columns .search input,.online-columns button{font-size:1rem}
+.online-columns p[role=status]{font-size:.875rem;margin:8px 0 12px}
+.online-columns .security-row .stock-button{cursor:default}
+@media(max-width:720px){.online-columns{grid-template-columns:minmax(0,1fr)}}

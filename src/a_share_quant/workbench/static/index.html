@@ -10,6 +10,7 @@
   <script src="/assets/echarts.min.js" defer></script>
   <script src="/assets/workbench.js" defer></script>
   <script src="/assets/agent.js" defer></script>
+  <script src="/assets/watchlist.js" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main">跳到内容</a>
@@ -22,6 +23,7 @@
     <a href="#overview" data-page="overview"><span data-icon="overview"></span><span class="nav-text">投资总览</span></a>
     <a href="#daily" data-page="daily"><span data-icon="daily"></span><span class="nav-text">日选研究</span></a>
     <a href="#monitor" data-page="monitor"><span data-icon="monitor"></span><span class="nav-text">盘中监控</span></a>
+    <a href="#watchlist" data-page="watchlist"><span data-icon="watchlist"></span><span class="nav-text">我的自选</span></a>
     <a href="#holdings" data-page="holdings"><span data-icon="holdings"></span><span class="nav-text">我的持仓</span></a>
     <a href="#models" data-page="models"><span data-icon="models"></span><span class="nav-text">模型观察</span></a>
     <a href="#agent" data-page="agent"><span data-icon="agent"></span><span class="nav-text">AI 分析</span></a>
@@ -31,7 +33,7 @@
   <button id="collapse-nav" class="collapse-nav" aria-label="折叠或展开导航" aria-expanded="true"><span data-icon="collapse"></span><span class="nav-text">收起导航</span></button>
 </aside>
 <div class="workspace">
-  <header class="topbar"><span id="breadcrumb">投资总览</span><div class="tools"><span id="connection" class="connection" role="status">正在连接</span><span id="top-cutoff" class="top-cutoff" title="日线数据截止">—</span><button id="density" class="icon-button" title="切换紧凑模式" aria-label="切换紧凑模式" aria-pressed="false"><span data-icon="density"></span></button><button id="theme" class="icon-button" title="切换深浅主题" aria-label="切换深浅主题" aria-pressed="false"><span data-icon="theme"></span></button></div></header>
+  <header class="topbar"><span id="breadcrumb">投资总览</span><div class="tools"><button id="open-security-search" type="button" aria-label="搜索股票"><span data-icon="search"></span>搜索股票</button><span id="connection" class="connection" role="status">正在连接</span><span id="top-cutoff" class="top-cutoff" title="日线数据截止">—</span><button id="density" class="icon-button" title="切换紧凑模式" aria-label="切换紧凑模式" aria-pressed="false"><span data-icon="density"></span></button><button id="theme" class="icon-button" title="切换深浅主题" aria-label="切换深浅主题" aria-pressed="false"><span data-icon="theme"></span></button></div></header>
   <main id="main" tabindex="-1">
     <div class="page-heading"><div><h1 id="page-title">投资总览</h1><p id="page-subtitle">先看数据状态，再看候选与价格。</p></div><button class="primary" id="refresh"><span data-icon="refresh"></span>刷新数据</button></div>
     <div id="alert" role="status" aria-live="polite"></div>
@@ -53,9 +55,17 @@
     </section>
 
     <section data-view="monitor" hidden>
-      <div class="toolbar"><label class="search"><span data-icon="search"></span><input id="monitor-search" placeholder="搜索股票名称或代码" aria-label="搜索监控" type="search"></label><select id="monitor-filter" aria-label="监控范围"><option value="all">全部监控</option><option value="daily">日选候选</option><option value="holdings">我的持仓</option><option value="watch">我的自选</option></select><span class="toolbar-note">15 秒同步</span></div>
+      <div class="toolbar"><label class="search"><span data-icon="search"></span><input id="monitor-search" placeholder="搜索股票名称或代码" aria-label="搜索监控" type="search"></label><select id="monitor-filter" aria-label="监控范围"><option value="all">全部监控</option><option value="daily">日选候选</option><option value="holdings">我的持仓</option><option value="watch">监控中的自选</option></select><span class="toolbar-note">15 秒同步</span></div>
       <article class="panel"><div class="panel-heading"><h2>行情与价格计划</h2><span id="session" class="badge"></span></div><div id="monitor-table" class="table-scroll"></div></article>
       <details class="help"><summary>监控状态说明</summary><p>“就绪”仅表示监控状态。指导是否可用仍取决于行情时间和数据质量。</p></details>
+    </section>
+
+    <section data-view="watchlist" aria-label="我的自选" hidden>
+      <article class="panel">
+        <div class="panel-heading"><h2>自选股票</h2><button id="watchlist-search" type="button">添加股票</button></div>
+        <p id="watchlist-message" class="muted" role="status"></p>
+        <div id="watchlist-items"></div>
+      </article>
     </section>
 
     <section data-view="holdings" hidden>
@@ -103,11 +113,19 @@
   </main>
 </div>
 
+<dialog id="security-search-dialog" aria-labelledby="security-search-title">
+  <div class="drawer-heading"><h2 id="security-search-title">搜索股票</h2><button id="close-security-search" class="icon-button" aria-label="关闭股票搜索"><span data-icon="close"></span></button></div>
+  <label class="search"><span data-icon="search"></span><input id="security-query" type="search" maxlength="80" placeholder="输入股票代码或简称" aria-label="股票代码或简称" autofocus></label>
+  <div class="toolbar"><p id="security-search-status" class="muted" role="status"></p><button id="refresh-security-catalog" type="button" hidden>更新名录</button></div>
+  <div id="security-results"></div>
+</dialog>
+
 <dialog id="stock-dialog" aria-labelledby="stock-title">
   <div class="drawer-heading"><h2 id="stock-title"></h2><button id="close-stock" class="icon-button" aria-label="关闭股票详情"><span data-icon="close"></span></button></div>
   <div class="agent-detail-entry"><span>想核查规则以外的信息？</span><button id="stock-agent-entry" class="primary">加入 AI 分析 →</button></div>
-  <div id="stock-summary"></div><section id="price-plan" class="price-plan"></section>
+  <div id="stock-summary"></div><p id="stock-watch-message" class="muted" role="status"></p><section id="price-plan" class="price-plan"></section>
   <div class="chart-heading"><h3>历史日 K 线</h3><select id="chart-range" aria-label="K线范围"><option value="60">最近 60 条</option><option value="120" selected>最近 120 条</option><option value="252">最近 252 条</option><option value="600">最近 600 条</option></select></div>
+  <div class="toolbar"><button id="download-stock-history" type="button" hidden>补齐日线</button><p id="stock-history-status" class="muted" role="status"></p></div>
   <div id="stock-chart" role="img" aria-label="股票日K线与成交量图"></div><div id="chart-note" class="muted"></div><div id="stock-reasons"></div>
   <section class="evidence-panel"><div class="panel-heading"><h3>核验依据</h3><button id="stock-evidence-button">查看核验依据</button></div><p class="muted">后台事实摘要，不是 AI 预测；不会调用付费模型或提交委托。</p><div id="stock-evidence" aria-live="polite"></div></section>
 </dialog>

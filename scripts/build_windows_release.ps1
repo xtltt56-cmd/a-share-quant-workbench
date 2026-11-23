@@ -23,6 +23,7 @@ $payloadItems = @(
     'pyproject.toml',
     'config',
     'constraints',
+    'online',
     'scripts',
     'src'
 )

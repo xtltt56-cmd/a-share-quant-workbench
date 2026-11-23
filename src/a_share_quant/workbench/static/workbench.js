@@ -1,6 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const icons={
+  watchlist:'<path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6-5.4-2.8-5.4 2.8 1-6L3.2 9.4l6.1-.9z"/>',
   overview:'<path d="M4 13h6V4H4zM14 20h6V11h-6zM4 20h6v-3H4zM14 7h6V4h-6z"/>',
   daily:'<path d="M5 3v4M19 3v4M3 9h18M5 5h14a2 2 0 0 1 2 2v13H3V7a2 2 0 0 1 2-2Z"/><path d="m7 15 3-3 2 2 4-4 2 2"/>',
   monitor:'<path d="M3 12h4l2-5 4 10 2-5h6"/><path d="M4 4h16v16H4z"/>',
@@ -40,10 +41,11 @@ const eventRiskStatus = x => {const risk=x?.event_risk||{},level=risk.level||"NO
 let connected=false,lastRead=null,progress={};
 let state={},account={},guidance={},governance={},modelHealth={},workflow={},activeStock="",chart=null,chartRequest=0,evidenceRequest=0,refreshing=false,buyToken="",importToken="",lastFocus=null;
 const prefs={get(k, fallback){try{return JSON.parse(localStorage.getItem(k))??fallback;}catch{return fallback;}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch{}}};
-let watch = new Set(prefs.get("quant-watch",[]).filter(x=>/^[0-9]{6}$/.test(x)));
+let watch = new Set();
+let activeSecurity = null;
 document.documentElement.dataset.theme=prefs.get("quant-theme","dark");
 document.body.classList.toggle("compact",prefs.get("quant-compact",false));
-const pageInfo={overview:["投资总览","先看数据状态，再看候选与价格。"],daily:["日选研究","比较候选分数、价格边界与适用日期。"],monitor:["盘中监控","核验行情时效与价格计划状态。"],holdings:["我的持仓","管理人工成交与券商导入快照。"],models:["模型观察","只用未来结果对证模型表现。"],agent:["AI 分析","联网补充研究，交叉核验规则与最新公开信息。"],system:["数据与系统","检查来源、时效和运行状态。"]};
+const pageInfo={watchlist:["我的自选","查看已收藏股票及可用行情。"],overview:["投资总览","先看数据状态，再看候选与价格。"],daily:["日选研究","比较候选分数、价格边界与适用日期。"],monitor:["盘中监控","核验行情时效与价格计划状态。"],holdings:["我的持仓","管理人工成交与券商导入快照。"],models:["模型观察","只用未来结果对证模型表现。"],agent:["AI 分析","联网补充研究，交叉核验规则与最新公开信息。"],system:["数据与系统","检查来源、时效和运行状态。"]};
 function route(){let page=location.hash.slice(1);if(["entry","import-section"].includes(page))page="holdings";if(page==="agent-settings")page="system";if(!pageInfo[page])page=location.pathname==="/advisory"?"holdings":"overview";document.querySelectorAll("[data-view]").forEach(el=>el.hidden=el.dataset.view!==page);document.querySelectorAll("[data-page]").forEach(el=>{el.classList.toggle("active",el.dataset.page===page);if(el.dataset.page===page)el.setAttribute("aria-current","page");else el.removeAttribute("aria-current");});$("page-title").textContent=$("breadcrumb").textContent=pageInfo[page][0];$("page-subtitle").textContent=pageInfo[page][1];document.title=pageInfo[page][0]+" · A股量化交易工作台";if(["#entry","#import-section","#agent-settings"].includes(location.hash))$(location.hash.slice(1)).scrollIntoView({behavior:"smooth"});else window.scrollTo({top:0,behavior:"instant"});}
 window.addEventListener("hashchange",route);route();
 async function api(path,body,header){const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),20000);try{const response=await fetch(path,{cache:"no-store",signal:controller.signal,...(body!==undefined?{method:"POST",headers:{"Content-Type":"application/json","X-Quant-Workbench-Request":header||"manual-advisory"},body:JSON.stringify(body)}:{})});const result=await response.json();if(!response.ok)throw Error(result.notice_zh||"请求未完成，请检查数据或重新预览");return result;}finally{clearTimeout(timeout);}}
@@ -210,15 +212,40 @@ function syncPreferenceButtons(){$("theme").setAttribute("aria-pressed",String(d
 $("theme").onclick=()=>{const theme=document.documentElement.dataset.theme==="dark"?"light":"dark";document.documentElement.dataset.theme=theme;prefs.set("quant-theme",theme);syncPreferenceButtons();if($("stock-dialog").open)loadChart();};
 $("density").onclick=()=>{document.body.classList.toggle("compact");prefs.set("quant-compact",document.body.classList.contains("compact"));syncPreferenceButtons();};
 syncPreferenceButtons();
-function mergedStock(symbol){const daily=(state.official_daily_candidates||[]).find(x=>x.symbol===symbol)||{},monitor=(state.intraday_monitor||[]).find(x=>x.symbol===symbol)||{},holding=(account.positions||[]).find(x=>x.code===symbol)||{},imported=(account.imported_account_snapshot?.positions||[]).find(x=>x.code===symbol)||{};return {...imported,...holding,...daily,...monitor,symbol,name:monitor.name||daily.name||holding.name||imported.name||symbol,price_guidance:monitor.price_guidance||daily.price_guidance};}
-function renderStock(){const x=mergedStock(activeStock),g=x.price_guidance||{},risk=x.event_risk||{},events=risk.events||[];$("stock-title").textContent=x.name+" · "+activeStock;$("stock-summary").innerHTML='<button class="watch-button" id="toggle-watch">'+(watch.has(activeStock)?"★ 已加入自选":"☆ 加入自选")+'</button>'+def("最新可用行情",number(x.current_price??x.last))+def("行情时间",time(x.quote_timestamp))+def("日选信号日期",x.signal_date||"不在本期日选")+def("数据质量",zh(x.data_quality))+def("公告风险",riskZh(risk.level||"NOT_CHECKED"))+def("公告检查时间",time(risk.checked_at));$("toggle-watch").onclick=()=>{watch.has(activeStock)?watch.delete(activeStock):watch.add(activeStock);prefs.set("quant-watch",[...watch].slice(0,200));renderStock();renderState();};
+function mergedStock(symbol){
+  const daily=(state.official_daily_candidates||[]).find(x=>x.symbol===symbol)||{};
+  const monitor=(state.intraday_monitor||[]).find(x=>x.symbol===symbol)||{};
+  const holding=(account.positions||[]).find(x=>x.code===symbol)||{};
+  const imported=(account.imported_account_snapshot?.positions||[]).find(x=>x.code===symbol)||{};
+  const catalogName=activeSecurity?.symbol===symbol ? activeSecurity.name : null;
+  return {...imported,...holding,...daily,...monitor,symbol,
+    name:catalogName||monitor.name||daily.name||holding.name||imported.name||symbol,
+    price_guidance:monitor.price_guidance||daily.price_guidance};
+}
+function renderStock(){const x=mergedStock(activeStock),g=x.price_guidance||{},risk=x.event_risk||{},events=risk.events||[];$("stock-title").textContent=x.name+" · "+activeStock;$("stock-summary").innerHTML='<button class="watch-button" id="toggle-watch">'+(window.quantWatchlist?.has(activeStock,activeSecurity?.exchange)?"★ 已加入自选":"☆ 加入自选")+'</button>'+def("最新可用行情",number(x.current_price??x.last))+def("行情时间",time(x.quote_timestamp))+def("日选信号日期",x.signal_date||"不在本期日选")+def("数据质量",zh(x.data_quality))+def("公告风险",riskZh(risk.level||"NOT_CHECKED"))+def("公告检查时间",time(risk.checked_at));$("toggle-watch").onclick=()=>window.quantWatchlist?.toggle(activeStock,activeSecurity);
 const lo=Number(g.entry_lower),hi=Number(g.entry_upper),max=Number(g.maximum_acceptable_price),invalid=Number(g.invalidation_price);let track="";if([lo,hi,max,invalid].every(Number.isFinite)&&invalid>0&&invalid<lo&&lo<=hi&&hi<=max&&max>invalid){const span=max-invalid;const current=x.current_price??x.last;const validQuote=quoteUsable(x)&&planApplies(g);track='<div class="price-track" title="从失效价到最高可接受价；蓝色为参考买入区间"><span class="price-zone" style="left:'+((lo-invalid)/span*100)+'%;width:'+((hi-lo)/span*100)+'%"></span>'+(validQuote?'<span class="price-marker" title="当前有效行情 '+number(current)+'" style="left:'+Math.max(0,Math.min(100,(Number(current)-invalid)/span*100))+'%"></span>':'')+'</div>';}
 $("price-plan").innerHTML='<h3>价格指导</h3><p>'+planStatus(x)+'</p>'+track+'<div class="plan-values"><div><small>参考买入区间</small><strong>'+esc(range(g))+'</strong></div><div><small>最高可接受价</small><strong>'+number(g.maximum_acceptable_price)+'</strong></div><div><small>失效价</small><strong>'+number(g.invalidation_price)+'</strong></div></div>'+def("适用日期",g.valid_for||g.valid_for_date||g.calculation_date||"以已有计划记录为准")+def("说明",(g.reason_codes||[]).map(zh).join("；")||(!g.entry_lower?"尚未提供可靠价格计划":"供人工核对；仍需核验当前行情与计划有效性"));
 const current=x.current_price??x.last;
 $("price-plan").innerHTML+=def("当前相对区间",!quoteUsable(x)?"行情未通过实时核验，暂不判断":!planApplies(g)?"计划不在当前适用日或缺少日期，暂不判断":!present(g.entry_lower)||!present(g.entry_upper)?"缺少参考区间":Number(current)<lo?"低于参考区间":Number(current)>hi?"高于参考区间":"位于参考区间")+def("本页成功读取",time(lastRead));
 $("stock-reasons").innerHTML='<div class="quiet-note"><h3>候选依据</h3>'+((x.reasons||[]).length?(x.reasons||[]).map(s=>'<p>'+esc(s)+'</p>').join(""):'<p>暂无已记录的候选理由</p>')+'</div><div class="quiet-note"><h3>近期公告</h3>'+(events.length?events.map(e=>'<p><a href="'+esc(e.source_url)+'" target="_blank" rel="noopener noreferrer">'+esc(e.title)+'</a> <small>'+time(e.announced_at)+' · '+esc(zh(e.level))+'</small></p>').join(""):'<p>当前检查窗口内暂无已记录公告，或公告检查尚未完成。</p>')+'</div>'+def("策略版本",x.strategy_version||"暂无");}
-document.addEventListener("click",e=>{const target=e.target.closest("[data-stock]");if(!target)return;lastFocus=target;activeStock=target.dataset.stock;evidenceRequest++;$("stock-evidence").textContent="点击查看当前数据与限制；输入变化后请重新核验。";$("stock-evidence-button").disabled=false;renderStock();$("stock-dialog").showModal();loadChart();});
-$("close-stock").onclick=()=>$("stock-dialog").close();$("stock-dialog").addEventListener("close",()=>{chartRequest++;evidenceRequest++;if(chart){chart.dispose();chart=null;}if(lastFocus?.isConnected)lastFocus.focus();});$("chart-range").onchange=loadChart;
+document.addEventListener("click",e=>{
+  const target=e.target.closest("[data-stock]");
+  if(!target)return;
+  lastFocus=target;
+  activeStock=target.dataset.stock;
+  activeSecurity=target.dataset.exchange
+    ? {exchange:target.dataset.exchange,symbol:activeStock,name:target.dataset.stockName}
+    : null;
+  $("stock-watch-message").textContent="";
+  $("stock-history-status").textContent="";
+  evidenceRequest++;
+  $("stock-evidence").textContent="点击查看当前数据与限制；输入变化后请重新核验。";
+  $("stock-evidence-button").disabled=false;
+  renderStock();
+  $("stock-dialog").showModal();
+  loadChart();
+});
+$("close-stock").onclick=()=>$("stock-dialog").close();$("stock-dialog").addEventListener("close",()=>{chartRequest++;evidenceRequest++;if(chart){chart.dispose();chart=null;}if(lastFocus?.isConnected)lastFocus.focus();});$("chart-range").onchange=()=>{$("stock-history-status").textContent="";loadChart();};
 $("stock-evidence-button").onclick=async()=>{
   const button=$("stock-evidence-button"),symbol=activeStock,request=++evidenceRequest;
   button.disabled=true;$("stock-evidence").textContent="正在读取本地核验依据…";
@@ -231,9 +258,19 @@ $("stock-evidence-button").onclick=async()=>{
   }catch(e){if(request===evidenceRequest)$("stock-evidence").textContent="核验依据读取失败；请稍后重试，不视为通过。";}
   finally{if(request===evidenceRequest)button.disabled=false;}
 };
-async function loadChart(){const request=++chartRequest;$("chart-note").textContent="正在读取本地日线…";if(chart){chart.dispose();chart=null;}$("stock-chart").innerHTML="";try{const data=await api("/api/stocks/history?symbol="+encodeURIComponent(activeStock)+"&limit="+$("chart-range").value);if(request!==chartRequest||!$("stock-dialog").open)return;const bars=data.bars||[];$("chart-note").textContent=data.notice_zh+" · "+(data.source||"未知来源")+" · "+(data.data_version||"")+" · "+bars.length+" 条";if(!bars.length){$("stock-chart").innerHTML=empty("暂无本地日线");return;}if(!window.echarts){$("stock-chart").innerHTML=empty("图表资源加载失败，请刷新页面");return;}chart=echarts.init($("stock-chart"));const dark=document.documentElement.dataset.theme==="dark",text=dark?"#a3b0c4":"#738096",line=dark?"#2b3b50":"#e6ebf1";chart.setOption({animation:false,legend:{data:["日K线","MA20","MA60"],textStyle:{color:text},top:0},tooltip:{trigger:"axis",confine:true},axisPointer:{link:[{xAxisIndex:"all"}]},grid:[{left:55,right:15,top:32,height:"51%"},{left:55,right:15,top:"70%",height:"14%"}],xAxis:[{type:"category",data:bars.map(x=>x.date),axisLabel:{color:text},axisLine:{lineStyle:{color:line}}},{type:"category",gridIndex:1,data:bars.map(x=>x.date),axisLabel:{show:false},axisLine:{show:false}}],yAxis:[{scale:true,axisLabel:{color:text},splitLine:{lineStyle:{color:line}}},{scale:true,gridIndex:1,axisLabel:{show:false},splitLine:{show:false}}],dataZoom:[{type:"inside",xAxisIndex:[0,1]},{type:"slider",xAxisIndex:[0,1],bottom:0,height:16,borderColor:line}],series:[{name:"日K线",type:"candlestick",data:bars.map(x=>[x.open,x.close,x.low,x.high]),itemStyle:{color:"#d94d5d",color0:"#19876f",borderColor:"#d94d5d",borderColor0:"#19876f"}},...[20,60].map(period=>({name:"MA"+period,type:"line",symbol:"none",lineStyle:{width:1,color:period===20?"#bb913b":"#8a77ca"},data:bars.map((x,i)=>i<period-1?null:bars.slice(i-period+1,i+1).reduce((sum,b)=>sum+b.close,0)/period)})),{name:"成交量（股）",type:"bar",xAxisIndex:1,yAxisIndex:1,data:bars.map(x=>({value:x.volume,itemStyle:{color:x.close>=x.open?"#d94d5d66":"#19876f66"}}))}]});}catch(e){if(request===chartRequest)$("chart-note").textContent="本地日线读取失败，请稍后重试。";}}
+async function loadChart(){const request=++chartRequest;$("chart-note").textContent="正在读取本地日线…";$("download-stock-history").hidden=true;if(chart){chart.dispose();chart=null;}$("stock-chart").innerHTML="";try{const data=await api("/api/stocks/history?symbol="+encodeURIComponent(activeStock)+"&limit="+$("chart-range").value+(activeSecurity?.exchange?"&exchange="+encodeURIComponent(activeSecurity.exchange):""));if(request!==chartRequest||!$("stock-dialog").open)return;const bars=data.bars||[];$("chart-note").textContent=data.notice_zh+" · "+(data.source||"未知来源")+" · "+(data.data_version||"")+" · "+bars.length+" 条"+(data.end_date?" · 截止 "+data.end_date:"");$("download-stock-history").hidden=bars.length>=Number($("chart-range").value);if(!bars.length){$("stock-chart").innerHTML=empty("暂无本地日线");return;}if(!window.echarts){$("stock-chart").innerHTML=empty("图表资源加载失败，请刷新页面");return;}chart=echarts.init($("stock-chart"));const dark=document.documentElement.dataset.theme==="dark",text=dark?"#a3b0c4":"#738096",line=dark?"#2b3b50":"#e6ebf1";chart.setOption({animation:false,legend:{data:["日K线","MA20","MA60"],textStyle:{color:text},top:0},tooltip:{trigger:"axis",confine:true},axisPointer:{link:[{xAxisIndex:"all"}]},grid:[{left:55,right:15,top:32,height:"51%"},{left:55,right:15,top:"70%",height:"14%"}],xAxis:[{type:"category",data:bars.map(x=>x.date),axisLabel:{color:text},axisLine:{lineStyle:{color:line}}},{type:"category",gridIndex:1,data:bars.map(x=>x.date),axisLabel:{show:false},axisLine:{show:false}}],yAxis:[{scale:true,axisLabel:{color:text},splitLine:{lineStyle:{color:line}}},{scale:true,gridIndex:1,axisLabel:{show:false},splitLine:{show:false}}],dataZoom:[{type:"inside",xAxisIndex:[0,1]},{type:"slider",xAxisIndex:[0,1],bottom:0,height:16,borderColor:line}],series:[{name:"日K线",type:"candlestick",data:bars.map(x=>[x.open,x.close,x.low,x.high]),itemStyle:{color:"#d94d5d",color0:"#19876f",borderColor:"#d94d5d",borderColor0:"#19876f"}},...[20,60].map(period=>({name:"MA"+period,type:"line",symbol:"none",lineStyle:{width:1,color:period===20?"#bb913b":"#8a77ca"},data:bars.map((x,i)=>i<period-1?null:bars.slice(i-period+1,i+1).reduce((sum,b)=>sum+b.close,0)/period)})),{name:"成交量（股）",type:"bar",xAxisIndex:1,yAxisIndex:1,data:bars.map(x=>({value:x.volume,itemStyle:{color:x.close>=x.open?"#d94d5d66":"#19876f66"}}))}]});}catch(e){if(request===chartRequest)$("chart-note").textContent="本地日线读取失败，请稍后重试。";}}
 window.addEventListener("resize",()=>chart?.resize());
-$("code").addEventListener("input",()=>{const x=mergedStock($("code").value);if(x.name!==$("code").value)$("name").value=x.name;});
+let autofilledName="";
+$("code").addEventListener("input",()=>{
+  const symbol=$("code").value;
+  const nameField=$("name");
+  const stock=mergedStock(symbol);
+  if(stock.name!==symbol){
+    nameField.value=autofilledName=stock.name;
+  }else if(autofilledName && nameField.value===autofilledName){
+    nameField.value=autofilledName="";
+  }
+});
 function invalidateBuy(){buyToken="";$("buy-confirm").hidden=true;$("buy-preview").textContent="";}
 $("buy-form").addEventListener("input",invalidateBuy);
 $("buy-form").onsubmit=e=>{e.preventDefault();const button=e.submitter;action(button,async()=>{invalidateBuy();const payload={name:$("name").value.trim(),code:$("code").value.trim(),quantity:Number($("quantity").value),price:$("price").value};const fingerprint=JSON.stringify(payload);const result=await api("/api/advisory/buy-preview",payload);const current=JSON.stringify({name:$("name").value.trim(),code:$("code").value.trim(),quantity:Number($("quantity").value),price:$("price").value});if(current!==fingerprint)return;buyToken=result.confirmation_token;$("buy-preview").innerHTML='<div class="quiet-note">'+def("股票",payload.name+" "+payload.code)+def("数量",payload.quantity+" 股")+def("成交价",payload.price+" 元")+def("预估总成本",result.estimated_total_cost)+def("说明",result.notice_zh)+'</div>';$("buy-confirm").hidden=!buyToken;},"buy-preview");};

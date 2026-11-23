@@ -34,12 +34,16 @@ from a_share_quant.storage.public_risk_store import PublicRiskStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.agent_runtime import AgentRuntime
 from a_share_quant.workbench.context_tools import WorkbenchContextTools
+from a_share_quant.workbench.security_catalog import EXCHANGES, SIX_DIGITS, SecurityCatalog
 from a_share_quant.workbench.service import WorkbenchService
+from a_share_quant.workbench.watchlist import Watchlist
+from a_share_quant.workbench.watchlist_quotes import WatchlistQuotes
 
 _UI_ROOT = Path(__file__).with_name("static")
 _UI_ASSETS = {
     "/assets/workbench.css": ("workbench.css", "text/css; charset=utf-8"),
     "/assets/workbench.js": ("workbench.js", "text/javascript; charset=utf-8"),
+    "/assets/watchlist.js": ("watchlist.js", "text/javascript; charset=utf-8"),
     "/assets/agent.js": ("agent.js", "text/javascript; charset=utf-8"),
     "/assets/echarts.min.js": ("echarts.min.js", "text/javascript; charset=utf-8"),
 }
@@ -152,6 +156,7 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         governance: EvolutionRegistry | None = None,
         research_lifecycle: ResearchLifecycle | None = None,
         agent_runtime: AgentRuntime | None = None,
+        watchlist: Watchlist | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
@@ -163,11 +168,18 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.agent_runtime = agent_runtime or AgentRuntime(
             WorkbenchContextTools(service, advisory_service),
         )
+        self.watchlist = watchlist
+        self.watchlist_quotes = WatchlistQuotes(service) if watchlist is not None else None
         self._governance_previews: dict[str, tuple[str, str, str]] = {}
         super().__init__(server_address, WorkbenchRequestHandler)
 
     def server_close(self) -> None:
         self.agent_runtime.stop()
+        if self.watchlist_quotes is not None:
+            self.watchlist_quotes.close()
+        if self.watchlist is not None:
+            self.watchlist.catalog.close()
+            self.watchlist.history.close()
         super().server_close()
 
 
@@ -197,12 +209,22 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
+        elif path in {"/api/securities/search", "/api/watchlist", "/api/stocks/history/status"}:
+            self._watchlist_read(path)
         elif path == "/api/stocks/history":
             from a_share_quant.workbench.stock_history import load_history
 
             query = parse_qs(urlparse(self.path).query)
             try:
-                result = load_history(query.get("symbol", [""])[0], query.get("limit", ["120"])[0])
+                symbol, limit = query.get("symbol", [""])[0], query.get("limit", ["120"])[0]
+                exchange = query.get("exchange", [""])[0]
+                watchlist = self.server.watchlist
+                if exchange:
+                    if watchlist is None or not self._agent_origin_valid():
+                        raise ValueError("证券名录不可用")
+                    result = watchlist.history.read(exchange, symbol, limit)
+                else:
+                    result = load_history(symbol, limit)
                 self._write_json(result)
             except ValueError:
                 self._write_json({"error": "证券代码或范围无效"}, status=HTTPStatus.BAD_REQUEST)
@@ -267,6 +289,9 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/agent/"):
             self._agent_request(path)
             return
+        if path in {"/api/securities/refresh", "/api/watchlist", "/api/stocks/history/download"}:
+            self._watchlist_write(path)
+            return
         if path == "/api/workflow/retry":
             self._discard_request_body()
             if self.headers.get("X-Quant-Workbench-Request") != "workflow-retry":
@@ -323,6 +348,95 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return
         self._discard_request_body()
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _watchlist_payload(self, watchlist: Watchlist) -> dict:
+        rows = watchlist.items()
+        if self.server.watchlist_quotes is not None:
+            rows = self.server.watchlist_quotes.enrich(
+                rows, allow_network=watchlist.catalog.allow_network,
+            )
+        return {"rows": rows}
+
+    def _watchlist_read(self, path: str) -> None:
+        watchlist = self.server.watchlist
+        if not self._agent_origin_valid() or watchlist is None:
+            self._write_json({"notice_zh": "证券与自选服务不可用"}, status=HTTPStatus.FORBIDDEN)
+            return
+        try:
+            if path == "/api/watchlist":
+                self._write_json(self._watchlist_payload(watchlist))
+            else:
+                query = parse_qs(urlparse(self.path).query)
+                if path == "/api/stocks/history/status":
+                    result = watchlist.history.status(
+                        query.get("exchange", [""])[0],
+                        query.get("symbol", [""])[0],
+                        query.get("limit", ["120"])[0],
+                    )
+                else:
+                    result = watchlist.catalog.search(query.get("q", [""])[0])
+                self._write_json(result)
+        except (OSError, ValueError, KeyError, TypeError):
+            self._write_json({"notice_zh": "本地证券数据无法读取，请检查文件或搜索条件。"},
+                             status=HTTPStatus.BAD_REQUEST)
+
+    def _watchlist_write(self, path: str) -> None:
+        watchlist = self.server.watchlist
+        if (
+            watchlist is None
+            or not self._agent_origin_valid()
+            or self.headers.get("X-Quant-Workbench-Request") != "watchlist"
+            or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json"
+        ):
+            self.close_connection = True
+            self._write_json({"notice_zh": "请求须来自本地工作台。"}, status=HTTPStatus.FORBIDDEN)
+            return
+        try:
+            self.connection.settimeout(3)
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 1 <= length <= 8192:
+                self.close_connection = True
+                raise ValueError("自选请求大小无效")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("自选请求无效")
+            if path == "/api/securities/refresh" and not payload:
+                watchlist.catalog.request_refresh(operator_requested=True)
+                self._write_json(watchlist.catalog.search(""))
+                return
+            if path == "/api/stocks/history/download":
+                if set(payload) != {"exchange", "symbol", "limit"} or not all(
+                    isinstance(value, str) for value in payload.values()
+                ):
+                    raise ValueError("日线请求无效")
+                self._write_json(watchlist.history.request(**payload))
+                return
+            if path != "/api/watchlist":
+                raise ValueError("名录刷新请求无效")
+            action = payload.get("action")
+            if set(payload) == {"action", "symbols"} and action == "migrate":
+                watchlist.migrate_legacy(payload["symbols"])
+            elif set(payload) == {"action", "exchange", "symbol"} and action in ("add", "remove"):
+                exchange, symbol = payload["exchange"], payload["symbol"]
+                if (
+                    not isinstance(exchange, str)
+                    or exchange not in EXCHANGES | ({""} if action == "remove" else set())
+                    or not isinstance(symbol, str)
+                    or not SIX_DIGITS.fullmatch(symbol)
+                ):
+                    raise ValueError("证券代码或交易所无效")
+                if action == "add":
+                    watchlist.add(exchange, symbol)
+                else:
+                    watchlist.remove(exchange, symbol)
+            else:
+                raise ValueError("自选操作无效")
+            self._write_json(self._watchlist_payload(watchlist))
+        except (OSError, KeyError, TypeError):
+            self._write_json({"notice_zh": "无法更新本地自选，请检查文件状态。"},
+                             status=HTTPStatus.SERVICE_UNAVAILABLE)
+        except ValueError as exc:
+            self._write_json({"notice_zh": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def _safe_exit(self) -> None:
         if self.headers.get("X-Quant-Workbench-Request") != "safe-exit":
@@ -693,6 +807,7 @@ def create_server(
     governance: EvolutionRegistry | None = None,
     research_lifecycle: ResearchLifecycle | None = None,
     agent_runtime: AgentRuntime | None = None,
+    watchlist: Watchlist | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -706,6 +821,7 @@ def create_server(
         governance,
         research_lifecycle,
         agent_runtime,
+        watchlist,
     )
 
 
@@ -843,6 +959,9 @@ def run_server(
             publish=service.publish_public_risk,
         )
         service.set_public_risk_refresh_request(public_risk_coordinator.request_refresh)
+    watchlist = None
+    if repo_root is not None:
+        watchlist = Watchlist(repo_root, SecurityCatalog(repo_root, allow_network=allow_network))
     server = create_server(
         service=service,
         advisory_service=advisory_service,
@@ -850,9 +969,12 @@ def run_server(
         governance=governance,
         research_lifecycle=research_lifecycle,
         agent_runtime=AgentRuntime(WorkbenchContextTools(service, advisory_service), repo_root),
+        watchlist=watchlist,
         port=port,
     )
     try:
+        if watchlist is not None:
+            watchlist.catalog.start()
         service.start_background()
         if eod_coordinator is not None:
             eod_coordinator.start()
@@ -865,6 +987,9 @@ def run_server(
     except KeyboardInterrupt:
         pass
     finally:
+        if watchlist is not None:
+            watchlist.catalog.close()
+            watchlist.history.close()
         if research_lifecycle is not None:
             research_lifecycle.stop()
         server.shutdown()
