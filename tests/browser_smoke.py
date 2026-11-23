@@ -58,10 +58,15 @@ def test_workbench_renders_data_and_failure_states():
             expect(page.get_by_text("正式日历仅覆盖未来")).to_be_visible()
             expect(page.get_by_text("降级", exact=True).first).to_be_visible()
             page.set_viewport_size({"width": 390, "height": 844})
+            mobile_margin = page.evaluate(
+                "() => getComputedStyle(document.querySelector('.workspace')).marginLeft"
+            )
+            assert mobile_margin == "0px", f"Sidebar offset at mobile width: {mobile_margin}"
             page.get_by_role("link", name="AI 分析", exact=True).click()
             expect(page.locator("#agent-start")).to_be_disabled()
             expect(page.locator("#agent-start-notice")).to_contain_text("有效计价快照")
-            assert page.evaluate("document.documentElement.scrollWidth") == 390
+            page_width = page.evaluate("document.documentElement.scrollWidth")
+            assert page_width == 390, f"Page overflow at mobile width: {page_width}px"
             assert errors == []
             browser.close()
     finally:
