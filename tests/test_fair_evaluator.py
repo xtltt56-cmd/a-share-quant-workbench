@@ -93,3 +93,21 @@ def test_evaluation_config_reads_risk_limits_from_yaml() -> None:
     assert config.max_positions == 10
     assert config.max_single_position == pytest.approx(0.15)
     assert config.max_gross_exposure == pytest.approx(0.60)
+
+
+def test_bounded_evaluation_has_no_pre_test_benchmark_return_and_no_shifted_label() -> None:
+    signal_day = date(2025, 1, 2)
+    missing_day = date(2025, 1, 4)
+    bars = _bars(["000001", "000300"])
+    bars = bars.loc[~(bars["symbol"].eq("000001") & bars["date"].eq(missing_day))]
+    predictions = _predictions(["000001"]).assign(signal_date=signal_day)
+
+    result = FairPortfolioEvaluator(EvaluationConfig(horizon_days=2)).evaluate(
+        predictions, bars, benchmark="000300", signal_period=(signal_day, signal_day),
+    )
+
+    assert result.equity["date"].tolist() == [signal_day, date(2025, 1, 3)]
+    assert result.equity["benchmark_equity"].iloc[0] == pytest.approx(1.0)
+    assert result.trades["execution_date"].tolist() == [date(2025, 1, 3)]
+    assert result.predictions["forward_return"].isna().all()
+    assert result.metrics["forward_label_coverage"] == 0.0

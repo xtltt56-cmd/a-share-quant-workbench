@@ -1,0 +1,12 @@
+{
+  "version": "deepseek-flash-2026-11-23-peak",
+  "model": "deepseek-flash",
+  "reviewed_on": "2026-11-23",
+  "valid_through": "2026-12-23",
+  "usd_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "cny_source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+  "input_usd_per_million": "0.30",
+  "output_usd_per_million": "1.20",
+  "input_cny_per_million": "2.00",
+  "output_cny_per_million": "8.00"
+}

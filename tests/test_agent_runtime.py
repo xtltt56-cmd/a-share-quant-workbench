@@ -3,6 +3,7 @@ import copy
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -83,7 +84,8 @@ def runtime_factory(tmp_path, monkeypatch):
                         lambda name: object())
     created = []
 
-    def factory(*, root=True, **kwargs):
+    def factory(*, root=True, clock=lambda: datetime(2026, 11, 24, tzinfo=timezone.utc),
+                **kwargs):
         instances = []
 
         def provider(cfg):
@@ -92,7 +94,7 @@ def runtime_factory(tmp_path, monkeypatch):
             return instance
 
         runtime = AgentRuntime(WorkbenchContextTools(service()), tmp_path if root else None,
-                               provider_factory=provider)
+                               provider_factory=provider, clock=clock)
         created.append(runtime)
         runtime.configure({"enabled": True, "backend": "LOCAL"})
         return runtime, instances
@@ -451,3 +453,17 @@ def test_agent_api_requires_local_origin_header_and_rejects_free_text(runtime_fa
         server.shutdown()
         server.server_close()
         thread.join(3)
+
+
+@pytest.mark.parametrize(("day", "expected"), [
+    (datetime(2026, 11, 23, tzinfo=timezone.utc), "AWAITING_APPROVAL"),
+    (datetime(2026, 12, 23, 15, 59, tzinfo=timezone.utc), "AWAITING_APPROVAL"),
+    (datetime(2026, 12, 23, 16, tzinfo=timezone.utc), "PRICE_REVIEW_REQUIRED"),
+])
+def test_cloud_pricing_uses_shanghai_review_window(runtime_factory, monkeypatch, day, expected):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "mock-key")
+    runtime, providers = runtime_factory(clock=lambda: day)
+    runtime.configure({"enabled": True, "backend": "CLOUD", "payment_authorized": True,
+                       "daily_budget_usd": "0.10", "task_budget_usd": "0.02"})
+    assert runtime.status()["status"] == expected
+    assert providers == []

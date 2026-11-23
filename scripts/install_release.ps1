@@ -4,7 +4,7 @@ param(
     [switch]$AllowSystemDrive,
     [switch]$SkipShortcut,
     [switch]$SkipLaunch,
-    [string]$PythonInstallerPath = ''
+    [string]$PythonPackagePath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -16,8 +16,9 @@ $runtimePython = Join-Path $runtimeRoot 'python.exe'
 $runtimeState = Join-Path $repoRoot '.runtime\install-state.json'
 $requirements = Join-Path $repoRoot 'constraints\release-py312.txt'
 $pythonVersion = '3.12.10'
-$pythonInstallerUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-amd64.exe"
-$pythonInstallerSha256 = '67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB'
+$pythonPackageName = "python.$pythonVersion.nupkg"
+$pythonPackageUrl = "https://api.nuget.org/v3-flatcontainer/python/$pythonVersion/$pythonPackageName"
+$pythonPackageSha256 = '0EB85C2DFCCCCF1B17352DE4C397F69194035B7D37149EACC16F1147D93DE3B8'
 
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -49,61 +50,56 @@ function Confirm-SystemDriveInstall {
     }
 }
 
-function Get-VerifiedPythonInstaller {
-    if ([string]::IsNullOrWhiteSpace($PythonInstallerPath)) {
+function Get-VerifiedPythonPackage {
+    if ([string]::IsNullOrWhiteSpace($PythonPackagePath)) {
         $cache = Join-Path $repoRoot '.runtime\install-cache'
         New-Item -ItemType Directory -Path $cache -Force | Out-Null
-        $candidate = Join-Path $cache "python-$pythonVersion-amd64.exe"
+        $candidate = Join-Path $cache $pythonPackageName
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-            Write-Host 'Downloading the signed installer from python.org...'
-            Invoke-WebRequest -Uri $pythonInstallerUrl -OutFile $candidate -UseBasicParsing
+            Write-Host 'Downloading the official CPython runtime package from NuGet...'
+            $download = "$candidate.$([Guid]::NewGuid().ToString('N')).download"
+            try {
+                Invoke-WebRequest -Uri $pythonPackageUrl -OutFile $download -UseBasicParsing
+                if ((Get-Sha256Hex -Path $download) -ne $pythonPackageSha256) {
+                    throw 'Downloaded CPython package failed its pinned SHA-256 check.'
+                }
+                Move-Item -LiteralPath $download -Destination $candidate
+            } finally {
+                if (Test-Path -LiteralPath $download -PathType Leaf) {
+                    Remove-Item -LiteralPath $download
+                }
+            }
         }
     } else {
-        $candidate = (Resolve-Path -LiteralPath $PythonInstallerPath).Path
+        $candidate = (Resolve-Path -LiteralPath $PythonPackagePath).Path
     }
-    $actualHash = Get-Sha256Hex -Path $candidate
-    if ($actualHash -ne $pythonInstallerSha256) {
-        throw "Python installer checksum failed. Actual SHA-256: $actualHash"
-    }
-    $signature = Get-AuthenticodeSignature -LiteralPath $candidate
-    if (
-        $signature.Status -ne 'Valid' -or
-        $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Subject -notlike '*Python Software Foundation*'
-    ) {
-        throw 'Python installer signature is invalid or has an unexpected signer.'
+    if ((Get-Sha256Hex -Path $candidate) -ne $pythonPackageSha256) {
+        throw 'CPython package failed its pinned SHA-256 check.'
     }
     return $candidate
 }
 
 function Install-PrivatePython {
-    $installer = Get-VerifiedPythonInstaller
-    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
-    $arguments = @(
-        '/quiet',
-        'InstallAllUsers=0',
-        "TargetDir=`"$runtimeRoot`"",
-        'Include_pip=1',
-        'Include_launcher=0',
-        'Include_test=0',
-        'Include_doc=0',
-        'Include_tcltk=0',
-        'Include_tools=0',
-        'Include_dev=0',
-        'Include_symbols=0',
-        'Include_debug=0',
-        'AssociateFiles=0',
-        'Shortcuts=0',
-        'PrependPath=0'
-    )
-    Write-Host 'Installing the application-private Python runtime...'
-    $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
-    if ($process.ExitCode -notin @(0, 3010)) {
-        throw "Python installation failed with exit code $($process.ExitCode)."
+    $package = Get-VerifiedPythonPackage
+    $cache = Join-Path $repoRoot '.runtime\install-cache'
+    New-Item -ItemType Directory -Path $cache -Force | Out-Null
+    $stage = Join-Path $cache ('python-' + [Guid]::NewGuid().ToString('N'))
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    Write-Host 'Extracting application-private Python...'
+    [IO.Compression.ZipFile]::ExtractToDirectory($package, $stage)
+    $tools = Join-Path $stage 'tools'
+    $candidate = Join-Path $tools 'python.exe'
+    $identity = & $candidate -I -c 'import platform; print(platform.python_version())'
+    if ($LASTEXITCODE -ne 0 -or $identity -ne $pythonVersion) {
+        throw 'The extracted interpreter failed its version check.'
     }
-    if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
-        throw 'Python installer completed but the private runtime is missing.'
+    if (Test-Path -LiteralPath $runtimeRoot) {
+        if (@(Get-ChildItem -LiteralPath $runtimeRoot -Force).Count -gt 0) {
+            throw 'An existing private runtime directory is incomplete. Back it up before retrying.'
+        }
+        Remove-Item -LiteralPath $runtimeRoot
     }
+    Move-Item -LiteralPath $tools -Destination $runtimeRoot
 }
 
 function Invoke-RuntimePython {
@@ -123,6 +119,7 @@ if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
     Install-PrivatePython
 }
 
+$env:PYTHONNOUSERSITE = '1'
 $runtimeCache = Join-Path $repoRoot '.runtime\cache\pip'
 $runtimeTemp = Join-Path $repoRoot '.runtime\tmp'
 New-Item -ItemType Directory -Path $runtimeCache, $runtimeTemp, (Split-Path $runtimeState), (Join-Path $repoRoot 'data'), (Join-Path $repoRoot 'logs') -Force | Out-Null

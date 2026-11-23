@@ -50,6 +50,7 @@ _RESEARCH_CONTEXT_KEYS = frozenset(
         "data_fingerprint",
         "data_refreshed",
         "outcome_cutoff",
+        "settlement_fingerprint",
     }
 )
 
@@ -140,6 +141,7 @@ class ResearchLifecycle:
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    request_queue_size = 32
 
     def __init__(
         self,
@@ -359,6 +361,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             or self.headers.get("X-Quant-Workbench-Request") != "agent"
             or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json"):
             self.close_connection = True
+            self._discard_request_body(maximum_bytes=8192)
             self._write_json({"notice_zh": "Agent 请求须来自本地工作台。"},
                              status=HTTPStatus.FORBIDDEN)
             return
@@ -479,13 +482,14 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": "model governance request could not be processed"}, status=HTTPStatus.BAD_REQUEST)
             return None
 
-    def _discard_request_body(self) -> None:
+    def _discard_request_body(self, *, maximum_bytes: int = 1_048_576) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if 0 < length <= 1_048_576:
-            self.rfile.read(length)
+            if 0 < length <= maximum_bytes:
+                self.connection.settimeout(3)
+                self.rfile.read(length)
+        except (OSError, ValueError):
+            return
 
     def _write_governance_state(self) -> None:
         governance = self.server.governance

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -177,7 +178,7 @@ def test_task8_worker_uses_only_workbench_derived_inputs_not_request_json(
     monkeypatch.setattr(
         research_worker,
         "_derive_settle_context",
-        lambda _policy, _contest: settlement,
+        lambda _policy: settlement,
         raising=False,
     )
     monkeypatch.setattr(
@@ -484,6 +485,14 @@ def test_task8_predict_derives_future_record_from_frozen_contest_and_daily_signa
     contest.pop("sha256", None)
     with pytest.raises(research_worker._Blocked, match="OFFICIAL_SIGNAL_DIGEST_MISMATCH"):
         research_worker._derive_predict_context(policy, contest)
+
+    monkeypatch.setattr(
+        research_worker, "_current_time",
+        lambda: datetime(2026, 8, 17, 1, 30, tzinfo=timezone.utc),
+    )
+    with pytest.raises(research_worker._Blocked, match="PREDICTION_WINDOW_MISSED"):
+        research_worker._derive_predict_context(policy, contest)
+    assert len(ProspectiveLedgerStore(policy=policy).predictions()) == 1
 
 
 def test_task8_predict_uses_verified_exchange_calendar_for_maturity(
@@ -818,8 +827,9 @@ def test_task8_worker_rejects_contest_fields_outside_frozen_contract() -> None:
         research_worker._contest_from_payload(payload)
 
 
+@pytest.mark.parametrize("missing_outcome", [False, True])
 def test_task8_settle_derives_actual_outcome_from_refreshed_return_artifact(
-    d_worker_root: Path, monkeypatch
+    d_worker_root: Path, monkeypatch, missing_outcome
 ) -> None:
     """Settlement must use a post-prediction immutable return artifact, not JSON."""
 
@@ -872,6 +882,11 @@ def test_task8_settle_derives_actual_outcome_from_refreshed_return_artifact(
         contest=frozen,
         now=datetime(2026, 8, 7, 8, tzinfo=timezone.utc),
     ).append_prediction(prediction)
+    missing = None
+    if missing_outcome:
+        missing = ledger.append_prediction(
+            replace(prediction, symbol="600002", prediction_id="missing-outcome")
+        )
     data = pd.DataFrame(
         [
             {
@@ -896,7 +911,18 @@ def test_task8_settle_derives_actual_outcome_from_refreshed_return_artifact(
     monkeypatch.setenv("A_SHARE_QUANT_RESEARCH_JOB_ID", job_id)
     monkeypatch.setattr(research_worker, "_current_time", lambda: now)
 
-    assert research_worker.run_job("settle", d_worker_root, storage_policy=policy) == 0
+    exit_code = research_worker.run_job("settle", d_worker_root, storage_policy=policy)
+    assert exit_code == int(missing_outcome)
+    if missing is not None:
+        status = json.loads(
+            (d_worker_root / f".runtime/research/status/{job_id}.json").read_text()
+        )
+        assert status["status"] == "PARTIAL"
+        evidence = d_worker_root / ".runtime/research" / status["artifact_relpath"]
+        evidence_result = json.loads(evidence.read_text())["result"]
+        assert evidence_result["deferred"] == [
+            {"prediction_id": missing.id, "reason": "REFRESHED_OUTCOME_NOT_READY"}
+        ]
     assert not (d_worker_root / ".runtime" / "research" / "settle-request.json").exists()
     outcomes = ProspectiveLedgerStore(policy=policy).settlements()
     assert len(outcomes) == 1
@@ -1095,7 +1121,7 @@ def test_settle_rejects_unadjusted_lake_when_corporate_action_evidence_conflicts
     MarketDataStore(d_worker_root / "data").write_daily_bars(pd.DataFrame(rows))
     monkeypatch.setattr(research_worker, "_current_time", lambda: now)
 
-    with pytest.raises(research_worker._Blocked, match="REFRESHED_OUTCOME_NOT_READY"):
+    with pytest.raises(research_worker._Blocked, match="OUTCOME_ADJUSTMENT_CONFLICT"):
         research_worker._derived_outcome(policy, prediction, now)
 
 
@@ -1130,3 +1156,14 @@ def test_task8_worker_dispatches_to_the_fixed_coordinator_when_verified(
     assert payload["status"] == "SUCCESS"
     assert payload["promotion"] == "NEVER"
     assert payload["artifact_digest"] == "b" * 64
+
+
+def test_forward_archive_only_requires_actual_horizon_and_reuses_digest(d_worker_root):
+    policy = ProjectStoragePolicy(d_worker_root)
+    as_of = date(2026, 12, 4)
+    sessions, digest = research_worker._verified_session_calendar(policy, as_of)
+    assert len(sessions) == 5
+    assert sessions[-1] == date(2026, 12, 11)
+    assert research_worker._verified_session_calendar(
+        policy, as_of, archived_digests={digest},
+    ) == (sessions, digest)

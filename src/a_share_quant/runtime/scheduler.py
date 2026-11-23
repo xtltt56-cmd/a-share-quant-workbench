@@ -234,6 +234,9 @@ class RealTimeScheduler:
         self._pending_full_snapshot: Any | None = None
         self._pending_full_error: str | None = None
         self._full_market_thread: threading.Thread | None = None
+        self._minute_thread: threading.Thread | None = None
+        self.priority_request_ms: float | None = None
+        self.full_market_request_ms: float | None = None
         self.circuit_breaker = circuit_breaker or RealtimeCircuitBreaker(
             stale_after_seconds=stale_after_seconds
         )
@@ -267,6 +270,7 @@ class RealTimeScheduler:
         priority_count = 0
         priority_error: Exception | None = None
         if self.priority_symbols:
+            request_started = self.monotonic_clock()
             try:
                 priority_method = getattr(self.provider, "get_priority_quotes", None)
                 if priority_method is None:
@@ -277,7 +281,8 @@ class RealTimeScheduler:
                         policy=self.retry_policy,
                     )
                 )
-                priority_report, priority_quarantined = self._check_quotes(priority_quotes, now=now)
+                now = self.clock()
+                priority_report, _ = self._check_quotes(priority_quotes, now=now)
                 if priority_report.is_usable:
                     usable_priority = tuple(
                         quote for quote in priority_report.quotes if not quote.is_stale
@@ -288,6 +293,8 @@ class RealTimeScheduler:
                     priority_error = RuntimeError("priority data is stale")
             except Exception as exc:  # provider boundary: do not leak payloads
                 priority_error = exc
+            finally:
+                self.priority_request_ms = (self.monotonic_clock() - request_started) * 1000
 
         pending_snapshot, pending_error = self._take_pending_full_result()
         if pending_snapshot is not None or pending_error is not None:
@@ -340,17 +347,20 @@ class RealTimeScheduler:
         # Reserve the next full-market slot before calling the public endpoint:
         # a slow or failed endpoint must not be retried on every 15-second tick.
         self._last_full_market_at = current_monotonic
-        if self.priority_symbols and priority_report is not None and priority_report.is_usable:
+        if self.priority_symbols:
             self._start_async_full_market_refresh()
+            usable = priority_report is not None and priority_report.is_usable
             return SchedulerTick(
                 timestamp=now,
                 session=session,
                 requested=True,
-                updated=True,
+                updated=usable,
                 quote_count=priority_count,
-                quality_status=priority_report.status,
+                quality_status=priority_report.status if usable else DataQualityStatus.DEGRADED,
+                error="" if usable else "FULL_MARKET_PENDING",
                 priority_only=True,
             )
+        request_started = self.monotonic_clock()
         try:
             snapshot = self._retry(
                 self.provider.get_market_snapshot,
@@ -358,7 +368,7 @@ class RealTimeScheduler:
             )
             return self._process_full_snapshot(
                 snapshot,
-                now=now,
+                now=self.clock(),
                 priority_report=priority_report,
                 priority_count=priority_count,
             )
@@ -382,6 +392,8 @@ class RealTimeScheduler:
                 quality_status=DataQualityStatus.FAILED,
                 error=type(exc).__name__,
             )
+        finally:
+            self.full_market_request_ms = (self.monotonic_clock() - request_started) * 1000
 
     def _process_full_snapshot(
         self,
@@ -411,14 +423,25 @@ class RealTimeScheduler:
                 quality_status=report.status,
                 error="DATA_STALE",
             )
-        usable_quotes = tuple(quote for quote in report.quotes if not quote.is_stale)
-        self.store.replace_quote_snapshot(usable_quotes)
-        bars = (
-            tuple(self._retry(lambda: self.provider.get_minute_bars(self.symbols, self.frequency)))
-            if self.symbols
-            else ()
-        )
-        self.store.put_minute_bars(bars)
+        usable_quotes = {quote.symbol: quote for quote in report.quotes if not quote.is_stale}
+        if self.priority_symbols:
+            for quote in self.store.quotes(self.priority_symbols):
+                existing = usable_quotes.get(quote.symbol)
+                if (
+                    not quote.is_stale
+                    and quote.quality_flag is DataQualityStatus.GOOD
+                    and 0 <= (now - quote.timestamp_exchange).total_seconds()
+                    <= self.circuit_breaker.stale_after_seconds
+                    and (existing is None or quote.timestamp_exchange > existing.timestamp_exchange)
+                ):
+                    usable_quotes[quote.symbol] = quote
+        self.store.replace_quote_snapshot(tuple(usable_quotes.values()))
+        bars = ()
+        if self.symbols:
+            if self.priority_symbols:
+                self._start_minute_refresh()
+            else:
+                bars = self._refresh_minute_bars()
         return SchedulerTick(
             timestamp=now,
             session=self.resolver.resolve(now),
@@ -430,6 +453,29 @@ class RealTimeScheduler:
             error="PARTIAL_DATA_STALE" if timestamp_quarantined else "",
         )
 
+    def _refresh_minute_bars(self) -> tuple:
+        bars = tuple(self._retry(
+            lambda: self.provider.get_minute_bars(self.symbols, self.frequency)
+        ))
+        self.store.put_minute_bars(bars)
+        return bars
+
+    def _start_minute_refresh(self) -> None:
+        if self._minute_thread is not None and self._minute_thread.is_alive():
+            return
+
+        def worker() -> None:
+            try:
+                self._refresh_minute_bars()
+            except Exception:
+                # A missing minute series does not invalidate the quote snapshot.
+                return
+
+        self._minute_thread = threading.Thread(
+            target=worker, name="quant-minute-refresh", daemon=True,
+        )
+        self._minute_thread.start()
+
     def _start_async_full_market_refresh(self) -> None:
         with self._full_market_lock:
             if self._full_market_thread is not None and self._full_market_thread.is_alive():
@@ -438,6 +484,7 @@ class RealTimeScheduler:
             def worker() -> None:
                 snapshot = None
                 error: str | None = None
+                request_started = self.monotonic_clock()
                 try:
                     snapshot = self._retry(
                         self.provider.get_market_snapshot,
@@ -445,7 +492,9 @@ class RealTimeScheduler:
                     )
                 except Exception as exc:
                     error = type(exc).__name__
+                elapsed = (self.monotonic_clock() - request_started) * 1000
                 with self._full_market_lock:
+                    self.full_market_request_ms = elapsed
                     self._pending_full_snapshot = snapshot
                     self._pending_full_error = error
 
@@ -465,9 +514,9 @@ class RealTimeScheduler:
             return snapshot, error
 
     def close(self) -> None:
-        thread = self._full_market_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=0.1)
+        for thread in (self._full_market_thread, self._minute_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=0.1)
         close_provider = getattr(self.provider, "close", None)
         if close_provider is not None:
             close_provider()

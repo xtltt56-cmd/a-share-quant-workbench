@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 import os
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -731,6 +731,7 @@ def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, obj
     fingerprint = _verified_research_manifest_digest(policy)
     session_completed = _completed_trading_session(now)
     data_refreshed = _fresh_daily_signal_available(policy, now)
+    settlement_fingerprint = _settlement_fingerprint(policy, now, fingerprint)
     outcome_cutoff = None
     contest_path = policy.authorize(".runtime/research/prospective-contest.json")
     if data_refreshed:
@@ -751,12 +752,11 @@ def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, obj
         try:
             policy.revalidate(contest_path)
             _verify_frozen_contest(_read_local_json(contest_path))
-            shanghai = now.astimezone(ZoneInfo("Asia/Shanghai"))
-            outcome_cutoff = (
-                datetime.combine(
-                    shanghai.date() + timedelta(days=1), time.min, tzinfo=shanghai.tzinfo
-                ).astimezone(timezone.utc)
-            )
+            calendar = AShareTradingCalendar()
+            signal_date = calendar.latest_completed_session(now)
+            outcome_cutoff = calendar.prediction_deadline(signal_date)
+            if now >= outcome_cutoff:
+                outcome_cutoff = None
         except (OSError, SystemExit, ValueError):
             outcome_cutoff = None
     return {
@@ -764,7 +764,35 @@ def _workbench_research_context(repo_root: Path, now: datetime) -> dict[str, obj
         "data_fingerprint": fingerprint,
         "data_refreshed": data_refreshed,
         "outcome_cutoff": outcome_cutoff,
+        "settlement_fingerprint": settlement_fingerprint,
     }
+
+
+def _settlement_fingerprint(
+    policy: ProjectStoragePolicy, now: datetime, manifest_digest: str | None
+) -> str | None:
+    """Queue due local evidence independently of the current prediction window."""
+    from a_share_quant.runtime.research_worker import due_predictions
+    from a_share_quant.storage.prospective_ledger_store import ProspectiveLedgerStore
+
+    try:
+        ledger = ProspectiveLedgerStore(policy=policy, recover_incomplete_tail=False)
+        due = due_predictions(ledger, now)
+        if not due:
+            return None
+        files = []
+        for symbol in sorted({item.symbol for item in due}):
+            path = policy.authorize(f"data/lake/daily_bars/{symbol}.parquet")
+            policy.revalidate(path)
+            try:
+                info = path.stat()
+                files.append((symbol, info.st_size, info.st_mtime_ns))
+            except FileNotFoundError:
+                files.append((symbol, None, None))
+        encoded = json.dumps([manifest_digest, [item.id for item in due], files]).encode()
+        return hashlib.sha256(encoded).hexdigest()
+    except (OSError, ValueError):
+        return None
 
 
 def _derived_model_registration(

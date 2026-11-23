@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
-from typing import Literal
+from importlib.resources import files
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,24 +25,31 @@ class AgentRuntimeConfig(BaseModel):
     daily_budget_usd: str = "0"
     task_budget_usd: str = "0"
     experiment_budget_cny: str = "0"
-    input_cny_per_million: Literal["2.00"] = "2.00"
-    output_cny_per_million: Literal["8.00"] = "8.00"
-    price_version_cny: Literal["deepseek-flash-2026-10-05-peak-cny"] = (
-        "deepseek-flash-2026-10-05-peak-cny"
-    )
+    approved_price_version: str | None = Field(default=None, max_length=80)
     max_model_requests: int = Field(default=3, ge=1, le=3)
     max_tool_calls: int = Field(default=6, ge=1, le=6)
     deadline_seconds: int = Field(default=90, ge=5, le=90)
     max_context_bytes: int = Field(default=16384, ge=4096, le=32768)
     max_output_tokens: int = Field(default=512, ge=128, le=2048)
     local_context_tokens: int = Field(default=4096, ge=4096, le=8192)
-    # Conservative peak, uncached USD rates checked against official docs.
-    # Only this model is supported; a new model requires reviewed price bounds.
-    price_version: Literal["deepseek-flash-2026-10-05-peak-usd"] = (
-        "deepseek-flash-2026-10-05-peak-usd"
-    )
-    input_usd_per_million: Literal["0.30"] = "0.30"
-    output_usd_per_million: Literal["1.20"] = "1.20"
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_pricing(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        settings = value.copy()
+        legacy = {
+            "input_cny_per_million": "2.00",
+            "output_cny_per_million": "8.00",
+            "price_version_cny": "deepseek-flash-2026-10-05-peak-cny",
+            "input_usd_per_million": "0.30",
+            "output_usd_per_million": "1.20",
+            "price_version": "deepseek-flash-2026-10-05-peak-usd",
+        }
+        for key, expected in legacy.items():
+            if key in settings and settings.pop(key) != expected:
+                raise ValueError("旧版计价设置无法核验")
+        return settings
 
     @field_validator("local_model")
     @classmethod
@@ -84,6 +93,40 @@ class AgentRuntimeConfig(BaseModel):
         if self.enabled and self.backend == "CLOUD" and self.generation_authorized and trial <= 0:
             raise ValueError("开始本次实验前须设置有效的累计人民币限额")
         return self
+
+
+class CloudPricing(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    version: str = Field(min_length=1, max_length=80)
+    model: Literal["deepseek-flash"]
+    reviewed_on: date
+    valid_through: date
+    usd_source: Literal["https://api-docs.deepseek.com/quick_start/pricing/"]
+    cny_source: Literal["https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"]
+    input_usd_per_million: Decimal = Field(gt=0, allow_inf_nan=False)
+    output_usd_per_million: Decimal = Field(gt=0, allow_inf_nan=False)
+    input_cny_per_million: Decimal = Field(gt=0, allow_inf_nan=False)
+    output_cny_per_million: Decimal = Field(gt=0, allow_inf_nan=False)
+
+    def valid_on(self, day: date) -> bool:
+        return self.reviewed_on <= day <= self.valid_through
+
+    def cost(self, input_tokens: int, output_tokens: int) -> tuple[Decimal, Decimal]:
+        return (
+            (input_tokens * self.input_usd_per_million
+             + output_tokens * self.output_usd_per_million) / 1_000_000,
+            (input_tokens * self.input_cny_per_million
+             + output_tokens * self.output_cny_per_million) / 1_000_000,
+        )
+
+
+def load_cloud_pricing() -> CloudPricing | None:
+    try:
+        raw = files(__package__).joinpath("cloud_pricing.json").read_bytes()
+        snapshot = CloudPricing.model_validate_json(raw)
+        return snapshot if snapshot.reviewed_on <= snapshot.valid_through else None
+    except (OSError, ValueError):
+        return None
 
 
 QUESTIONS = {

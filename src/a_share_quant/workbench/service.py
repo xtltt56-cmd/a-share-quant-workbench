@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from a_share_quant.advisory.price_contracts import GuidanceState, PriceGuidancePlan
 from a_share_quant.advisory.price_overlay import PriceGuidanceOverlay
@@ -374,8 +375,16 @@ class WorkbenchService:
         now = self.clock()
         expected = None
         calendar_error = None
+        calendar_metadata: dict[str, object] = {
+            "lookahead_sessions": 0, "coverage_warning": True,
+        }
         try:
-            expected = AShareTradingCalendar().latest_completed_session(now).isoformat()
+            calendar = AShareTradingCalendar()
+            calendar_metadata = {
+                **calendar.metadata(),
+                **calendar.coverage(now.astimezone(ZoneInfo("Asia/Shanghai")).date()),
+            }
+            expected = calendar.latest_completed_session(now).isoformat()
         except CalendarUnavailableError:
             calendar_error = "CALENDAR_UNAVAILABLE"
         latest = state.get("latest_quote_at")
@@ -385,6 +394,10 @@ class WorkbenchService:
             and state["schema_pass"] and state["continuous_updates"]
             and age is not None and 0 <= age <= self.live_quality_gate.stale_after_seconds
         )
+        priority = tuple(self._priority_symbols)
+        fresh_priority = sum(
+            self.validated_quote(symbol) is not None for symbol in priority
+        ) if self.allow_network and state["evidence_mode"] == "REAL_MARKET" else 0
         refresh = {"status": "NOT_ENABLED", "notice_zh": "当前未启用日线后台网络刷新。"}
         if self._eod_status_provider is not None:
             refresh = self._eod_status_provider()
@@ -403,7 +416,7 @@ class WorkbenchService:
             "mode": "MANUAL_ASSISTANCE", "process_ready": True,
             "status": "OK" if core_ready else "NEEDS_ATTENTION",
             "paper_only": True, "live_trading_enabled": False,
-            "calendar": AShareTradingCalendar().metadata(),
+            "calendar": calendar_metadata,
             "stages": {
                 "realtime": {
                     "status": "GOOD" if realtime_ready else (
@@ -412,6 +425,11 @@ class WorkbenchService:
                     "ready": realtime_ready, "source": state["active_source"],
                     "quote_timestamp": latest, "data_age_seconds": age,
                     "session": state["session"], "error_code": state["last_error"],
+                    "priority_required": len(priority), "priority_fresh": fresh_priority,
+                    "priority_request_ms": getattr(self.scheduler, "priority_request_ms", None),
+                    "full_market_request_ms": getattr(
+                        self.scheduler, "full_market_request_ms", None
+                    ),
                 },
                 "daily": {
                     "status": daily_status,

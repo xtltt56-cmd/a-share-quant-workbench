@@ -26,7 +26,7 @@ class PublicRiskCoordinator:
         symbols: Iterable[str] | SymbolSupplier,
         publish: SnapshotPublisher,
         provider: CNInfoAnnouncementProvider | None = None,
-        interval_seconds: float = 6 * 60 * 60,
+        interval_seconds: float = (6 * 60 - 5) * 60,
         window_days: int = 30,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -44,6 +44,7 @@ class PublicRiskCoordinator:
         self.interval_seconds = float(interval_seconds)
         self.window_days = window_days
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._retry_needed = False
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -86,6 +87,7 @@ class PublicRiskCoordinator:
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("public risk clock must be timezone-aware")
+        self._retry_needed = False
         try:
             symbols = self.symbols
             if not symbols:
@@ -100,20 +102,28 @@ class PublicRiskCoordinator:
             snapshot = self.store.latest()
             assert snapshot is not None
         except (OSError, TimeoutError, RuntimeError, TypeError, ValueError):
+            self._retry_needed = True
             cached = self.store.latest()
             notice = (
                 "巨潮公告检查失败，继续保留上次成功快照；未成功检查的股票不得视为无风险。"
             )
             self.publish(cached, "UPDATE_FAILED", notice)
             return cached
+        self._retry_needed = snapshot.status in {"PARTIAL", "UPDATE_FAILED"}
         self.publish(snapshot, snapshot.status, snapshot.notice_zh)
         return snapshot
 
     def _run(self) -> None:
+        failures = 0
         while not self._stop.is_set():
-            self.refresh_once()
-            self._wake.wait(self.interval_seconds)
             self._wake.clear()
+            self.refresh_once()
+            failures = failures + 1 if self._retry_needed else 0
+            delay = self.interval_seconds
+            if 0 < failures <= 3:
+                delay = min(delay, (60, 120, 240)[failures - 1])
+            if not self._wake.wait(delay) and failures > 3:
+                failures = 0
 
 
 __all__ = ["PublicRiskCoordinator"]
