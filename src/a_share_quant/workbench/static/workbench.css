@@ -217,3 +217,15 @@ table{font-size:14px}th,.stat-label,.stat small,.badge,.stock-button small,.pane
  .monitor-cards .badge{font-size:12px}.monitor-cards button{margin-top:10px}
  td{flex-wrap:wrap}td .cell-note{flex-basis:100%;text-align:right;max-width:none}
 }
+#open-security-search{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+#open-security-search svg{width:15px;height:15px}
+#security-search-dialog{width:min(540px,calc(100vw - 28px));max-height:82vh;padding:20px}
+#security-search-dialog .search{display:flex;margin-top:14px}
+#security-search-dialog .toolbar{justify-content:space-between;gap:8px;padding:6px 0}
+#security-search-status{margin:0}
+.security-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
+.security-row .stock-button{text-align:left;min-width:0}
+.security-row .security-action{flex-shrink:0}
+@media(max-width:420px){#open-security-search{padding:5px 8px}}
+.watchlist-quote{text-align:right;margin-left:auto;min-width:0}
+.watchlist-quote small{display:block}

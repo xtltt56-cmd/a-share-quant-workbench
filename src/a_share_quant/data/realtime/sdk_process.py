@@ -16,6 +16,12 @@ from a_share_quant.contracts.data import ProviderRequestError
 
 ALLOWED_ENDPOINTS = frozenset(
     {
+        "stock_zh_a_hist_tx",
+        "stock_zh_a_hist",
+        "stock_zh_a_daily",
+        "stock_info_sh_name_code",
+        "stock_info_sz_name_code",
+        "stock_info_bj_name_code",
         "stock_zh_a_spot_em",
         "stock_zh_a_spot",
         "stock_zh_a_spot_sina",

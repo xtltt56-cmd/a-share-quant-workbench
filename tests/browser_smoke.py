@@ -50,6 +50,32 @@ def test_workbench_renders_data_and_failure_states():
             page.route("**/api/agent/status", lambda route: route.fulfill(json=agent))
 
             page.goto(base)
+            security = {"symbol": "600519", "exchange": "SSE", "name": "贵州茅台"}
+            page.route("**/api/securities/search?*", lambda route: route.fulfill(json={
+                "rows": [security], "matches": 1, "updated_at": "2026-11-23T10:00:00+08:00",
+                "allow_network": False,
+            }))
+            page.route("**/api/watchlist", lambda route: route.fulfill(json={
+                "rows": [dict(security, verified=True, saved_exchange="SSE",
+                              quote_status="NO_QUOTE")]
+                if route.request.method == "POST" else [],
+            }))
+            page.route("**/api/stocks/history?*", lambda route: route.fulfill(json={
+                "bars": [], "notice_zh": "尚无本地日线",
+            }))
+            page.locator("#open-security-search").click()
+            page.locator("#security-query").fill("600519")
+            page.locator("#security-results [data-add-symbol]").click()
+            expect(page.locator("#security-results [data-add-symbol]")).to_be_disabled()
+            page.locator("#close-security-search").click()
+            page.get_by_role("link", name="我的自选", exact=True).click()
+            page.locator("#watchlist-items [data-stock]").click()
+            expect(page.locator("#stock-title")).to_contain_text("贵州茅台")
+            page.locator("#close-stock").click()
+            page.get_by_role("link", name="我的持仓", exact=True).click()
+            page.locator("#code").fill("000001")
+            expect(page.locator("#name")).to_have_value("")
+
             page.get_by_role("link", name="日选研究", exact=True).click()
             expect(page.locator("#daily-description")).to_contain_text("本机日线池 2 只")
             page.get_by_role("link", name="模型观察", exact=True).click()

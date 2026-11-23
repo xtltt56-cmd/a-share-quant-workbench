@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="按股票代码或简称搜索沪深北 A 股，在浏览器里保存自选。">
+  <title>A 股自选</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./workbench.css">
+  <link rel="stylesheet" href="./online.css">
+  <script src="./watchlist.js" defer></script>
+</head>
+<body>
+  <main class="online-watchlist">
+    <header>
+      <h1>A 股自选</h1>
+      <p class="muted">搜索沪深北 A 股，收藏保存在当前浏览器。</p>
+    </header>
+    <div class="online-columns">
+      <section class="panel" aria-labelledby="search-heading">
+        <div class="panel-heading"><h2 id="search-heading">搜索股票</h2></div>
+        <label class="search">
+          <input id="security-query" type="search" maxlength="80" placeholder="输入股票代码或简称" aria-label="股票代码或简称">
+        </label>
+        <p id="catalog-status" class="muted" role="status">正在读取证券名录…</p>
+        <div id="security-results"></div>
+      </section>
+      <section class="panel" aria-labelledby="watchlist-heading">
+        <div class="panel-heading"><h2 id="watchlist-heading">我的自选</h2><span id="watchlist-count" class="muted"></span></div>
+        <p id="watchlist-status" role="status"></p>
+        <div id="watchlist-items"></div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

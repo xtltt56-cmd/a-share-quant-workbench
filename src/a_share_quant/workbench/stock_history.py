@@ -7,14 +7,22 @@ import pandas as pd
 
 from a_share_quant.config import Settings
 
+HISTORY_LIMITS = frozenset({"60", "120", "252", "600"})
+
 
 def load_history(symbol: str, limit: str = "120", *, data_root: Path | None = None) -> dict:
-    if not re.fullmatch(r"[0-9]{6}", symbol) or limit not in {"60", "120", "252", "600"}:
+    if not re.fullmatch(r"[0-9]{6}", symbol) or limit not in HISTORY_LIMITS:
         raise ValueError("invalid symbol or range")
     root = ((data_root or Settings.load().data_dir) / "lake" / "daily_bars").resolve()
     path = root / f"{symbol}.parquet"
     if path.is_symlink() or path.resolve().parent != root:
         raise ValueError("invalid local file")
+    return read_history_file(path, symbol, limit)
+
+
+def read_history_file(path: Path, symbol: str, limit: str) -> dict:
+    if limit not in HISTORY_LIMITS or path.is_symlink():
+        raise ValueError("invalid range or history file")
     if not path.exists():
         return {"symbol": symbol, "bars": [], "notice_zh": "尚未收集该股票的本地日线"}
     frame = pd.read_parquet(path)
@@ -34,6 +42,7 @@ def load_history(symbol: str, limit: str = "120", *, data_root: Path | None = No
         "symbol": symbol,
         "bars": rows,
         "source": str(frame.source.iloc[-1]) if len(frame) else "",
+        "end_date": rows[-1]["date"] if rows else "",
         "notice_zh": "本地历史日线；价格口径以数据版本为准，非实时分时行情",
         "data_version": (
             str(frame.data_version.iloc[-1]) if len(frame) and "data_version" in frame else "未知"
