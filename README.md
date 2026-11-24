@@ -111,8 +111,7 @@ provider is present.
       tracking, and an ordered EOD finalization/PIT boundary.
 - [x] Stage 3RT-D adds the loopback-only Dashboard/API, paper-only service,
       CLI, bounded Windows launcher/stop scripts, and Desktop shortcut creator.
-      The verified local shortcut is
-      `C:\Users\lenovo\Desktop\A股量化交易系统.lnk` and is not committed.
+      The Desktop shortcut is named `股票量化研究工作台.lnk` and is created locally.
 - [x] Stage 3RT acceptance report is in
       [`reports/stage3_realtime_workbench_report.md`](reports/stage3_realtime_workbench_report.md).
       The current provider smoke remains proxy-blocked; this is explicitly
