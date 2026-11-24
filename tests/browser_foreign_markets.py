@@ -9,7 +9,9 @@ from playwright.sync_api import expect, sync_playwright
 
 from a_share_quant.market.foreign_sessions import market_session
 from a_share_quant.workbench.app import create_server
+from a_share_quant.workbench.foreign_catalog import legacy_listing_id
 from a_share_quant.workbench.foreign_markets import (
+    _CATALOG_BYTES,
     _SNAPSHOT_BYTES,
     MARKET_META,
     UNIVERSES,
@@ -49,6 +51,21 @@ def test_market_switch_keeps_research_and_ledgers_isolated(tmp_path):
         service._save(market, "daily", snapshot, _SNAPSHOT_BYTES)
         assert service.state(market)["fresh"], f"{market} snapshot is stale"
 
+    hk_listings = {
+        symbol: dict(row, currency="HKD", listing_id=legacy_listing_id("HK", symbol),
+                     keys=[row["name"].casefold()])
+        for symbol, row in UNIVERSES["HK"].items()
+    }
+    hk_listings["01093"] = {
+        "symbol": "01093", "name": "石藥集團", "exchange": "XHKG", "currency": "HKD",
+        "listing_id": "test-outside-sample", "keys": ["石藥集團", "石药集团"],
+    }
+    service._save("HK", "catalog", {
+        "rows": hk_listings, "archived": {}, "updated_at": now.isoformat(),
+        "as_of": service.state("HK")["as_of"],
+    }, _CATALOG_BYTES)
+    service.catalogs.pop("HK", None)
+
     server = create_server(port=0, foreign_markets=service)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -77,6 +94,12 @@ def test_market_switch_keeps_research_and_ledgers_isolated(tmp_path):
             expect(page.locator("#foreign-stock-note")).to_contain_text(f"每手 {board_lot} 股")
             page.locator("#close-foreign-stock").click()
 
+            page.locator("#open-security-search").click()
+            page.locator("#security-query").fill("石药集团")
+            page.locator('#security-results [data-foreign-add="01093"]').click()
+            expect(page.locator("#security-results")).to_contain_text("已添加")
+            page.locator("#close-security-search").click()
+
             us = context.new_page()
             us.goto(base + "/?market=US#watchlist")
             expect(us.locator("#foreign-view")).to_contain_text("暂无美股自选")
@@ -87,6 +110,7 @@ def test_market_switch_keeps_research_and_ledgers_isolated(tmp_path):
 
             page.locator('[data-page="watchlist"]').click()
             expect(page.locator('#foreign-view [data-foreign-remove="00700"]')).to_be_visible()
+            expect(page.locator('#foreign-view [data-foreign-remove="01093"]')).to_be_visible()
             page.locator('[data-page="holdings"]').click()
             form = page.locator("#foreign-ledger")
             expect(form.locator('[name="date"]')).not_to_have_value("")

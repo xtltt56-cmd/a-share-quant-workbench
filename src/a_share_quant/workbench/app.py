@@ -217,7 +217,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif path in {
             "/api/foreign/state", "/api/foreign/security", "/api/foreign/quotes",
-            "/api/foreign/account",
+            "/api/foreign/account", "/api/foreign/search",
         }:
             self._foreign_request(path)
         elif path in {"/api/securities/search", "/api/watchlist", "/api/stocks/history/status"}:
@@ -306,6 +306,7 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         if path in {
             "/api/foreign/refresh", "/api/foreign/favorite",
             "/api/foreign/ledger-preview", "/api/foreign/ledger-record",
+            "/api/foreign/catalog-refresh", "/api/foreign/history-refresh",
         }:
             self._foreign_request(path)
             return
@@ -394,8 +395,12 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
                 result = service.quotes(market)
             elif path == "/api/foreign/account":
                 result = service.account(market)
+            elif path == "/api/foreign/search":
+                result = service.search(market, query.get("q", [""])[0])
             elif path == "/api/foreign/security":
-                result = service.security(market, query.get("symbol", [""])[0])
+                result = service.security(
+                    market, query.get("symbol", [""])[0], query.get("listing_id", [""])[0],
+                )
             else:
                 size = int(self.headers.get("Content-Length", "0"))
                 if not 1 <= size <= 1024:
@@ -406,14 +411,23 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
                 if path == "/api/foreign/refresh" and body == {}:
                     service.refresh(market)
                     result = {"accepted": True}
+                elif path == "/api/foreign/catalog-refresh" and body == {}:
+                    service.refresh_catalog(market, force=True)
+                    result = {"accepted": True}
+                elif (
+                    path == "/api/foreign/history-refresh" and isinstance(body, dict)
+                    and set(body) == {"symbol", "listing_id"}
+                    and all(isinstance(value, str) for value in body.values())
+                ):
+                    result = service.security(market, body["symbol"], body["listing_id"], force=True)
                 elif path in {"/api/foreign/ledger-preview", "/api/foreign/ledger-record"}:
                     result = service.record(market, body, commit=path.endswith("-record"))
                 elif (
                     path == "/api/foreign/favorite" and isinstance(body, dict)
-                    and set(body) == {"symbol", "action"}
+                    and set(body) in ({"symbol", "action"}, {"symbol", "action", "listing_id"})
                     and all(isinstance(value, str) for value in body.values())
                 ):
-                    service.favorite(market, body["symbol"], body["action"])
+                    service.favorite(market, body["symbol"], body["action"], body.get("listing_id", ""))
                     result = service.state(market)
                 else:
                     raise ValueError("市场操作无效")

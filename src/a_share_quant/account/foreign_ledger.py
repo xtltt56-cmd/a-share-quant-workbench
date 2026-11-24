@@ -42,7 +42,7 @@ def prepare_event(market: str, data: dict, pool: dict, now: datetime) -> dict:
             raise ValueError("入金金额必须大于零")
         return {**event, "amount": str(amount)}
     if action not in {"buy", "sell"} or data["symbol"] not in pool:
-        raise ValueError("仅可登记当前市场研究样本内的买入或卖出")
+        raise ValueError("请选择当前市场名录中与账本币种一致的股票")
     if not re.fullmatch(r"[1-9][0-9]{0,8}", data["quantity"]):
         raise ValueError("股数须为正整数")
     quantity = int(data["quantity"])
@@ -70,6 +70,7 @@ def account_snapshot(events: list[dict], today: str) -> dict:
     cash, realized = _ZERO, _ZERO
     unsettled: list[tuple[str, Decimal]] = []
     positions: dict[str, tuple[int, Decimal]] = {}
+    symbols: dict[str, str] = {}
     previous = ""
     for event in events:
         day = event["date"]
@@ -82,30 +83,33 @@ def account_snapshot(events: list[dict], today: str) -> dict:
             cash += Decimal(event["amount"])
             continue
         symbol, quantity = event["symbol"], event["quantity"]
-        shares, cost = positions.get(symbol, (0, _ZERO))
+        listing_id = event.get("listing_id", symbol)
+        symbols[listing_id] = symbol
+        shares, cost = positions.get(listing_id, (0, _ZERO))
         notional, fee = Decimal(event["notional"]), Decimal(event["fee"])
         if event["action"] == "buy":
             total = notional + fee
             if total > cash:
                 raise ValueError("买入金额和费用超过当日已结算可用资金")
             cash -= total
-            positions[symbol] = (shares + quantity, cost + total)
+            positions[listing_id] = (shares + quantity, cost + total)
         else:
             if quantity > shares:
                 raise ValueError("卖出股数超过账本可用持仓")
             released = cost if quantity == shares else money(cost * quantity / shares)
             proceeds = notional - fee
             realized += proceeds - released
-            positions[symbol] = (shares - quantity, cost - released)
+            positions[listing_id] = (shares - quantity, cost - released)
             unsettled.append((event["settles_on"], proceeds))
     cash += sum(amount for settled, amount in unsettled if settled <= today)
     pending = sum((amount for settled, amount in unsettled if settled > today), _ZERO)
     return {
         "cash": str(cash), "pending": str(pending), "realized": str(realized),
         "positions": [
-            {"symbol": symbol, "quantity": shares, "available": shares,
+            {"symbol": symbols[listing_id], "listing_id": listing_id,
+             "quantity": shares, "available": shares,
              "cost": str(cost), "average": str(price(cost / shares))}
-            for symbol, (shares, cost) in sorted(positions.items()) if shares
+            for listing_id, (shares, cost) in sorted(positions.items()) if shares
         ],
     }
 

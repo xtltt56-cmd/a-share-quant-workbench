@@ -8,23 +8,31 @@
   const detail = $("foreign-stock-dialog");
   const detailNote = $("foreign-stock-note");
   const favoriteButton = $("foreign-stock-favorite");
+  const stockRefresh = $("foreign-stock-refresh");
+  const catalogRefresh = $("refresh-security-catalog");
   const refreshButton = $("refresh");
+  refreshButton.lastChild.textContent = "刷新日选";
   const marketName = $("market-switch").selectedOptions[0].textContent.slice(0, -2);
   let data, page, current, foreignChart, loading = false;
   let detailVersion = 0;
   let mutationVersion = 0;
   let quotes, loadingQuotes = false;
   let account, preview;
+  let searchVersion = 0, searchTimer, searchData, chooseLedgerStock = false;
+  let detailTimer, detailData, chartBars;
 
-  function endpoint(action, symbol) {
+  function endpoint(action, symbol, listingId) {
     const query = new URLSearchParams({market:selectedMarket});
     if (symbol) query.set("symbol", symbol);
+    if (listingId) query.set("listing_id", listingId);
     return "/api/foreign/" + action + "?" + query;
   }
 
   function stock(x) {
-    return '<button class="stock-button" data-foreign-symbol="' + esc(x.symbol) + '">'
-      + esc(x.name) + '<small>' + esc(x.symbol + " · " + x.exchange) + '</small></button>';
+    return '<button class="stock-button" data-foreign-symbol="' + esc(x.symbol)
+      + '" data-listing-id="' + esc(x.listing_id || "") + '">'
+      + esc(x.name) + '<small>' + esc([x.symbol, x.exchange, x.currency,
+        x.active === false ? "已移出名录" : ""].filter(Boolean).join(" · ")) + '</small></button>';
   }
 
   function panel(title, content, subtitle = "") {
@@ -33,8 +41,8 @@
       + content + '</article>';
   }
 
-  function price(value) {
-    return present(value) ? number(value, data.market === "HK" ? 3 : 2) + " " + data.currency : "—";
+  function price(value, currency = data?.currency) {
+    return present(value) ? number(value, selectedMarket === "HK" ? 3 : 2) + " " + currency : "—";
   }
 
   function quoteTime(timestamp) {
@@ -99,12 +107,13 @@
     } else if (page === "watchlist" || page === "monitor") {
       const monitor = page === "monitor";
       const rows = data.favorites.map(x => {
-        const quote = quotes?.quotes[x.symbol];
+        const quote = x.active ? quotes?.quotes[x.symbol] : undefined;
         return [
-        stock(x), esc(price(x.bar?.close)), esc(x.bar?.date || "暂无"),
-        ...(monitor ? [quote ? esc(price(quote.price)) : "—", quote
+        stock(x), esc(price(x.bar?.close, x.currency)), esc(x.bar?.date || "暂无"),
+        ...(monitor ? [quote ? esc(price(quote.price, x.currency)) : "—", quote
           ? esc(quoteTime(quote.timestamp) + (quote.fresh ? "" : " · 已过期")) : "暂无"] : []),
-        '<button type="button" data-foreign-remove="' + esc(x.symbol) + '">移除</button>',
+        '<button type="button" data-foreign-remove="' + esc(x.symbol)
+          + '" data-listing-id="' + esc(x.listing_id) + '">移除</button>',
         ];
       });
       const headers = ["股票", "最近收盘", "交易日",
@@ -135,7 +144,7 @@
       };
       view.innerHTML = panel(pageInfo[page][0], empty(messages[page]));
     }
-    if (search.open) searchResults();
+    if (search.open) renderSearch();
     if (detail.open) updateFavorite();
   }
 
@@ -189,8 +198,9 @@
               <label>当地日期<input name="date" type="date" required></label>
               <label data-deposit>入金金额（${esc(data.currency)}）<input name="amount" inputmode="decimal"></label>
               <label data-fill hidden>股票<select name="symbol">
-                ${data.pool.map(x => '<option value="' + esc(x.symbol) + '">' + esc(x.symbol + " " + x.name) + '</option>').join("")}
-              </select></label>
+                ${data.pool.map(x => '<option value="' + esc(x.symbol) + '" data-listing-id="'
+                  + esc(x.listing_id) + '">' + esc(x.symbol + " " + x.name) + '</option>').join("")}
+              </select><button type="button" data-foreign-ledger-search>从名录挑选</button></label>
               <label data-fill hidden>股数<input name="quantity" inputmode="numeric"></label>
               <label data-fill hidden>成交单价（${esc(data.currency)}）<input name="price" inputmode="decimal"></label>
               <label data-fill hidden>实付总费用（${esc(data.currency)}）<input name="fee" inputmode="decimal" value="0"></label>
@@ -215,6 +225,9 @@
           clearPreview();
           const fields = Object.fromEntries(new FormData(form));
           const body = {id:crypto.randomUUID(), ...fields};
+          if (fields.action !== "deposit") {
+            body.listing_id = form.elements.symbol.selectedOptions[0]?.dataset.listingId || "";
+          }
           const result = await api(endpoint("ledger-preview"), body, "foreign-markets");
           if (!form.isConnected
               || JSON.stringify(fields) !== JSON.stringify(Object.fromEntries(new FormData(form)))) return;
@@ -292,46 +305,81 @@
     }
   }
 
-  function searchResults() {
-    const query = searchInput.value.trim().toUpperCase();
-    const candidates = (data?.pool || []).filter(x =>
-      x.symbol.includes(query) || x.name.toUpperCase().includes(query)
-      || x.symbol === query.replace("-", "."));
-    $("security-search-status").textContent = "当前市场 " + marketName + " · " + candidates.length + " 只";
-    $("security-results").innerHTML = candidates.length
-      ? table(["股票", "自选"], candidates.map(x => [stock(x),
-          data.favorites.some(item => item.symbol === x.symbol) ? "已添加"
-          : '<button data-foreign-add="' + esc(x.symbol) + '">添加</button>']))
-      : empty("当前研究样本中没有匹配股票");
+  function renderSearch() {
+    if (!searchData) return;
+    const {rows, matches, size, running, as_of:asOf, complete_catalog:complete, error} = searchData;
+    catalogRefresh.hidden = !searchData.network;
+    catalogRefresh.disabled = running;
+    const scope = complete ? "名录 " + size + " 只 · " + asOf : "暂可查询研究样本";
+    $("security-search-status").textContent = [scope,
+      searchInput.value.trim() ? "匹配 " + matches + " 只" + (matches > 30 ? " · 显示前 30 条" : "") : "",
+      running ? "正在更新名录" : error].filter(Boolean).join(" · ");
+    $("security-results").innerHTML = rows.length
+      ? table(["股票", chooseLedgerStock ? "登记" : "自选"], rows.map(x => {
+        const id = ' data-listing-id="' + esc(x.listing_id) + '"';
+        if (chooseLedgerStock) return [esc(x.symbol + " · " + x.name + " · " + x.currency),
+          x.currency === data.currency
+            ? '<button type="button" data-ledger-symbol="' + esc(x.symbol) + '"' + id + '>选择</button>'
+            : "币种与账本不同"];
+        return [stock(x), data?.favorites.some(item => item.listing_id === x.listing_id) ? "已添加"
+          : '<button type="button" data-foreign-add="' + esc(x.symbol) + '"' + id + '>添加</button>'];
+      }))
+      : empty(searchInput.value.trim() ? (running ? "正在获取上市名录" : "未找到匹配股票")
+                                        : "输入股票代码或名称");
   }
 
-  function openSearch() {
+  function searchResults(delay = 150) {
+    const query = searchInput.value.trim();
+    const version = ++searchVersion;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      try {
+        const result = await api(endpoint("search") + "&q=" + encodeURIComponent(query));
+        if (!search.open || version !== searchVersion) return;
+        searchData = result;
+        renderSearch();
+        if (result.running) searchTimer = setTimeout(() => searchResults(0), 800);
+      } catch (error) {
+        if (version === searchVersion) $("security-search-status").textContent = error.message;
+      }
+    }, delay);
+  }
+
+  function openSearch(forLedger = false) {
+    chooseLedgerStock = forLedger;
     $("security-search-title").textContent = "搜索" + marketName;
     searchInput.value = "";
-    searchResults();
+    searchData = undefined;
+    $("security-search-status").textContent = "正在读取证券名录";
+    $("security-results").innerHTML = "";
     search.showModal();
     searchInput.focus();
+    searchResults(0);
   }
 
   function updateFavorite() {
-    const added = data?.favorites.some(x => x.symbol === current);
+    const added = data?.favorites.some(x => x.listing_id === current?.listingId);
     favoriteButton.textContent = added ? "★ 移除自选" : "☆ 加入自选";
     favoriteButton.dataset.foreignAction = added ? "remove" : "add";
+    favoriteButton.disabled = !detailData || (!detailData.active && !added);
   }
 
-  function drawChart(rows) {
-    if (!rows.length || !window.echarts) return;
-    const bars = rows.slice(-120);
-    foreignChart = window.echarts.init($("foreign-stock-chart"));
+  function drawChart(bars) {
+    if (!bars.length || !window.echarts) return;
+    foreignChart ||= window.echarts.init($("foreign-stock-chart"));
     const days = bars.map(bar => bar.date);
     foreignChart.setOption({
       animation:false,
       tooltip:{trigger:"axis", confine:true},
-      grid:[{left:70, right:18, top:16, height:"59%"}, {left:70, right:18, top:"72%", height:"14%"}],
+      grid:[{left:70, right:18, top:16, height:"53%"}, {left:70, right:18, top:"66%", height:"13%"}],
       xAxis:[{type:"category", data:days, axisLabel:{show:false}},
         {type:"category", gridIndex:1, data:days, axisLabel:{color:"#9aaac0"}}],
       yAxis:[{scale:true, axisLabel:{color:"#9aaac0"}}, {gridIndex:1, axisLabel:{show:false}}],
-      dataZoom:[{type:"inside", xAxisIndex:[0, 1]}],
+      dataZoom:[
+        {type:"inside", xAxisIndex:[0, 1]},
+        {type:"slider", xAxisIndex:[0, 1], height:18, bottom:6,
+          startValue:days[Math.max(0, days.length - 120)], end:100},
+      ],
       series:[
         {name:"不复权日 K 线", type:"candlestick", data:bars.map(x => [x.open, x.close, x.low, x.high])},
         {name:"成交量", type:"bar", xAxisIndex:1, yAxisIndex:1, data:bars.map(x => x.volume)},
@@ -339,34 +387,64 @@
     });
   }
 
-  async function openStock(symbol) {
+  function openStock(symbol, listingId) {
     if (search.open) search.close();
-    current = symbol;
-    const version = ++detailVersion;
+    current = {symbol, listingId};
+    detailData = undefined;
+    chartBars = undefined;
+    detailVersion++;
     $("foreign-stock-title").textContent = symbol;
+    $("foreign-stock-meta").textContent = "";
     detailNote.textContent = "读取日线中…";
+    stockRefresh.hidden = true;
     updateFavorite();
     detail.showModal();
+    loadStock();
+  }
+
+  async function loadStock(force = false) {
+    const version = ++detailVersion;
+    clearTimeout(detailTimer);
     try {
-      const quote = await api(endpoint("security", symbol));
-      if (version !== detailVersion) return;
+      const {symbol, listingId} = current;
+      const quote = force
+        ? await api(endpoint("history-refresh"), {symbol, listing_id:listingId || ""}, "foreign-markets")
+        : await api(endpoint("security", symbol, listingId));
+      if (version !== detailVersion || !detail.open) return;
+      current.listingId = quote.listing_id;
+      detailData = quote;
       $("foreign-stock-title").textContent = quote.name + " · " + quote.symbol;
+      $("foreign-stock-meta").textContent = [quote.exchange, quote.currency,
+        quote.research_sample ? "日选研究样本" : "未纳入日选样本"].join(" · ");
       const last = quote.bars.at(-1);
-      detailNote.textContent = quote.source + " · " + (last
-        ? "不复权价格 · " + last.date + " · 收盘 " + price(last.close)
-        : "暂无日线，请先刷新本市场数据");
+      const priceInfo = last ? quote.source + " · 截至 " + last.date + " · 收盘 "
+        + price(last.close, quote.currency) + " · " + quote.bars.length + " 根日线" : "";
+      const stale = last && last.date < quote.expected ? "缓存日期早于最近交易日 " + quote.expected : "";
+      detailNote.textContent = [priceInfo, stale, quote.notice].filter(Boolean).join(" · ");
       if (quote.board_lot_as_of && quote.board_lot) {
         detailNote.textContent += " · 每手 " + quote.board_lot + " 股（港交所 " + quote.board_lot_as_of + "）";
       }
-      drawChart(quote.bars);
+      updateFavorite();
+      stockRefresh.hidden = !quote.active || quote.status === "offline";
+      stockRefresh.disabled = quote.status === "loading";
+      const nextBars = JSON.stringify(quote.bars);
+      if (nextBars !== chartBars) {
+        drawChart(quote.bars);
+        chartBars = nextBars;
+      }
+      if (quote.status === "loading") detailTimer = setTimeout(loadStock, 700);
     } catch (error) {
-      if (version === detailVersion) detailNote.textContent = error.message;
+      if (version === detailVersion) {
+        detailNote.textContent = error.message;
+        stockRefresh.disabled = false;
+      }
     }
   }
 
-  async function changeFavorite(symbol, operation) {
+  async function changeFavorite(symbol, operation, listingId) {
     mutationVersion++;
-    data = await api(endpoint("favorite"), {symbol, action:operation}, "foreign-markets");
+    data = await api(endpoint("favorite"),
+      {symbol, action:operation, listing_id:listingId || ""}, "foreign-markets");
     mutationVersion++;
     render(page);
     if (page === "monitor") loadQuotes();
@@ -374,28 +452,60 @@
 
   document.querySelector('.sidebar-bottom a').hidden = true;
   window.renderForeignMarket = render;
-  $("open-security-search").onclick = openSearch;
+  $("open-security-search").onclick = () => openSearch();
   $("close-security-search").onclick = () => search.close();
   $("close-foreign-stock").onclick = () => detail.close();
-  searchInput.oninput = searchResults;
+  searchInput.oninput = () => {
+    searchData = undefined;
+    $("security-results").innerHTML = "";
+    searchResults();
+  };
+  search.addEventListener("close", () => {
+    searchVersion++;
+    clearTimeout(searchTimer);
+  });
+  catalogRefresh.onclick = () => action(catalogRefresh, async () => {
+    await api(endpoint("catalog-refresh"), {}, "foreign-markets");
+    searchResults(0);
+  }, "security-search-status");
+  stockRefresh.onclick = () => loadStock(true);
   detail.addEventListener("close", () => {
     detailVersion++;
+    clearTimeout(detailTimer);
     foreignChart?.dispose();
     foreignChart = null;
   });
   window.addEventListener("resize", () => foreignChart?.resize());
   favoriteButton.onclick = () => action(favoriteButton,
-    () => changeFavorite(current, favoriteButton.dataset.foreignAction), "foreign-stock-note");
+    () => changeFavorite(current.symbol, favoriteButton.dataset.foreignAction, current.listingId),
+    "foreign-stock-note");
   document.addEventListener("click", event => {
     const button = event.target.closest(
-      "[data-foreign-search], [data-foreign-symbol], [data-foreign-add], [data-foreign-remove]"
+      "[data-foreign-search], [data-foreign-symbol], [data-foreign-add], [data-foreign-remove], "
+      + "[data-foreign-ledger-search], [data-ledger-symbol]"
     );
     if (!button) return;
     if (button.hasAttribute("data-foreign-search")) openSearch();
-    else if (button.dataset.foreignSymbol) openStock(button.dataset.foreignSymbol);
+    else if (button.hasAttribute("data-foreign-ledger-search")) openSearch(true);
+    else if (button.dataset.ledgerSymbol) {
+      const row = searchData.rows.find(item => item.listing_id === button.dataset.listingId);
+      const select = $("foreign-ledger")?.elements.symbol;
+      if (!row || !select) return;
+      const option = [...select.options].find(item => item.dataset.listingId === row.listing_id)
+        || select.appendChild(new Option(row.symbol + " " + row.name, row.symbol));
+      option.dataset.listingId = row.listing_id;
+      select.selectedIndex = option.index;
+      clearPreview();
+      search.close();
+    }
+    else if (button.dataset.foreignSymbol) {
+      openStock(button.dataset.foreignSymbol, button.dataset.listingId);
+    }
     else if (button.dataset.foreignAdd) action(button,
-      () => changeFavorite(button.dataset.foreignAdd, "add"), "security-search-status");
-    else action(button, () => changeFavorite(button.dataset.foreignRemove, "remove"), "alert");
+      () => changeFavorite(button.dataset.foreignAdd, "add", button.dataset.listingId),
+      "security-search-status");
+    else action(button,
+      () => changeFavorite(button.dataset.foreignRemove, "remove", button.dataset.listingId), "alert");
   });
   refreshButton.onclick = async () => {
     await action(refreshButton, async () => {

@@ -42,7 +42,7 @@ def test_ranking_requires_consecutive_sessions_and_uses_adjusted_prices():
 def test_market_endpoints_and_favorites_are_scoped(tmp_path, monkeypatch):
     monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
     monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
-    service = ForeignMarkets(tmp_path, allow_network=True)
+    service = ForeignMarkets(tmp_path, allow_network=False)
     server = create_server(port=0, foreign_markets=service)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a-share-quant"
-version = "0.2.7"
+version = "0.2.8"
 description = "Framework-first A-share quantitative research and paper-trading system"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "numpy>=1.26,<3",
     "pandas>=2.2,<3",
     "openpyxl>=3.1,<4",
+    "OpenCC>=1.4.2,<2",
     "xlrd>=2,<3",
     "pyarrow>=16,<24",
     "pydantic-settings>=2.4,<3",

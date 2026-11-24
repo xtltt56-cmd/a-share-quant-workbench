@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 from bisect import bisect_right
 from datetime import date, datetime, time, timedelta
 from io import BytesIO
@@ -21,6 +23,7 @@ ALPACA_SOURCE = "Alpaca SIP 历史日线"
 HKEX_SECURITIES = (
     "https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx"
 )
+_US_SINA_FACTOR = "https://finance.sina.com.cn/us_stock/company/reinstatement/{}_qfq.js"
 HTTP_TIMEOUT = (4, 8)
 
 
@@ -52,16 +55,13 @@ def _get(url: str, **kwargs) -> requests.Response:
 
 
 def sina_daily(symbol: str, start: date, end: date, *, market: str = "HK") -> list[dict]:
-    from akshare.stock.cons import hk_js_decode, us_sina_stock_hist_qfq_url, zh_js_decode
-    from py_mini_racer import MiniRacer
-
     if market == "HK":
         base = f"https://finance.sina.com.cn/stock/hkstock/{symbol}"
         encoded = _get(base + "/klc2_kl.js").text
-        factor_url, decoder_source = base + "/qfq.js", hk_js_decode
+        factor_url = base + "/qfq.js"
     else:
         encoded = _get(f"https://finance.sina.com.cn/staticdata/us/{symbol}").text
-        factor_url, decoder_source = us_sina_stock_hist_qfq_url.format(symbol), zh_js_decode
+        factor_url = _US_SINA_FACTOR.format(symbol)
     match = re.match(r'\s*var\s+[\w$]+\s*=\s*"([A-Za-z0-9+/=]+)"\s*;', encoded)
     if match is None:
         raise ForeignDataError("新浪日线返回格式异常")
@@ -73,12 +73,16 @@ def sina_daily(symbol: str, start: date, end: date, *, market: str = "HK") -> li
     if not changes:
         raise ForeignDataError("新浪日线缺少复权因子")
     dates = [row[0] for row in changes]
-    decoder = MiniRacer()
     try:
-        decoder.eval(decoder_source, timeout=3000)
-        decoded = decoder.call("d", match[1], timeout=3000)
-    finally:
-        decoder.close()
+        # Native V8 failures on Windows must not terminate the HTTP server.
+        response = subprocess.run(
+            [sys.executable, "-m", "a_share_quant.data.providers.sina_decode"],
+            input=json.dumps([market, match[1]]), capture_output=True, encoding="utf-8",
+            timeout=25, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        decoded = json.loads(response.stdout)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        raise ForeignDataError("新浪日线解码失败或超时，请稍后重试") from None
     bars = []
     for row in decoded:
         day = date.fromisoformat(row["date"][:10])
