@@ -57,3 +57,5 @@ jobs:
           .\.venv\Scripts\python.exe -m playwright install chromium
       - name: Check offline workbench in Chromium
         run: .\.venv\Scripts\python.exe tests/browser_smoke.py
+      - name: Check multi-market workbench in Chromium
+        run: .\.venv\Scripts\python.exe -m pytest -q tests/browser_foreign_markets.py

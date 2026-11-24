@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a-share-quant"
-version = "0.2.6"
+version = "0.2.7"
 description = "Framework-first A-share quantitative research and paper-trading system"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "akshare>=1.18,<2",
     "duckdb>=1.0,<2",
+    "exchange-calendars>=4.11.2,<5",
     "numpy>=1.26,<3",
     "pandas>=2.2,<3",
     "openpyxl>=3.1,<4",

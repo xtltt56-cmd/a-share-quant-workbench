@@ -23,6 +23,12 @@
 
 更新或回退前将 `.runtime/watchlist/favorites.json` 留作自选备份。源码中的独立在线页需用 `scripts/build_online_watchlist.py` 和本机有效证券名录构建，部署构建产物后才可在线使用，收藏保存在当前浏览器。
 
+## 港股和美股研究
+
+通过左上角市场选择器切换市场，进入「日选研究」刷新日线。当前海外市场覆盖预设研究样本。默认日线来自新浪财经，港股每手股数和适用印花税标记来自港交所公开名录。美股可选在本机 `.env` 配置 `APCA_API_KEY_ID` 和 `APCA_API_SECRET_KEY`，在对应数据权限下获取 Alpaca SIP 历史日线和 IEX 单交易所成交。
+
+自选与本地人工账本分市场保存。账本按当地交易日登记已完成的买卖和实付费用，支持本币入金、估算交收日和待结算卖出款。更新前可单独备份 `.runtime/foreign-markets/US/` 和 `.runtime/foreign-markets/HK/` 中的 `favorites.json` 与 `ledger.json`。建议以实际券商结单核对本地记录。
+
 ## AI 分析（可选）
 
 发布包已包含 Agent 所需的 SDK，但默认仍使用标准工作流，不自动下载本地模型或调用收费 API。

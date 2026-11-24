@@ -11,14 +11,22 @@
   <script src="/assets/workbench.js" defer></script>
   <script src="/assets/agent.js" defer></script>
   <script src="/assets/watchlist.js" defer></script>
+  <script src="/assets/foreign-markets.js" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main">跳到内容</a>
 <aside class="sidebar">
-  <a class="brand" href="/#overview" aria-label="量化工作台首页">
-    <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-    <span class="nav-text">量化工作台<small>A股研究</small></span>
-  </a>
+  <div class="brand">
+    <a class="brand-mark" href="#overview" aria-label="量化工作台首页"><i></i><i></i><i></i></a>
+    <div class="brand-caption">
+      <a class="nav-text" href="#overview">量化工作台</a>
+      <select id="market-switch" aria-label="选择股票市场">
+        <option value="CN">A股研究</option>
+        <option value="US">美股研究</option>
+        <option value="HK">港股研究</option>
+      </select>
+    </div>
+  </div>
   <nav aria-label="主导航">
     <a href="#overview" data-page="overview"><span data-icon="overview"></span><span class="nav-text">投资总览</span></a>
     <a href="#daily" data-page="daily"><span data-icon="daily"></span><span class="nav-text">日选研究</span></a>
@@ -38,6 +46,7 @@
     <div class="page-heading"><div><h1 id="page-title">投资总览</h1><p id="page-subtitle">先看数据状态，再看候选与价格。</p></div><button class="primary" id="refresh"><span data-icon="refresh"></span>刷新数据</button></div>
     <div id="alert" role="status" aria-live="polite"></div>
     <div class="agent-mode-banner"><span id="agent-mode-label">标准工作流 · 不调用 AI</span><a href="#agent">进入 AI 分析 →</a></div>
+    <section id="foreign-view" hidden aria-labelledby="page-title"></section>
 
     <section data-view="overview" aria-label="投资总览">
       <div id="overview-stats" class="stats"></div>
@@ -118,6 +127,16 @@
   <label class="search"><span data-icon="search"></span><input id="security-query" type="search" maxlength="80" placeholder="输入股票代码或简称" aria-label="股票代码或简称" autofocus></label>
   <div class="toolbar"><p id="security-search-status" class="muted" role="status"></p><button id="refresh-security-catalog" type="button" hidden>更新名录</button></div>
   <div id="security-results"></div>
+</dialog>
+
+<dialog id="foreign-stock-dialog" aria-labelledby="foreign-stock-title">
+  <div class="drawer-heading">
+    <h2 id="foreign-stock-title"></h2>
+    <button id="close-foreign-stock" class="icon-button" aria-label="关闭海外股票详情"><span data-icon="close"></span></button>
+  </div>
+  <button id="foreign-stock-favorite" type="button"></button>
+  <p id="foreign-stock-note" class="muted" role="status"></p>
+  <div id="foreign-stock-chart" role="img" aria-label="股票不复权日 K 线与成交量"></div>
 </dialog>
 
 <dialog id="stock-dialog" aria-labelledby="stock-title">

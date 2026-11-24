@@ -2,6 +2,7 @@
 akshare==1.18.83
 baostock==0.9.3
 duckdb==1.5.5
+exchange-calendars==4.11.2
 lightgbm==4.7.0
 numpy==2.5.1
 openpyxl==3.1.5

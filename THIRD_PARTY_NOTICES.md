@@ -6,6 +6,7 @@ Python 第三方组件通过包、公开 API 或明确的 Adapter 接入。前�
 
 - [AKShare](https://github.com/akfamily/akshare)
 - [BaoStock](https://www.baostock.com/)
+- [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars) 4.11.2（Apache-2.0，港股和美股交易时段及账本交收日估算）
 - [Qlib](https://github.com/microsoft/qlib)
 - [DuckDB](https://duckdb.org/)
 - [Optuna](https://github.com/optuna/optuna)
