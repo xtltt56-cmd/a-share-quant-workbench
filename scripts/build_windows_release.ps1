@@ -96,15 +96,26 @@ function Compress-Payload {
     if (Test-Path -LiteralPath $archive) {
         Remove-Item -LiteralPath $archive -Force
     }
-    foreach ($privateName in @('.env', '.runtime')) {
-        if (Test-Path -LiteralPath (Join-Path $Stage $privateName)) {
-            throw 'Private runtime content is present in the release staging directory.'
-        }
-    }
+    # The portable installer creates .runtime locally; never ship that state.
+    $payload = @(Get-ChildItem -LiteralPath $Stage -Force | Where-Object {
+        $_.Name -notin @('.env', '.runtime')
+    })
+    Compress-Archive -LiteralPath $payload.FullName -DestinationPath $archive -CompressionLevel Optimal
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [IO.Compression.ZipFile]::CreateFromDirectory(
-        $Stage, $archive, [IO.Compression.CompressionLevel]::Optimal, $false, [Text.Encoding]::UTF8
-    )
+    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+    try {
+        $names = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+        $expectedLaunchers = @(Get-ChildItem -LiteralPath $repoRoot -File -Filter '*.cmd' | ForEach-Object Name)
+        foreach ($required in @('VERSION.json', '.env.example', 'README_RELEASE_ZH.md', 'pyproject.toml') + $expectedLaunchers) {
+            if ($names -cnotcontains $required) { throw "Missing release archive entry: $required" }
+        }
+        if ($names -match '^(\.env|\.runtime)(/|$)') { throw 'Private runtime content is present in the release archive.' }
+        if ($Name.EndsWith('-Portable.zip') -and $names -cnotcontains 'runtime/python.exe') {
+            throw 'Portable archive does not include its Python runtime.'
+        }
+    } finally {
+        $zip.Dispose()
+    }
     return $archive
 }
 
