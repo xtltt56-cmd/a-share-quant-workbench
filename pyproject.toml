@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a-share-quant"
-version = "0.2.8"
-description = "Framework-first A-share quantitative research and paper-trading system"
+version = "0.2.9"
+description = "Local quantitative research workbench for mainland China, Hong Kong, and US stocks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

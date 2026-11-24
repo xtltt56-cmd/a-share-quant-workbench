@@ -1,5 +1,6 @@
 "use strict";
 const $ = id => document.getElementById(id);
+const productName = document.title;
 const icons={
   watchlist:'<path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6-5.4-2.8-5.4 2.8 1-6L3.2 9.4l6.1-.9z"/>',
   overview:'<path d="M4 13h6V4H4zM14 20h6V11h-6zM4 20h6v-3H4zM14 7h6V4h-6z"/>',
@@ -75,7 +76,7 @@ function route(){
   $("page-title").textContent = $("breadcrumb").textContent = pageInfo[page][0];
   $("page-subtitle").textContent = overseas ? "" : pageInfo[page][1];
   const marketName = {CN:"A股", US:"美股", HK:"港股"}[selectedMarket];
-  document.title = pageInfo[page][0] + " · " + marketName + "量化交易工作台";
+  document.title = pageInfo[page][0] + " · " + marketName + " · " + productName;
   $("foreign-view").hidden = !overseas;
   document.querySelector(".agent-mode-banner").hidden = overseas;
   if (overseas) window.renderForeignMarket?.(page);

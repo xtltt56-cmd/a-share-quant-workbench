@@ -75,10 +75,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $productName = (Get-Content -LiteralPath VERSION.json -Raw -Encoding UTF8 | ConvertFrom-Json).product_name
           $packages = (Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'qw-release') -File).FullName
           gh release create '${{ github.ref_name }}' @packages `
             --repo '${{ github.repository }}' `
             --verify-tag `
-            --title "A股量化交易工作台 ${{ github.ref_name }} 公开预览版" `
+            --title "$productName ${{ github.ref_name }} 公开预览版" `
             --notes-file docs/RELEASE_NOTES_ZH.md `
             --latest
