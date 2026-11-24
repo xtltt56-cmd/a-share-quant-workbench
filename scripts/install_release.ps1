@@ -164,7 +164,8 @@ if (-not $SkipShortcut) {
     }
 }
 
-Write-Host 'A-Share Quant Workbench installation completed.'
+$productName = (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION.json') -Raw -Encoding UTF8 | ConvertFrom-Json).product_name
+Write-Host "$productName installation completed."
 if (-not $SkipLaunch) {
     & (Join-Path $repoRoot 'scripts\start_quant_workbench.ps1')
 }

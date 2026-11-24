@@ -1077,7 +1077,7 @@ def run_server(
             public_risk_coordinator.start()
         if research_lifecycle is not None:
             research_lifecycle.start()
-        print(f"A股量化交易工作台：http://127.0.0.1:{server.server_address[1]}/")
+        print(f"股票量化研究工作台：http://127.0.0.1:{server.server_address[1]}/")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -1278,7 +1278,7 @@ _DASHBOARD_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>A股量化交易工作台</title>
+<title>经典工作台 · 股票量化研究工作台</title>
 <style>
 body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#172033;margin:0}
 header{background:#12233f;color:white;padding:20px 28px}
@@ -1309,7 +1309,7 @@ table{width:100%;border-collapse:collapse;background:white;margin-top:14px}
 th,td{padding:9px;border-bottom:1px solid #edf0f5;text-align:left;font-size:13px;vertical-align:top}th{color:#667085}
 .muted{color:#667085}.safe{color:#147a46}.warn{color:#a15c00}.danger{color:#b42318}
 </style></head>
-<body><header><h1>A股量化交易工作台</h1>
+<body><header><h1>股票量化研究工作台</h1>
 <div>仅供纸面监控日线候选和盘中数据；“就绪”仅表示监控状态。</div></header>
 <main>
 <div class="grid">
@@ -1402,7 +1402,7 @@ load(); setInterval(load,15000);
 
 _ADVISORY_DASHBOARD_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>本地人工投顾</title><style>
+<title>本地人工投顾 · 股票量化研究工作台</title><style>
 body{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f7fb;color:#172033;margin:0}header{background:#12233f;color:white;padding:20px 28px}main{max-width:960px;margin:22px auto;padding:0 18px}.card{background:white;border:1px solid #dfe5ef;border-radius:10px;padding:16px;margin-top:14px;box-shadow:0 2px 8px #12233f12}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}label{display:grid;gap:5px;font-size:13px}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px}button{background:#1d5fd1;color:white;border:0;border-radius:6px;padding:9px 14px;cursor:pointer}.muted{color:#667085}.warn{color:#a15c00;white-space:pre-wrap}pre{overflow:auto;background:#f8fafc;padding:12px;border-radius:6px}</style></head>
 <body><header><h1>本地人工投顾</h1><div>仅供人工复核、人工下单与本机成交记录；本页面不提交委托。</div></header><main>
 <div class="card"><strong>重要提示：</strong>请先在券商端自行完成交易，再在此确认记录；数据与模型状态不构成实时市场验证。</div>

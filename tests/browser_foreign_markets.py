@@ -80,7 +80,9 @@ def test_market_switch_keeps_research_and_ledgers_isolated(tmp_path):
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(base + "/?market=CN#daily", wait_until="networkidle")
             expect(page.locator('[data-view="daily"]')).to_be_visible()
+            expect(page).to_have_title("日选研究 · A股 · 股票量化研究工作台")
             page.locator("#market-switch").select_option("HK")
+            expect(page).to_have_title("日选研究 · 港股 · 股票量化研究工作台")
             expect(page.locator("#foreign-view table").first.locator("tbody tr")).to_have_count(
                 service.state("HK")["coverage"]
             )
@@ -102,6 +104,7 @@ def test_market_switch_keeps_research_and_ledgers_isolated(tmp_path):
 
             us = context.new_page()
             us.goto(base + "/?market=US#watchlist")
+            expect(us).to_have_title("我的自选 · 美股 · 股票量化研究工作台")
             expect(us.locator("#foreign-view")).to_contain_text("暂无美股自选")
             us.locator('[data-page="daily"]').click()
             expect(us.locator("#foreign-view table").first.locator("tbody tr")).to_have_count(

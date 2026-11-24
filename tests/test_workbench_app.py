@@ -85,7 +85,7 @@ def test_dashboard_binds_only_to_loopback_and_exposes_backend_freshness() -> Non
             html = response.read().decode("utf-8")
             assert response.headers["Cache-Control"] == "no-store"
         assert '<html lang="zh-CN">' in html
-        assert "A股量化交易工作台" in html
+        assert "股票量化研究工作台" in html
         assert "仅供纸面监控" in html
         assert "当前数据源" in html
         assert "数据源类别" in html

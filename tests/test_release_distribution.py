@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
+from zipfile import ZipFile
 
+import pytest
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +20,7 @@ def test_release_metadata_matches_project_version() -> None:
 
     assert project["project"]["version"] == metadata["version"]
     assert metadata["channel"] == "preview"
+    assert metadata["product_name"] == "股票量化研究工作台"
 
 
 def test_release_ships_agent_dependencies_without_secrets() -> None:
@@ -119,3 +124,32 @@ def test_online_release_can_be_built_without_copying_local_runtime(tmp_path: Pat
     assert len(archives) == 1
     assert (output / "SHA256SUMS.txt").is_file()
     assert archives[0].stat().st_size < 20 * 1024 * 1024
+    with ZipFile(archives[0]) as archive:
+        assert json.loads(archive.read("VERSION.json"))["product_name"] == "股票量化研究工作台"
+        names = set(archive.namelist())
+        assert {".env.example", "LICENSE", "README_RELEASE_ZH.md", "pyproject.toml"} <= names
+        for action in ("安装", "启动", "停止"):
+            assert f"{action}股票量化研究工作台.cmd" in names
+
+
+@pytest.mark.parametrize(("runtime", "expected"), [
+    (None, "install"),
+    (".venv/Scripts/python.exe", "launch"),
+    ("runtime/python.exe", "launch"),
+])
+def test_windows_entrypoint_selects_install_or_launch(tmp_path, runtime, expected):
+    launcher = tmp_path / "启动股票量化研究工作台.cmd"
+    shutil.copyfile(ROOT / launcher.name, launcher)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "install_release.ps1").write_text("Write-Output install", encoding="ascii")
+    (scripts / "start_quant_workbench.ps1").write_text("Write-Output launch", encoding="ascii")
+    if runtime:
+        marker = tmp_path / runtime
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    result = subprocess.run(
+        [os.environ["COMSPEC"], "/d", "/c", launcher.name], cwd=tmp_path,
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=15, check=True,
+    )
+    assert result.stdout.strip() == expected.encode("ascii")

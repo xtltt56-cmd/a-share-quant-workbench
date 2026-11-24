@@ -1,6 +1,6 @@
 {
-  "version": "0.2.8",
+  "version": "0.2.9",
   "channel": "preview",
-  "product_name": "A股量化交易系统",
+  "product_name": "股票量化研究工作台",
   "distribution": "source"
 }

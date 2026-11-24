@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$sourceMetadata = Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 $payloadItems = @(
@@ -56,7 +57,10 @@ function New-PayloadStage {
     }
     Get-ChildItem -LiteralPath $repoRoot -File -Filter '*.cmd' | Copy-Item -Destination $stage
     Get-ChildItem -LiteralPath $stage -Directory -Recurse -Filter '__pycache__' | Sort-Object FullName -Descending | Remove-Item -Recurse -Force
-    Get-ChildItem -LiteralPath $stage -File -Recurse -Include '*.pyc', '*.pyo' | Remove-Item -Force
+    # Windows PowerShell 5.1 can ignore -Include when paired with -LiteralPath.
+    Get-ChildItem -LiteralPath $stage -File -Recurse |
+        Where-Object { $_.Extension -in @('.pyc', '.pyo') } |
+        Remove-Item -Force
     $revision = (& git -C $repoRoot rev-parse --verify HEAD 2>$null | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($revision)) {
         $revision = [string]$env:GITHUB_SHA
@@ -68,7 +72,7 @@ function New-PayloadStage {
     $metadata = [ordered]@{
         version = $Version
         channel = $Channel.ToLowerInvariant()
-        product_name = 'A-Share Quant Workbench'
+        product_name = $sourceMetadata.product_name
         distribution = 'windows-x64'
         git_commit = $revision.Trim()
         source_dirty = $sourceDirty
@@ -92,10 +96,15 @@ function Compress-Payload {
     if (Test-Path -LiteralPath $archive) {
         Remove-Item -LiteralPath $archive -Force
     }
-    $payload = @(Get-ChildItem -LiteralPath $Stage -Force | Where-Object {
-        $_.Name -notin @('.env', '.runtime')
-    })
-    Compress-Archive -LiteralPath $payload.FullName -DestinationPath $archive -CompressionLevel Optimal
+    foreach ($privateName in @('.env', '.runtime')) {
+        if (Test-Path -LiteralPath (Join-Path $Stage $privateName)) {
+            throw 'Private runtime content is present in the release staging directory.'
+        }
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::CreateFromDirectory(
+        $Stage, $archive, [IO.Compression.CompressionLevel]::Optimal, $false, [Text.Encoding]::UTF8
+    )
     return $archive
 }
 
@@ -103,7 +112,7 @@ $artifacts = @()
 if ($Flavor -in @('Online', 'Both')) {
     $onlineStage = New-PayloadStage -Channel 'Online'
     try {
-        $artifacts += Compress-Payload -Stage $onlineStage -Name "A-Share-Quant-Workbench-v$Version-Windows-x64-Online.zip"
+        $artifacts += Compress-Payload -Stage $onlineStage -Name "Stock-Quant-Workbench-v$Version-Windows-x64-Online.zip"
     } finally {
         if (([IO.Path]::GetFullPath($onlineStage)).StartsWith($outputRoot, [StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $onlineStage -Recurse -Force
@@ -136,7 +145,7 @@ if ($Flavor -in @('Portable', 'Both')) {
         if ($LASTEXITCODE -ne 0) {
             throw 'Portable import smoke test failed.'
         }
-        $artifacts += Compress-Payload -Stage $portableStage -Name "A-Share-Quant-Workbench-v$Version-Windows-x64-Portable.zip"
+        $artifacts += Compress-Payload -Stage $portableStage -Name "Stock-Quant-Workbench-v$Version-Windows-x64-Portable.zip"
     } finally {
         Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
         if (([IO.Path]::GetFullPath($portableStage)).StartsWith($outputRoot, [StringComparison]::OrdinalIgnoreCase)) {
