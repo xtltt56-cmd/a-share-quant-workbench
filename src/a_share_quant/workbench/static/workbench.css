@@ -52,7 +52,18 @@ small,.muted{color:var(--muted)}
 
 .sidebar{position:fixed;inset:0 auto 0 0;width:216px;background:var(--side);color:#d9e2ee;padding:23px 14px 16px;display:flex;flex-direction:column;z-index:20;border-right:1px solid rgba(255,255,255,.05)}
 .brand{display:flex;align-items:center;gap:11px;color:#fff;font-size:16px;font-weight:700;padding:3px 8px 29px;white-space:nowrap}
-.brand small{display:block;font-size:9px;font-weight:500;letter-spacing:1.5px;color:#7f91a8;margin-top:2px}
+.brand-caption{display:grid;justify-items:start;gap:3px}
+.brand-caption a{color:inherit}
+#market-switch{font-size:11px;color:#c4d5ec;background:#142238;border-color:#30435d;padding:2px 5px;min-height:25px}
+.nav-collapsed .brand{align-items:center;flex-direction:column;padding-right:0;padding-left:0}
+.nav-collapsed #market-switch{width:54px;padding-left:2px;font-size:10px}
+#foreign-stock-chart{height:330px}
+#foreign-view .panel+.panel{margin-top:16px}
+@media(max-width:760px){
+  .sidebar .brand,.nav-collapsed .sidebar .brand{display:flex;flex-direction:row;padding:0 5px 6px}
+  .brand-caption{display:flex;align-items:center;gap:10px}
+  .nav-collapsed #market-switch{width:auto}
+}
 .brand-mark{width:34px;height:34px;border:1px solid #5b88ed;border-radius:8px;display:flex;align-items:flex-end;justify-content:center;gap:3px;padding:7px}
 .brand-mark i{display:block;width:3px;border-radius:2px;background:#7fa7ff}
 .brand-mark i:nth-child(1){height:7px}.brand-mark i:nth-child(2){height:12px}.brand-mark i:nth-child(3){height:18px}

@@ -41,12 +41,48 @@ const eventRiskStatus = x => {const risk=x?.event_risk||{},level=risk.level||"NO
 let connected=false,lastRead=null,progress={};
 let state={},account={},guidance={},governance={},modelHealth={},workflow={},activeStock="",chart=null,chartRequest=0,evidenceRequest=0,refreshing=false,buyToken="",importToken="",lastFocus=null;
 const prefs={get(k, fallback){try{return JSON.parse(localStorage.getItem(k))??fallback;}catch{return fallback;}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch{}}};
+const marketParam = new URLSearchParams(location.search).get("market");
+const marketPreference = marketParam || prefs.get("quant-market", "CN");
+const selectedMarket = ["CN", "US", "HK"].includes(marketPreference) ? marketPreference : "CN";
+$("market-switch").value = selectedMarket;
+if (marketParam) prefs.set("quant-market", selectedMarket);
+$("market-switch").onchange = () => {
+  const url = new URL(location.href);
+  url.searchParams.set("market", $("market-switch").value);
+  if (["#entry", "#import-section"].includes(url.hash)) url.hash = "holdings";
+  if (url.hash === "#agent-settings") url.hash = "system";
+  location.assign(url);
+};
 let watch = new Set();
 let activeSecurity = null;
 document.documentElement.dataset.theme=prefs.get("quant-theme","dark");
 document.body.classList.toggle("compact",prefs.get("quant-compact",false));
 const pageInfo={watchlist:["我的自选","查看已收藏股票及可用行情。"],overview:["投资总览","先看数据状态，再看候选与价格。"],daily:["日选研究","比较候选分数、价格边界与适用日期。"],monitor:["盘中监控","核验行情时效与价格计划状态。"],holdings:["我的持仓","管理人工成交与券商导入快照。"],models:["模型观察","只用未来结果对证模型表现。"],agent:["AI 分析","联网补充研究，交叉核验规则与最新公开信息。"],system:["数据与系统","检查来源、时效和运行状态。"]};
-function route(){let page=location.hash.slice(1);if(["entry","import-section"].includes(page))page="holdings";if(page==="agent-settings")page="system";if(!pageInfo[page])page=location.pathname==="/advisory"?"holdings":"overview";document.querySelectorAll("[data-view]").forEach(el=>el.hidden=el.dataset.view!==page);document.querySelectorAll("[data-page]").forEach(el=>{el.classList.toggle("active",el.dataset.page===page);if(el.dataset.page===page)el.setAttribute("aria-current","page");else el.removeAttribute("aria-current");});$("page-title").textContent=$("breadcrumb").textContent=pageInfo[page][0];$("page-subtitle").textContent=pageInfo[page][1];document.title=pageInfo[page][0]+" · A股量化交易工作台";if(["#entry","#import-section","#agent-settings"].includes(location.hash))$(location.hash.slice(1)).scrollIntoView({behavior:"smooth"});else window.scrollTo({top:0,behavior:"instant"});}
+function route(){
+  let page = location.hash.slice(1);
+  if (["entry", "import-section"].includes(page)) page = "holdings";
+  if (page === "agent-settings") page = "system";
+  if (!pageInfo[page]) page = location.pathname === "/advisory" ? "holdings" : "overview";
+  const overseas = selectedMarket !== "CN";
+  document.querySelectorAll("[data-view]").forEach(el => {
+    el.hidden = overseas || el.dataset.view !== page;
+  });
+  document.querySelectorAll("[data-page]").forEach(el => {
+    el.classList.toggle("active", el.dataset.page === page);
+    if (el.dataset.page === page) el.setAttribute("aria-current", "page");
+    else el.removeAttribute("aria-current");
+  });
+  $("page-title").textContent = $("breadcrumb").textContent = pageInfo[page][0];
+  $("page-subtitle").textContent = overseas ? "" : pageInfo[page][1];
+  const marketName = {CN:"A股", US:"美股", HK:"港股"}[selectedMarket];
+  document.title = pageInfo[page][0] + " · " + marketName + "量化交易工作台";
+  $("foreign-view").hidden = !overseas;
+  document.querySelector(".agent-mode-banner").hidden = overseas;
+  if (overseas) window.renderForeignMarket?.(page);
+  if (!overseas && ["#entry", "#import-section", "#agent-settings"].includes(location.hash)) {
+    $(location.hash.slice(1)).scrollIntoView({behavior:"smooth"});
+  } else window.scrollTo({top:0, behavior:"instant"});
+}
 window.addEventListener("hashchange",route);route();
 async function api(path,body,header){const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),20000);try{const response=await fetch(path,{cache:"no-store",signal:controller.signal,...(body!==undefined?{method:"POST",headers:{"Content-Type":"application/json","X-Quant-Workbench-Request":header||"manual-advisory"},body:JSON.stringify(body)}:{})});const result=await response.json();if(!response.ok)throw Error(result.notice_zh||"请求未完成，请检查数据或重新预览");return result;}finally{clearTimeout(timeout);}}
 function dailyPoolCaption(){
@@ -285,4 +321,7 @@ function renderAllocation(){const rows=(account.positions||[]).map(x=>({...x,cos
 function updateNav(){const collapsed=document.body.classList.contains("nav-collapsed");$("collapse-nav").setAttribute("aria-expanded",String(!collapsed));document.querySelectorAll("[data-page]").forEach(el=>el.title=pageInfo[el.dataset.page][0]);}
 document.body.classList.toggle("nav-collapsed",prefs.get("quant-nav-collapsed",false));updateNav();
 $("collapse-nav").onclick=()=>{document.body.classList.toggle("nav-collapsed");prefs.set("quant-nav-collapsed",document.body.classList.contains("nav-collapsed"));updateNav();chart?.resize();};
-load();setInterval(()=>{if(!document.hidden)load();},15000);
+if (selectedMarket === "CN") {
+  load();
+  setInterval(() => { if (!document.hidden) load(); }, 15000);
+}

@@ -1,5 +1,6 @@
 "use strict";
 (() => {
+  if (selectedMarket !== "CN") return;
   let status = null, dirty = false, running = false, stopping = false, job = null;
   let results = [], total = 0, finished = 0;
   const selected = new Set(), extras = new Set(), limit = 10;

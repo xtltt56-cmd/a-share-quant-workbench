@@ -34,6 +34,7 @@ from a_share_quant.storage.public_risk_store import PublicRiskStore
 from a_share_quant.workbench.advisory_service import AdvisoryWorkbenchService
 from a_share_quant.workbench.agent_runtime import AgentRuntime
 from a_share_quant.workbench.context_tools import WorkbenchContextTools
+from a_share_quant.workbench.foreign_markets import MARKET_META, ForeignMarkets
 from a_share_quant.workbench.security_catalog import EXCHANGES, SIX_DIGITS, SecurityCatalog
 from a_share_quant.workbench.service import WorkbenchService
 from a_share_quant.workbench.watchlist import Watchlist
@@ -44,6 +45,7 @@ _UI_ASSETS = {
     "/assets/workbench.css": ("workbench.css", "text/css; charset=utf-8"),
     "/assets/workbench.js": ("workbench.js", "text/javascript; charset=utf-8"),
     "/assets/watchlist.js": ("watchlist.js", "text/javascript; charset=utf-8"),
+    "/assets/foreign-markets.js": ("foreign-markets.js", "text/javascript; charset=utf-8"),
     "/assets/agent.js": ("agent.js", "text/javascript; charset=utf-8"),
     "/assets/echarts.min.js": ("echarts.min.js", "text/javascript; charset=utf-8"),
 }
@@ -157,6 +159,7 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         research_lifecycle: ResearchLifecycle | None = None,
         agent_runtime: AgentRuntime | None = None,
         watchlist: Watchlist | None = None,
+        foreign_markets: ForeignMarkets | None = None,
     ) -> None:
         if server_address[0] != "127.0.0.1":
             raise ValueError("the workbench must bind to 127.0.0.1")
@@ -169,11 +172,14 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
             WorkbenchContextTools(service, advisory_service),
         )
         self.watchlist = watchlist
+        self.foreign_markets = foreign_markets
         self.watchlist_quotes = WatchlistQuotes(service) if watchlist is not None else None
         self._governance_previews: dict[str, tuple[str, str, str]] = {}
         super().__init__(server_address, WorkbenchRequestHandler)
 
     def server_close(self) -> None:
+        if self.foreign_markets is not None:
+            self.foreign_markets.close()
         self.agent_runtime.stop()
         if self.watchlist_quotes is not None:
             self.watchlist_quotes.close()
@@ -209,6 +215,11 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
+        elif path in {
+            "/api/foreign/state", "/api/foreign/security", "/api/foreign/quotes",
+            "/api/foreign/account",
+        }:
+            self._foreign_request(path)
         elif path in {"/api/securities/search", "/api/watchlist", "/api/stocks/history/status"}:
             self._watchlist_read(path)
         elif path == "/api/stocks/history":
@@ -292,6 +303,12 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         if path in {"/api/securities/refresh", "/api/watchlist", "/api/stocks/history/download"}:
             self._watchlist_write(path)
             return
+        if path in {
+            "/api/foreign/refresh", "/api/foreign/favorite",
+            "/api/foreign/ledger-preview", "/api/foreign/ledger-record",
+        }:
+            self._foreign_request(path)
+            return
         if path == "/api/workflow/retry":
             self._discard_request_body()
             if self.headers.get("X-Quant-Workbench-Request") != "workflow-retry":
@@ -348,6 +365,67 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
             return
         self._discard_request_body()
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _foreign_request(self, path: str) -> None:
+        service = self.server.foreign_markets
+        if service is None:
+            self._write_json({"notice_zh": "本机海外市场服务未启动"},
+                             status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if not self._agent_origin_valid() or (
+            self.command == "POST" and (
+                self.headers.get("X-Quant-Workbench-Request") != "foreign-markets"
+                or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json"
+            )
+        ):
+            self.close_connection = True
+            self._write_json({"notice_zh": "请求须来自本地工作台"}, status=HTTPStatus.FORBIDDEN)
+            return
+        query = parse_qs(urlparse(self.path).query)
+        market = query.get("market", [""])[0]
+        if market not in MARKET_META:
+            self.close_connection = True
+            self._write_json({"notice_zh": "市场代码无效"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            if path == "/api/foreign/state":
+                result = service.state(market)
+            elif path == "/api/foreign/quotes":
+                result = service.quotes(market)
+            elif path == "/api/foreign/account":
+                result = service.account(market)
+            elif path == "/api/foreign/security":
+                result = service.security(market, query.get("symbol", [""])[0])
+            else:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= size <= 1024:
+                    self.close_connection = True
+                    raise ValueError("市场操作请求大小无效")
+                self.connection.settimeout(3)
+                body = json.loads(self.rfile.read(size))
+                if path == "/api/foreign/refresh" and body == {}:
+                    service.refresh(market)
+                    result = {"accepted": True}
+                elif path in {"/api/foreign/ledger-preview", "/api/foreign/ledger-record"}:
+                    result = service.record(market, body, commit=path.endswith("-record"))
+                elif (
+                    path == "/api/foreign/favorite" and isinstance(body, dict)
+                    and set(body) == {"symbol", "action"}
+                    and all(isinstance(value, str) for value in body.values())
+                ):
+                    service.favorite(market, body["symbol"], body["action"])
+                    result = service.state(market)
+                else:
+                    raise ValueError("市场操作无效")
+            self._write_json(result)
+        except json.JSONDecodeError:
+            self._write_json({"notice_zh": "市场请求或本地缓存格式无效"},
+                             status=HTTPStatus.BAD_REQUEST)
+        except ValueError as exc:
+            self._write_json({"notice_zh": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except (OSError, KeyError, TypeError):
+            self._write_json({"notice_zh": "海外市场数据暂不可用"},
+                             status=HTTPStatus.SERVICE_UNAVAILABLE)
 
     def _watchlist_payload(self, watchlist: Watchlist) -> dict:
         rows = watchlist.items()
@@ -808,6 +886,7 @@ def create_server(
     research_lifecycle: ResearchLifecycle | None = None,
     agent_runtime: AgentRuntime | None = None,
     watchlist: Watchlist | None = None,
+    foreign_markets: ForeignMarkets | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> WorkbenchHTTPServer:
@@ -822,6 +901,7 @@ def create_server(
         research_lifecycle,
         agent_runtime,
         watchlist,
+        foreign_markets,
     )
 
 
@@ -970,6 +1050,7 @@ def run_server(
         research_lifecycle=research_lifecycle,
         agent_runtime=AgentRuntime(WorkbenchContextTools(service, advisory_service), repo_root),
         watchlist=watchlist,
+        foreign_markets=ForeignMarkets(repo_root, allow_network=allow_network) if repo_root else None,
         port=port,
     )
     try:
